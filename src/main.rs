@@ -22,6 +22,7 @@ mod config;
 mod data;
 mod detect;
 mod state;
+mod transcribe;
 mod winctl;
 
 use config::Config;
@@ -283,6 +284,18 @@ impl eframe::App for App {
                         if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
                             toggle_pin = true;
                         }
+                        // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(90, 96, 108)),
+                        )
+                        .on_hover_text(format!(
+                            "health-widget v{}\ncommit {}\nсборка {}",
+                            env!("CARGO_PKG_VERSION"),
+                            env!("GIT_HASH"),
+                            env!("BUILD_TIME"),
+                        ));
                     });
                 });
                 if toggle_pin {
@@ -298,6 +311,8 @@ impl eframe::App for App {
                 let prog_target = self.prog_target.clone();
                 let mut toggle_mic = false;
                 let mut toggle_zoom = false;
+                let mut mic_off = false;
+                let mut zoom_off = false;
                 let mut new_mic: Option<Option<String>> = None;
                 let mut new_prog: Option<Option<String>> = None;
                 let mut refresh = false;
@@ -311,16 +326,25 @@ impl eframe::App for App {
                     {
                         toggle_mic = true;
                     }
-                    let cur = device_label(&mic_target, &self.mics, "🎤 по умолчанию");
+                    // Подпись селектора отражает состояние: выключен — «⊘ выключено».
+                    let cur = if mic_on {
+                        device_label(&mic_target, &self.mics, "🎤 по умолчанию")
+                    } else {
+                        "⊘ выключено".to_string()
+                    };
                     egui::ComboBox::from_id_salt("mic-src")
                         .width(150.0)
                         .selected_text(egui::RichText::new(cur).size(11.0))
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(mic_target.is_none(), "🎤 по умолчанию").clicked() {
+                            // Первый пункт — отключить источник.
+                            if ui.selectable_label(!mic_on, "⊘ выключено").clicked() {
+                                mic_off = true;
+                            }
+                            if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
                                 new_mic = Some(None);
                             }
                             for d in &self.mics {
-                                let sel = mic_target.as_deref() == Some(d.target.as_str());
+                                let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
                                 if ui.selectable_label(sel, &d.label).clicked() {
                                     new_mic = Some(Some(d.target.clone()));
                                 }
@@ -337,17 +361,24 @@ impl eframe::App for App {
                     {
                         toggle_zoom = true;
                     }
-                    let cur = device_label(&prog_target, &self.programs, "🔊 весь вывод");
+                    let cur = if zoom_on {
+                        device_label(&prog_target, &self.programs, "🔊 весь вывод")
+                    } else {
+                        "⊘ выключено".to_string()
+                    };
                     egui::ComboBox::from_id_salt("prog-src")
                         .width(150.0)
                         .selected_text(egui::RichText::new(cur).size(11.0))
                         .show_ui(ui, |ui| {
                             egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                                if ui.selectable_label(prog_target.is_none(), "🔊 весь вывод").clicked() {
+                                if ui.selectable_label(!zoom_on, "⊘ выключено").clicked() {
+                                    zoom_off = true;
+                                }
+                                if ui.selectable_label(zoom_on && prog_target.is_none(), "🔊 весь вывод").clicked() {
                                     new_prog = Some(None);
                                 }
                                 for d in &self.programs {
-                                    let sel = prog_target.as_deref() == Some(d.target.as_str());
+                                    let sel = zoom_on && prog_target.as_deref() == Some(d.target.as_str());
                                     if ui.selectable_label(sel, &d.label).clicked() {
                                         new_prog = Some(Some(d.target.clone()));
                                     }
@@ -364,17 +395,21 @@ impl eframe::App for App {
                     self.mics = audio::list_mics();
                     self.programs = audio::list_programs();
                 }
+                // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
                 if let Some(sel) = new_mic {
                     self.mic_target = sel;
-                    if self.mic.is_some() {
-                        self.mic = audio::AudioMonitor::start(self.mic_target.as_deref());
-                    }
+                    self.mic = audio::AudioMonitor::start(self.mic_target.as_deref());
                 }
                 if let Some(sel) = new_prog {
                     self.prog_target = sel;
-                    if self.zoom.is_some() {
-                        self.zoom = self.start_program();
-                    }
+                    self.zoom = self.start_program();
+                }
+                // Пункт «⊘ выключено» — погасить канал.
+                if mic_off {
+                    self.mic = None;
+                }
+                if zoom_off {
+                    self.zoom = None;
                 }
                 if toggle_mic {
                     self.mic = if self.mic.is_some() {
@@ -421,6 +456,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("🎤 Микрофон").size(11.0).color(color));
                     draw_scope(ui, &self.scope, color);
+                    draw_transcript(ui, mon.transcript(), color);
                 }
                 if let Some(mon) = &self.zoom {
                     mon.snapshot(&mut self.scope);
@@ -428,6 +464,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color));
                     draw_scope(ui, &self.scope, color);
+                    draw_transcript(ui, mon.transcript(), color);
                 }
 
                 // Ручка ресайза в правом-нижнем углу: тянешь — композитор растягивает окно.
@@ -509,6 +546,51 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     );
 }
 
+/// Показать онлайн-транскрипцию под осциллографом канала: накопленный текст обычным
+/// цветом канала, текущую (незавершённую) гипотезу — приглушённо и курсивом.
+/// `data` = None — распознавание для канала не запущено (нет venv/модели) → ничего не рисуем.
+fn draw_transcript(ui: &mut egui::Ui, data: Option<(String, String)>, color: egui::Color32) {
+    let (finals, partial) = match data {
+        Some(t) => t,
+        None => return,
+    };
+    if finals.is_empty() && partial.is_empty() {
+        // Пока тишина/прогрев — тонкая подсказка, чтобы канал не выглядел «сломанным».
+        ui.label(
+            egui::RichText::new("… слушаю")
+                .size(11.0)
+                .italics()
+                .color(egui::Color32::from_rgb(90, 96, 108)),
+        );
+        return;
+    }
+    ui.add_space(2.0);
+    // Одна переносимая по словам строка: финальный текст + серым «хвост» гипотезы.
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let base = egui::TextFormat {
+        font_id: egui::FontId::proportional(12.0),
+        color,
+        ..Default::default()
+    };
+    if !finals.is_empty() {
+        job.append(&finals, 0.0, base.clone());
+    }
+    if !partial.is_empty() {
+        let sep = if finals.is_empty() { "" } else { " " };
+        job.append(
+            &format!("{sep}{partial}"),
+            0.0,
+            egui::TextFormat {
+                italics: true,
+                color: egui::Color32::from_rgb(140, 146, 158),
+                ..base
+            },
+        );
+    }
+    ui.label(job);
+}
+
 /// Нарисовать ручку ресайза в правом-нижнем углу панели и обработать перетаскивание.
 /// На Wayland клиент не задаёт свой размер сам — просим композитор начать интерактивный
 /// resize в направлении SouthEast.
@@ -550,6 +632,16 @@ fn main() -> eframe::Result<()> {
     // Диагностика: `health-widget --check-capture` печатает, видит ли детектор активный
     // захват экрана прямо сейчас, и выходит (0 = захват идёт, 1 = нет). Удобно проверить
     // авто-скрытие со своим инструментом созвона до боевого звонка (см. README «Проверка»).
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!(
+            "health-widget v{} (commit {}, сборка {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_HASH"),
+            env!("BUILD_TIME"),
+        );
+        std::process::exit(0);
+    }
+
     if std::env::args().nth(1).as_deref() == Some("--check-capture") {
         if !detect::available() {
             eprintln!("детект недоступен: нет ни pw-dump, ни busctl");

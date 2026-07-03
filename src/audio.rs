@@ -12,9 +12,13 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::transcribe::Transcriber;
+
 /// Сколько последних сэмплов держим для отрисовки волны.
 const CAP: usize = 2048;
 const RATE: &str = "44100";
+/// Числовое значение RATE — для инициализации ресемплера транскрайбера.
+const RATE_HZ: u32 = 44100;
 
 /// Имя monitor-источника вывода по умолчанию — это «то, что слышно» (Zoom/Телемост и т.п.).
 /// None — если не удалось определить sink по умолчанию.
@@ -93,7 +97,11 @@ pub fn list_programs() -> Vec<Device> {
         if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
             continue;
         }
-        let props = match o.get("info").and_then(|i| i.get("props")) {
+        let info = match o.get("info") {
+            Some(i) => i,
+            None => continue,
+        };
+        let props = match info.get("props") {
             Some(p) => p,
             None => continue,
         };
@@ -112,6 +120,12 @@ pub fn list_programs() -> Vec<Device> {
             },
             None => continue,
         };
+        // Показываем только реально звучащие потоки ("running"). "idle"/"suspended" — это
+        // либо временные дубли того же приложения, либо постоянные заглушки (напр. пустой
+        // sink speech-dispatcher): звука в них нет, захват отдаёт тишину — в списке не нужны.
+        if info.get("state").and_then(|s| s.as_str()) != Some("running") {
+            continue;
+        }
         let app = props
             .get("application.name")
             .and_then(|s| s.as_str())
@@ -128,12 +142,26 @@ pub fn list_programs() -> Vec<Device> {
         };
         res.push(Device { target, label });
     }
+
+    // Одно приложение может держать несколько звучащих нод с одинаковой подписью
+    // (напр. вкладки браузера) — оставляем по одной на подпись, чтобы не было дублей.
+    let mut seen: Vec<String> = Vec::new();
+    res.retain(|d| {
+        if seen.contains(&d.label) {
+            false
+        } else {
+            seen.push(d.label.clone());
+            true
+        }
+    });
     res
 }
 
 pub struct AudioMonitor {
     samples: Arc<Mutex<VecDeque<f32>>>,
     child: Child,
+    /// Онлайн-транскрипция этого канала (None — движок/модель не установлены или выключены).
+    transcriber: Option<Transcriber>,
 }
 
 impl AudioMonitor {
@@ -156,9 +184,17 @@ impl AudioMonitor {
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(CAP)));
         let buf = samples.clone();
 
+        // Транскрайбер: кормящую половину отдаём в поток-читатель, читающую держим в структуре.
+        let (transcriber, mut feeder) = match Transcriber::start(RATE_HZ) {
+            Some((t, f)) => (Some(t), Some(f)),
+            None => (None, None),
+        };
+
         std::thread::spawn(move || {
             let mut acc: Vec<u8> = Vec::with_capacity(8192);
             let mut raw = [0u8; 4096];
+            // Переиспользуемый буфер декодированного батча — уходит и в осциллограф, и в STT.
+            let mut batch: Vec<f32> = Vec::with_capacity(2048);
             loop {
                 match stdout.read(&mut raw) {
                     Ok(0) | Err(_) => break, // пайп закрылся — процесс умер
@@ -168,16 +204,22 @@ impl AudioMonitor {
                         if full == 0 {
                             continue;
                         }
+                        batch.clear();
+                        let mut i = 0;
+                        while i < full {
+                            batch.push(f32::from_le_bytes([acc[i], acc[i + 1], acc[i + 2], acc[i + 3]]));
+                            i += 4;
+                        }
                         if let Ok(mut g) = buf.lock() {
-                            let mut i = 0;
-                            while i < full {
-                                let v = f32::from_le_bytes([acc[i], acc[i + 1], acc[i + 2], acc[i + 3]]);
+                            for &v in &batch {
                                 if g.len() >= CAP {
                                     g.pop_front();
                                 }
                                 g.push_back(v);
-                                i += 4;
                             }
+                        }
+                        if let Some(f) = feeder.as_mut() {
+                            f.feed(&batch); // тот же звук — в распознавание
                         }
                         acc.drain(..full); // остаток (неполный сэмпл) переносим на след. чтение
                     }
@@ -185,7 +227,13 @@ impl AudioMonitor {
             }
         });
 
-        Some(Self { samples, child })
+        Some(Self { samples, child, transcriber })
+    }
+
+    /// Текущая транскрипция канала: (накопленный текст, текущая гипотеза).
+    /// None — если для канала нет активного распознавания.
+    pub fn transcript(&self) -> Option<(String, String)> {
+        self.transcriber.as_ref().map(|t| t.text())
     }
 
     /// Скопировать текущее содержимое буфера в `out` (переиспользуемый вектор — без аллокаций).
