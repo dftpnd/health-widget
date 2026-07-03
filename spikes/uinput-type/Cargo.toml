@@ -1,0 +1,8 @@
+[package]
+name = "uinput-type"
+version = "0.1.0"
+edition = "2021"
+description = "Спайк Фазы 0: авто-ввод через /dev/uinput на чистом Rust (без ydotool/демона/root)"
+
+[dependencies]
+evdev = "0.12"

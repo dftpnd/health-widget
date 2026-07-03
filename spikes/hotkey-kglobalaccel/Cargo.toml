@@ -1,0 +1,11 @@
+[package]
+name = "hotkey-kglobalaccel"
+version = "0.1.0"
+edition = "2021"
+description = "Спайк Фазы 0: глобальный хоткей через KGlobalAccel (D-Bus/zbus), самопроверка инъекцией uinput"
+
+[dependencies]
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+futures-util = "0.3"
+evdev = "0.12"

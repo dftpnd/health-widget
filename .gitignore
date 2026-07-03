@@ -1,0 +1,2 @@
+# Rust build artifacts (в т.ч. в spikes/*/target)
+target/

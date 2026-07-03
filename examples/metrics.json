@@ -1,0 +1,10 @@
+{
+  "title": "Здоровье",
+  "metrics": [
+    { "label": "Пульс",   "value": "62 bpm" },
+    { "label": "Сон",     "value": "7ч 10м" },
+    { "label": "Шаги",    "value": "8 420" },
+    { "label": "HRV",     "value": "48 ms" },
+    { "label": "Вес",     "value": "74.3 кг" }
+  ]
+}
