@@ -316,6 +316,7 @@ impl eframe::App for App {
                 let mut new_mic: Option<Option<String>> = None;
                 let mut new_prog: Option<Option<String>> = None;
                 let mut refresh = false;
+                let mut refresh_mic = false;
 
                 // Строка 1 — микрофон: тумблер + выбор устройства.
                 ui.horizontal(|ui| {
@@ -350,6 +351,9 @@ impl eframe::App for App {
                                 }
                             }
                         });
+                    if ui.small_button("⟳").on_hover_text("обновить список микрофонов").clicked() {
+                        refresh_mic = true;
+                    }
                 });
 
                 // Строка 2 — программа/вывод: тумблер + выбор программы + обновление списка.
@@ -394,6 +398,9 @@ impl eframe::App for App {
                 if refresh {
                     self.mics = audio::list_mics();
                     self.programs = audio::list_programs();
+                }
+                if refresh_mic {
+                    self.mics = audio::list_mics();
                 }
                 // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
                 if let Some(sel) = new_mic {
