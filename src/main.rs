@@ -687,8 +687,8 @@ impl App {
         }
     }
 
-    /// Нарисовать содержимое чат-колонки: шапка + лента сообщений. Ввод — в Task 5.
-    fn draw_chat(&mut self, ui: &mut egui::Ui) {
+    /// Нарисовать содержимое чат-колонки: шапка + лента сообщений + ввод.
+    fn draw_chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.chat.drain_inbox();
         ui.horizontal(|ui| {
             ui.label(
@@ -728,6 +728,70 @@ impl App {
                     );
                 }
             });
+
+        // Приём картинки перетаскиванием в область чата → OCR в attachment.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            match chat::ocr_file(&path) {
+                Ok(t) => self.chat.attachment = Some(t),
+                Err(e) => self.chat.messages.push(chat::ChatMessage {
+                    role: chat::Role::Error,
+                    text: e,
+                }),
+            }
+        }
+
+        ui.separator();
+        // Чип с прикреплённым OCR-текстом (видно, что уйдёт вместе с сообщением).
+        if let Some(att) = self.chat.attachment.clone() {
+            ui.horizontal(|ui| {
+                let short: String = att.chars().take(40).collect();
+                ui.label(
+                    egui::RichText::new(format!("📷 {short}…"))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(150, 180, 150)),
+                );
+                if ui.small_button("✕").on_hover_text("убрать картинку").clicked() {
+                    self.chat.attachment = None;
+                }
+            });
+        }
+        let mut do_send = false;
+        ui.horizontal(|ui| {
+            if ui.button("📎").on_hover_text("вставить картинку из буфера (OCR)").clicked() {
+                match chat::ocr_clipboard() {
+                    Ok(t) => self.chat.attachment = Some(t),
+                    Err(e) => self.chat.messages.push(chat::ChatMessage {
+                        role: chat::Role::Error,
+                        text: e,
+                    }),
+                }
+            }
+            let send_clicked = ui.button("▶").on_hover_text("отправить (Enter)").clicked();
+            let resp = ui.add(
+                egui::TextEdit::multiline(&mut self.chat.input)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("сообщение…"),
+            );
+            // Enter отправляет, Shift+Enter — перенос строки.
+            let enter = resp.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            do_send = send_clicked || enter;
+        });
+        if do_send && !self.chat.is_sending() {
+            self.chat.send(
+                ctx,
+                self.cfg.autopilot_dir.clone(),
+                self.cfg.autopilot_bin.clone(),
+            );
+        }
     }
 }
 
@@ -798,7 +862,7 @@ impl eframe::App for App {
                     .default_width(CHAT_W)
                     .frame(frame)
                     .show(ctx, |ui| {
-                        self.draw_chat(ui);
+                        self.draw_chat(ui, ctx);
                     });
             }
 
