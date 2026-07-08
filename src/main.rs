@@ -806,11 +806,7 @@ impl App {
             });
 
         if do_send && !self.chat.is_sending() {
-            self.chat.send(
-                ctx,
-                self.cfg.autopilot_dir.clone(),
-                self.cfg.autopilot_bin.clone(),
-            );
+            self.chat.send(ctx, self.cfg.autopilot_dir.clone());
         }
     }
 }
