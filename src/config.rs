@@ -15,7 +15,10 @@ pub struct Config {
     pub bg_alpha: u8,
     /// Пропускать ли клики мыши насквозь.
     pub click_through: bool,
-    /// Прятать ли виджет при обнаружении захвата экрана.
+    /// Прятать ли виджет при обнаружении захвата экрана. По умолчанию ВЫКЛ: приватность
+    /// в стриме держит KWin-скрипт `excludeFromCapture` (виджет виден локально, но не
+    /// попадает в screencast). Авто-хайд прятал окно и локально — включать только явно
+    /// через `HEALTH_AUTO_HIDE=1` (напр. на GNOME, где excludeFromCapture нет).
     pub auto_hide_on_share: bool,
     /// Период опроса детектора.
     pub detect_poll: Duration,
@@ -45,7 +48,7 @@ impl Default for Config {
             height: 200.0,
             bg_alpha: 220,
             click_through: false,
-            auto_hide_on_share: true,
+            auto_hide_on_share: false,
             detect_poll: Duration::from_millis(1000),
             autopilot_dir,
             autopilot_bin,
