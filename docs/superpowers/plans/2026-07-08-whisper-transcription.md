@@ -20,6 +20,9 @@
 - НЕ ломать: захват звука (`src/audio.rs`), схему БД (`transcript`/`calls`/`tracks`), CLI-флаги `--transcript`/`--calls`/`--export`, запись WAV-дорожек.
 - Константа `STT_RATE = 16000.0` в `src/transcribe.rs` остаётся.
 - Термин-файлы (`it_hotwords.txt`, `it_corrections.tsv`) живут в data-dir рядом с распакованным скриптом; редактируются пользователем; установщик копирует их только если отсутствуют.
+- **CUDA-либы вне пути загрузчика** (установлено в Task 1): pip-колёса кладут `libcublas.so.12`/cudnn в `venv-whisper/lib/python3.12/site-packages/nvidia/*/lib`, которых нет на дефолтном пути линкера. `whisper_stream.py` сам чинит это (guard `_ensure_cuda_libpath`: выставляет `LD_LIBRARY_PATH` и `os.execv`-перезапускается), поэтому Rust-сторона НЕ трогает env. Установщик экспортирует `LD_LIBRARY_PATH` для своего вызова `whisper_smoke.py` (в нём guard'а нет).
+- Подтверждённые версии (Task 1): faster-whisper 1.2.1, ctranslate2 4.8.1 — Blackwell/sm_120 работает без даунгрейда.
+- Анти-галлюцинация: в `model.transcribe(...)` держать `condition_on_previous_text=False` (Whisper зацикливается на тихом/неясном аудио — наблюдалось в Task 1).
 
 ## File Structure
 
@@ -360,7 +363,26 @@ def _take(n: int) -> bytes:
         return out
 
 
+def _ensure_cuda_libpath():
+    """CUDA-либы (cublas/cudnn) стоят pip-колёсами внутри venv и не на пути загрузчика.
+    Выставляем LD_LIBRARY_PATH и перезапускаем интерпретатор — линкер читает путь только
+    при старте процесса. Guard по _WHISPER_LDPATH защищает от повторного re-exec.
+    Вызывается только из main() (не при импорте), чтобы не ломать unit-тесты."""
+    if os.environ.get("_WHISPER_LDPATH"):
+        return
+    import glob
+    libs = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages",
+                                  "nvidia", "*", "lib"))
+    os.environ["_WHISPER_LDPATH"] = "1"
+    if not libs:
+        return
+    prev = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(libs + ([prev] if prev else []))
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def main() -> int:
+    _ensure_cuda_libpath()
     if len(sys.argv) < 2:
         sys.stderr.write("usage: whisper_stream.py <model>\n")
         return 2
@@ -383,6 +405,7 @@ def main() -> int:
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(
             audio, language="ru", beam_size=5, vad_filter=True,
+            condition_on_previous_text=False,
             hotwords=hotwords, initial_prompt=hotwords,
         )
         text = " ".join(s.text.strip() for s in segments).strip()
@@ -663,6 +686,10 @@ cp "$SCRIPT_DIR/scripts/whisper_stream.py" "$BASE/whisper_stream.py"
 [ -f "$BASE/it_corrections.tsv" ] || cp "$SCRIPT_DIR/scripts/it_corrections.tsv" "$BASE/it_corrections.tsv"
 
 echo "==> предзагрузка модели $MODEL и проверка GPU-инференса"
+# CUDA-либы стоят колёсами внутри venv, не на пути линкера — smoke-скрипт guard'а не имеет,
+# поэтому выставляем путь здесь (whisper_stream.py в рантайме чинит это сам).
+SITE="$VENV/lib/python3.12/site-packages"
+export LD_LIBRARY_PATH="$SITE/nvidia/cublas/lib:$SITE/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 "$VENV/bin/python" "$SCRIPT_DIR/scripts/whisper_smoke.py"
 
 echo
