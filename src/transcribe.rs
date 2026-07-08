@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::transcript_log::TranscriptLog;
+
 /// Частота, которую ждёт Vosk small-модель.
 const STT_RATE: f64 = 16000.0;
 /// Сколько последних символов финального текста держим (бегущая строка под осциллографом).
@@ -85,9 +87,15 @@ impl Feeder {
 
 impl Transcriber {
     /// Запустить хелпер для канала с исходной частотой `src_rate`.
-    /// None — если транскрипция выключена или окружение (python/скрипт/модель) не готово.
-    /// При успехе возвращает читающую половину (для UI) и кормящую (в аудио-поток).
-    pub fn start(src_rate: u32) -> Option<(Transcriber, Feeder)> {
+    /// `channel` — метка канала для БД («я» / «телемост»), `log` — куда писать полный
+    /// текст (None — не сохранять). None-возврат — если транскрипция выключена или
+    /// окружение (python/скрипт/модель) не готово. При успехе возвращает читающую
+    /// половину (для UI) и кормящую (в аудио-поток).
+    pub fn start(
+        src_rate: u32,
+        channel: &'static str,
+        log: Option<Arc<TranscriptLog>>,
+    ) -> Option<(Transcriber, Feeder)> {
         if std::env::var("HEALTH_TRANSCRIBE").as_deref() == Ok("0") {
             return None;
         }
@@ -132,6 +140,11 @@ impl Transcriber {
                         g.finals.push_str(t);
                         trim_head(&mut g.finals, MAX_FINALS);
                         g.partial.clear();
+                        // Полный сегмент — на диск (с временем и каналом). UI держит
+                        // только бегущий хвост; целиком история живёт в БД.
+                        if let Some(log) = &log {
+                            log.append(channel, t);
+                        }
                     }
                 }
             });

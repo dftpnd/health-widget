@@ -19,6 +19,10 @@ pub struct Config {
     pub auto_hide_on_share: bool,
     /// Период опроса детектора.
     pub detect_poll: Duration,
+    /// Рабочий каталог автопилота (там `.env` и `config/`) — cwd для `autopilot run`.
+    pub autopilot_dir: PathBuf,
+    /// Бинарь автопилота. Кнопки чат/отклики показываются, только если он существует.
+    pub autopilot_bin: PathBuf,
 }
 
 impl Default for Config {
@@ -27,6 +31,12 @@ impl Default for Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("health-widget")
             .join("metrics.json");
+        // Автопилот по умолчанию — рядом в ~/projects/work-autopilot с venv-бинарём.
+        let autopilot_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("projects")
+            .join("work-autopilot");
+        let autopilot_bin = autopilot_dir.join(".venv").join("bin").join("autopilot");
         Self {
             json_path,
             x: 40.0,
@@ -37,6 +47,8 @@ impl Default for Config {
             click_through: false,
             auto_hide_on_share: true,
             detect_poll: Duration::from_millis(1000),
+            autopilot_dir,
+            autopilot_bin,
         }
     }
 }
@@ -67,6 +79,14 @@ impl Config {
         }
         if let Some(v) = env_bool("HEALTH_AUTO_HIDE") {
             c.auto_hide_on_share = v;
+        }
+        // Автопилот: каталог задаётся отдельно, бинарь следует за ним, если не задан явно.
+        if let Ok(v) = std::env::var("HEALTH_AUTOPILOT_DIR") {
+            c.autopilot_dir = PathBuf::from(v);
+            c.autopilot_bin = c.autopilot_dir.join(".venv").join("bin").join("autopilot");
+        }
+        if let Ok(v) = std::env::var("HEALTH_AUTOPILOT_BIN") {
+            c.autopilot_bin = PathBuf::from(v);
         }
         c
     }

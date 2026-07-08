@@ -25,6 +25,14 @@ pub struct State {
     /// Закреплено ли окно «поверх всех».
     #[serde(default)]
     pub pinned: bool,
+    /// Выбранный профиль автопилота (аккаунт/резюме): "fullstack" | "back" | "bulat".
+    /// None — старое состояние без поля → трактуется как "fullstack".
+    #[serde(default)]
+    pub pilot_profile: Option<String>,
+    /// Строгость откликов (порог релевантности к резюме): "strict" | "medium" | "any".
+    /// Прокидывается как MIN_SIMILARITY автопилоту. None — старое состояние → "medium".
+    #[serde(default)]
+    pub pilot_strictness: Option<String>,
 }
 
 fn path() -> PathBuf {

@@ -12,7 +12,11 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use std::path::Path;
+
+use crate::recorder::WavRecorder;
 use crate::transcribe::Transcriber;
+use crate::transcript_log::TranscriptLog;
 
 /// Сколько последних сэмплов держим для отрисовки волны.
 const CAP: usize = 2048;
@@ -162,12 +166,20 @@ pub struct AudioMonitor {
     child: Child,
     /// Онлайн-транскрипция этого канала (None — движок/модель не установлены или выключены).
     transcriber: Option<Transcriber>,
+    /// Пишущий WAV во время кола (None — сейчас не записываем). Разделён с потоком-читателем.
+    recorder: Arc<Mutex<Option<WavRecorder>>>,
 }
 
 impl AudioMonitor {
     /// Запустить захват из `target` (None — источник по умолчанию = микрофон).
+    /// `channel` — метка канала для сохранения транскрипции («я» / «телемост»),
+    /// `log` — хранилище полного текста (None — не сохранять).
     /// None-возврат — если `pw-record` недоступен или не стартовал.
-    pub fn start(target: Option<&str>) -> Option<Self> {
+    pub fn start(
+        target: Option<&str>,
+        channel: &'static str,
+        log: Option<Arc<TranscriptLog>>,
+    ) -> Option<Self> {
         let mut cmd = Command::new("pw-record");
         cmd.args(["--rate", RATE, "--channels", "1", "--format", "f32"]);
         if let Some(t) = target {
@@ -184,8 +196,12 @@ impl AudioMonitor {
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(CAP)));
         let buf = samples.clone();
 
+        // Рекордер кола: разделяем с потоком-читателем; None — пока не пишем.
+        let recorder: Arc<Mutex<Option<WavRecorder>>> = Arc::new(Mutex::new(None));
+        let rec = recorder.clone();
+
         // Транскрайбер: кормящую половину отдаём в поток-читатель, читающую держим в структуре.
-        let (transcriber, mut feeder) = match Transcriber::start(RATE_HZ) {
+        let (transcriber, mut feeder) = match Transcriber::start(RATE_HZ, channel, log) {
             Some((t, f)) => (Some(t), Some(f)),
             None => (None, None),
         };
@@ -221,19 +237,47 @@ impl AudioMonitor {
                         if let Some(f) = feeder.as_mut() {
                             f.feed(&batch); // тот же звук — в распознавание
                         }
+                        // …и в дорожку кола, если сейчас идёт запись.
+                        if let Ok(mut r) = rec.lock() {
+                            if let Some(w) = r.as_mut() {
+                                w.write(&batch);
+                            }
+                        }
                         acc.drain(..full); // остаток (неполный сэмпл) переносим на след. чтение
                     }
                 }
             }
         });
 
-        Some(Self { samples, child, transcriber })
+        Some(Self { samples, child, transcriber, recorder })
     }
 
     /// Текущая транскрипция канала: (накопленный текст, текущая гипотеза).
     /// None — если для канала нет активного распознавания.
     pub fn transcript(&self) -> Option<(String, String)> {
         self.transcriber.as_ref().map(|t| t.text())
+    }
+
+    /// Начать писать звук канала в WAV-файл `path` (дорожка кола). Ошибку возвращаем,
+    /// чтобы вызывающий не считал дорожку записанной.
+    pub fn start_recording(&self, path: &Path) -> std::io::Result<()> {
+        let w = WavRecorder::create(path, RATE_HZ)?;
+        if let Ok(mut g) = self.recorder.lock() {
+            *g = Some(w); // прежний (если был) финализируется при drop
+        }
+        Ok(())
+    }
+
+    /// Остановить запись дорожки: забираем рекордер — его Drop дописывает заголовок WAV.
+    pub fn stop_recording(&self) {
+        if let Ok(mut g) = self.recorder.lock() {
+            g.take();
+        }
+    }
+
+    /// Идёт ли сейчас запись этого канала.
+    pub fn is_recording(&self) -> bool {
+        self.recorder.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
     /// Скопировать текущее содержимое буфера в `out` (переиспользуемый вектор — без аллокаций).
