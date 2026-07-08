@@ -1434,14 +1434,16 @@ dependencies = [
 name = "health-widget"
 version = "0.3.0"
 dependencies = [
- "arboard",
  "dirs",
  "eframe",
  "egui",
+ "image",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
  "signal-hook",
+ "zbus",
 ]
 
 [[package]]

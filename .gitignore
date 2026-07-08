@@ -6,3 +6,4 @@ __pycache__/
 
 # Экспорт колов (--export по умолчанию сюда)
 tmp/
+widget.log

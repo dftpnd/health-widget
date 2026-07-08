@@ -13,7 +13,7 @@
 //! KWin (слой выше); на GNOME системного флага нет — там работает «шарь одно окно» +
 //! авто-скрытие + хоткей.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,9 @@ mod pilot;
 mod pilot_scan;
 mod pilot_stats;
 mod pilot_notify;
+mod kwin_shot;
 mod recorder;
+mod screenshot;
 mod state;
 mod transcribe;
 mod transcript_log;
@@ -152,6 +154,63 @@ struct App {
     /// Состояние предыдущего кадра + момент его появления — для дебаунса записи.
     prev_state: state::State,
     stable_since: Instant,
+    /// Статус последнего снимка области экрана (кнопка «Скрин»). Фоновый поток
+    /// грабера пишет сюда по завершении, UI читает под кнопкой каждый кадр.
+    shot_status: Arc<std::sync::Mutex<screenshot::ShotStatus>>,
+    /// Запрос начать разметку области. Ставится кнопкой «Скрин» или SIGUSR2
+    /// (кнопка Tartarus); update() на главном потоке подхватывает и открывает
+    /// оверлей. Через флаг — потому что сигнал прилетает в другом потоке.
+    shot_request: Arc<AtomicBool>,
+    /// Оверлей разметки сейчас открыт (ждём два клика).
+    shot_active: bool,
+    /// Точки-клики оверлея в физических пикселях экрана (нужно ровно две).
+    shot_points: Vec<[u32; 2]>,
+    /// Счётчики нажатий кнопок-маркеров транскрипции (RT-сигналы от Tartarus: физ. 10=микрофон,
+    /// 15=телемост). Сигнальный поток инкрементит, UI сравнивает с *_seen и обрабатывает
+    /// каждое новое нажатие как старт/стоп записи участка. Счётчик (а не булев тумблер) —
+    /// чтобы не терять нажатия и не зависеть от порядка кадров.
+    mark_mic: Arc<AtomicU32>,
+    mark_zoom: Arc<AtomicU32>,
+    /// Сколько нажатий уже обработано UI-потоком (микрофон/телемост).
+    mark_mic_seen: u32,
+    mark_zoom_seen: u32,
+    /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
+    markers_mic: MarkerState,
+    markers_zoom: MarkerState,
+}
+
+/// Состояние маркеров транскрипции одного канала. Кнопка стартует запись (запоминаем
+/// байтовый офсет конца текста), повторное нажатие — стоп: диапазон уходит в `spans`
+/// (подсветка остаётся навсегда), а текст участка копируется в буфер. Пока запись идёт,
+/// подсвечивается растущий диапазон `active_start..конец`. Несколько маркеров копятся.
+#[derive(Default)]
+struct MarkerState {
+    /// Завершённые маркеры — байтовые диапазоны [start, end) в накопленном тексте.
+    spans: Vec<(usize, usize)>,
+    /// Старт текущей записи (байтовый офсет), None — сейчас не пишем.
+    active_start: Option<usize>,
+}
+
+impl MarkerState {
+    /// Обработать одно нажатие кнопки при текущей длине текста `len` (в байтах).
+    /// Возвращает диапазон для копирования, если это был «стоп».
+    fn toggle(&mut self, len: usize) -> Option<(usize, usize)> {
+        match self.active_start.take() {
+            None => {
+                self.active_start = Some(len);
+                None
+            }
+            Some(start) => {
+                let end = len;
+                if start < end {
+                    self.spans.push((start, end));
+                    Some((start, end))
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 impl App {
@@ -169,15 +228,53 @@ impl App {
             .clone()
             .unwrap_or_else(|| DEFAULT_STRICTNESS.to_string());
 
-        // Поток обработки SIGUSR1: тумблер видимости + перерисовка.
+        // Статус снимка экрана — общий для UI (кнопка «Скрин») и грабера.
+        let shot_status: Arc<std::sync::Mutex<screenshot::ShotStatus>> =
+            Arc::new(std::sync::Mutex::new(screenshot::ShotStatus::Idle));
+        // Запрос разметки области — ставят кнопка «Скрин» и SIGUSR2, читает update().
+        let shot_request = Arc::new(AtomicBool::new(false));
+
+        // Счётчики нажатий кнопок-маркеров (RT-сигналы от Tartarus: 10=микрофон, 15=телемост).
+        let mark_mic = Arc::new(AtomicU32::new(0));
+        let mark_zoom = Arc::new(AtomicU32::new(0));
+
+        // Поток обработки сигналов: SIGUSR1 — тумблер видимости; SIGUSR2 — начать
+        // разметку области под снимок (кнопка «Скрин»); SIGRTMIN+0/+1 — тумблеры выделения
+        // транскрипции микрофона/телемоста (кнопки Tartarus через remap → pkill --signal).
         {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
+            let shot_request = shot_request.clone();
+            let mark_mic = mark_mic.clone();
+            let mark_zoom = mark_zoom.clone();
+            // SIGRTMIN зависит от glibc (обычно 34); вычисляем один раз, тем же значением
+            // Tartarus шлёт `pkill --signal 34/35`.
+            let rt_mic = libc::SIGRTMIN();
+            let rt_zoom = libc::SIGRTMIN() + 1;
             std::thread::spawn(move || {
-                let mut signals =
-                    signal_hook::iterator::Signals::new([signal_hook::consts::SIGUSR1])
-                        .expect("cannot register SIGUSR1 handler");
-                for _ in signals.forever() {
+                let mut signals = signal_hook::iterator::Signals::new([
+                    signal_hook::consts::SIGUSR1,
+                    signal_hook::consts::SIGUSR2,
+                    rt_mic,
+                    rt_zoom,
+                ])
+                .expect("cannot register signal handler");
+                for sig in signals.forever() {
+                    if sig == signal_hook::consts::SIGUSR2 {
+                        shot_request.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    if sig == rt_mic {
+                        mark_mic.fetch_add(1, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    if sig == rt_zoom {
+                        mark_zoom.fetch_add(1, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
                     let prev = shared.user_visible.load(Ordering::Relaxed);
                     shared.user_visible.store(!prev, Ordering::Relaxed);
                     ctx.request_repaint();
@@ -323,6 +420,16 @@ impl App {
             last_saved: st.clone(),
             prev_state: st.clone(),
             stable_since: Instant::now(),
+            shot_status,
+            shot_request,
+            shot_active: false,
+            shot_points: Vec::new(),
+            mark_mic,
+            mark_zoom,
+            mark_mic_seen: 0,
+            mark_zoom_seen: 0,
+            markers_mic: MarkerState::default(),
+            markers_zoom: MarkerState::default(),
         }
     }
 
@@ -492,6 +599,80 @@ impl App {
         self.pilot_notify_on =
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
     }
+
+    /// Полноэкранный прозрачный оверлей разметки области под снимок. Ловит два
+    /// клика (в физических пикселях экрана), рисует крестики на отмеченном; по
+    /// второму клику закрывается и отдаёт прямоугольник граберу. Esc — отмена.
+    fn show_shot_overlay(&mut self, ctx: &egui::Context) {
+        let vb = egui::ViewportBuilder::default()
+            .with_title("health-widget-shot")
+            .with_fullscreen(true)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_mouse_passthrough(false);
+        let id = egui::ViewportId::from_hash_of("hw-shot-overlay");
+
+        // Итог кадра: None — ещё размечаем; Some(None) — отмена; Some(Some(rect)).
+        let mut done: Option<Option<[u32; 4]>> = None;
+
+        ctx.show_viewport_immediate(id, vb, |octx, _class| {
+            if octx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                done = Some(None);
+            }
+            let click = octx.input(|i| {
+                i.pointer
+                    .primary_clicked()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            });
+
+            // Полностью прозрачный оверлей: экран выглядит как обычно (без вуали и
+            // меток), но окно ловит клики (mouse_passthrough=false). Пустой frame с
+            // прозрачной заливкой — на экране ничего не рисуем.
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin::same(0))
+                        .fill(egui::Color32::TRANSPARENT),
+                )
+                .show(octx, |ui| {
+                    // Сенс на всю площадь — гарантируем, что окно принимает клики.
+                    ui.allocate_response(ui.available_size(), egui::Sense::click());
+                });
+
+            if done.is_none() {
+                if let Some(pos) = click {
+                    // Логические координаты (как геометрия окон KWin) — их ждёт CaptureArea.
+                    let px = [pos.x.round().max(0.0) as u32, pos.y.round().max(0.0) as u32];
+                    self.shot_points.push(px);
+                    if self.shot_points.len() >= 2 {
+                        let (a, b) = (self.shot_points[0], self.shot_points[1]);
+                        done = Some(Some([
+                            a[0].min(b[0]),
+                            a[1].min(b[1]),
+                            a[0].abs_diff(b[0]),
+                            a[1].abs_diff(b[1]),
+                        ]));
+                    }
+                }
+            }
+            octx.request_repaint();
+        });
+
+        if let Some(res) = done {
+            self.shot_active = false;
+            self.shot_points.clear();
+            ctx.request_repaint();
+            match res {
+                Some([x, y, w, h]) => {
+                    *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Working;
+                    screenshot::grab(x as i32, y as i32, w, h, ctx.clone(), self.shot_status.clone());
+                }
+                None => *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Cancelled,
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -513,6 +694,17 @@ impl eframe::App for App {
         }
 
         self.maybe_reload();
+
+        // Снимок области: запрос от кнопки «Скрин» или SIGUSR2 (Tartarus) открывает
+        // прозрачный оверлей разметки; пока он активен — рисуем его каждый кадр.
+        if self.shot_request.swap(false, Ordering::Relaxed) && !self.shot_active {
+            self.shot_active = true;
+            self.shot_points.clear();
+            *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Marking;
+        }
+        if self.shot_active {
+            self.show_shot_overlay(ctx);
+        }
 
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
         // (скан/обогащение) завершаются сами, дойдя до конца, — сообщаем об этом,
@@ -739,38 +931,93 @@ impl eframe::App for App {
                 }
                 ui.add_space(2.0);
 
-                // Кол: запись звонка (две дорожки WAV + транскрипт) под одним названием и
-                // датой. Каналы могли смениться выше — приводим запись в соответствие колу.
+                // Кол + Скрин в одной линии, по 50% ширины каждому. Слева — запись
+                // звонка (две дорожки WAV + транскрипт), справа — снимок области экрана
+                // через Spectacle. Каналы могли смениться выше — приводим запись к колу.
                 self.reconcile_call_recording();
                 let mut call_toggle = false;
                 let active_name = self.active_call.as_ref().map(|c| c.name.clone());
                 let mut name_buf = self.call_name_input.clone();
-                section(ui, "🎙 Кол", |ui| {
-                    ui.horizontal(|ui| {
-                        let recording = active_name.is_some();
-                        let (label, hint) = if recording {
-                            ("⏹ Завершить кол", "Остановить запись и сохранить кол")
-                        } else {
-                            ("🔴 Новый кол", "Начать запись звонка: звук обоих каналов + текст")
-                        };
-                        if ui.button(label).on_hover_text(hint).clicked() {
-                            call_toggle = true;
+
+                let mut shoot = false;
+                let shot_line = {
+                    use screenshot::ShotStatus::*;
+                    match &*self.shot_status.lock().unwrap() {
+                        Idle => None,
+                        Marking => Some((
+                            "⧗ кликни две точки…".to_string(),
+                            egui::Color32::from_rgb(210, 200, 120),
+                        )),
+                        Working => Some((
+                            "⧗ режу…".to_string(),
+                            egui::Color32::from_rgb(210, 200, 120),
+                        )),
+                        Saved(p) => {
+                            let name = std::path::Path::new(p)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("сохранено");
+                            Some((
+                                format!("✔ {name}"),
+                                egui::Color32::from_rgb(120, 200, 120),
+                            ))
                         }
-                        if let Some(n) = &active_name {
-                            ui.label(
-                                egui::RichText::new(format!("● запись: {n}"))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(230, 120, 120)),
-                            );
-                        } else {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut name_buf)
-                                    .hint_text("название кола")
-                                    .desired_width(150.0),
-                            );
+                        Cancelled => Some(("отменено".to_string(), egui::Color32::GRAY)),
+                        Failed(e) => {
+                            Some((format!("✖ {e}"), egui::Color32::from_rgb(230, 120, 120)))
                         }
+                    }
+                };
+
+                ui.columns(2, |cols| {
+                    section(&mut cols[0], "🎙 Кол", |ui| {
+                        ui.horizontal(|ui| {
+                            let recording = active_name.is_some();
+                            let (label, hint) = if recording {
+                                ("⏹ Завершить", "Остановить запись и сохранить кол")
+                            } else {
+                                ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
+                            };
+                            if ui.button(label).on_hover_text(hint).clicked() {
+                                call_toggle = true;
+                            }
+                            if let Some(n) = &active_name {
+                                ui.label(
+                                    egui::RichText::new(format!("● {n}"))
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(230, 120, 120)),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut name_buf)
+                                        .hint_text("название")
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
+                        });
+                    });
+                    section(&mut cols[1], "📸 Скрин", |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.shot_active,
+                                    egui::Button::new("📸 Область"),
+                                )
+                                .on_hover_text(
+                                    "Кликнуть две точки на экране — сохранить PNG области \
+                                     в ~/.local/share/health-widget/screenshots/",
+                                )
+                                .clicked()
+                            {
+                                shoot = true;
+                            }
+                            if let Some((text, color)) = &shot_line {
+                                ui.label(egui::RichText::new(text).size(11.0).color(*color));
+                            }
+                        });
                     });
                 });
+
                 self.call_name_input = name_buf;
                 if call_toggle {
                     if self.active_call.is_some() {
@@ -778,6 +1025,9 @@ impl eframe::App for App {
                     } else {
                         self.start_call();
                     }
+                }
+                if shoot {
+                    self.shot_request.store(true, Ordering::Relaxed);
                 }
                 ui.add_space(2.0);
 
@@ -802,7 +1052,7 @@ impl eframe::App for App {
                             .and_then(|p| p.last_line())
                             .unwrap_or_else(|| self.pilot_status.clone())
                     };
-                    section(ui, "🤖 Автопилот", |ui| {
+                    section_collapsible(ui, "🤖 Автопилот", |ui| {
                         // Профиль (аккаунт/резюме): под кем работает автопилот. Смена —
                         // перезапуск под другой аккаунт браузера (свой логин, свои счётчики).
                         ui.horizontal(|ui| {
@@ -1166,7 +1416,7 @@ impl eframe::App for App {
                 }
 
                 if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
-                    section(ui, "📊 Показатели", |ui| {
+                    section_collapsible(ui, "📊 Показатели", |ui| {
                         for m in &self.metrics.items {
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -1197,6 +1447,30 @@ impl eframe::App for App {
                     });
                 }
 
+                // Кнопки-маркеры транскрипции (RT-сигналы Tartarus): обрабатываем каждое новое
+                // нажатие как старт/стоп записи участка. На «стоп» — текст участка в буфер обмена;
+                // сами диапазоны-маркеры хранятся в markers_* и рисуются в draw_transcript.
+                let c_mic = self.mark_mic.load(Ordering::Relaxed);
+                let mic_finals = self.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+                if let Some(txt) = apply_mark_presses(
+                    &mut self.markers_mic,
+                    &mut self.mark_mic_seen,
+                    c_mic,
+                    mic_finals.as_deref(),
+                ) {
+                    clipboard_set(txt);
+                }
+                let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
+                let zoom_finals = self.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+                if let Some(txt) = apply_mark_presses(
+                    &mut self.markers_zoom,
+                    &mut self.mark_zoom_seen,
+                    c_zoom,
+                    zoom_finals.as_deref(),
+                ) {
+                    clipboard_set(txt);
+                }
+
                 // Осциллограммы активных каналов (у каждого — своя подпись и цвет).
                 if self.mic.is_some() || self.zoom.is_some() {
                     section(ui, "📈 Осциллограммы", |ui| {
@@ -1205,7 +1479,7 @@ impl eframe::App for App {
                             let color = egui::Color32::from_rgb(120, 210, 150);
                             ui.label(egui::RichText::new("🎤 Микрофон").size(11.0).color(color));
                             draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color, "mic");
+                            draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
                         }
                         if let Some(mon) = &self.zoom {
                             mon.snapshot(&mut self.scope);
@@ -1215,7 +1489,7 @@ impl eframe::App for App {
                                 egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
                             );
                             draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color, "zoom");
+                            draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
                         }
                     });
                 }
@@ -1264,7 +1538,27 @@ fn section<R>(
     ui: &mut egui::Ui,
     title: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
+) -> Option<R> {
+    section_impl(ui, title, false, add_contents)
+}
+
+/// Как [`section`], но с иконкой сворачивания справа от заголовка. Клик по заголовку
+/// или иконке скрывает/показывает содержимое; состояние запоминается на время сессии.
+fn section_collapsible<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    section_impl(ui, title, true, add_contents)
+}
+
+fn section_impl<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    collapsible: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let title_color = egui::Color32::from_rgb(120, 130, 150);
     egui::Frame::default()
         .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
@@ -1272,14 +1566,52 @@ fn section<R>(
         .corner_radius(8)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(title)
-                    .size(10.5)
-                    .strong()
-                    .color(egui::Color32::from_rgb(120, 130, 150)),
-            );
-            ui.add_space(4.0);
-            add_contents(ui)
+            let title_rich = egui::RichText::new(title)
+                .size(10.5)
+                .strong()
+                .color(title_color);
+
+            if !collapsible {
+                ui.label(title_rich);
+                ui.add_space(4.0);
+                return Some(add_contents(ui));
+            }
+
+            let id = ui.make_persistent_id(("section_collapsed", title));
+            let mut collapsed = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+            let toggled = ui
+                .horizontal(|ui| {
+                    let icon = if collapsed { "▸" } else { "▾" };
+                    let header = ui.add(
+                        egui::Label::new(title_rich).sense(egui::Sense::click()),
+                    );
+                    let icon_resp = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(icon).size(10.5).color(title_color),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                        })
+                        .inner;
+                    let hovered = header.hovered() || icon_resp.hovered();
+                    if hovered {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    header.clicked() || icon_resp.clicked()
+                })
+                .inner;
+            if toggled {
+                collapsed = !collapsed;
+                ui.data_mut(|d| d.insert_temp(id, collapsed));
+            }
+            if collapsed {
+                None
+            } else {
+                ui.add_space(4.0);
+                Some(add_contents(ui))
+            }
         })
         .inner
 }
@@ -1330,17 +1662,30 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
 /// прокручиваемой области (остаётся на месте, можно выделить и скопировать), текущую
 /// незавершённую гипотезу — приглушённо отдельной строкой. `data` = None — распознавание
 /// для канала не запущено (нет venv/модели) → ничего не рисуем. `id_salt` разводит
-/// состояние прокрутки/выделения двух каналов (микрофон/Zoom).
+/// состояние прокрутки/выделения двух каналов (микрофон/Zoom). `markers` — участки,
+/// отмеченные кнопкой с макро-клавиатуры (Tartarus): их фон подсвечивается цветом канала.
 fn draw_transcript(
     ui: &mut egui::Ui,
     data: Option<(String, String)>,
     color: egui::Color32,
     id_salt: &str,
+    markers: &MarkerState,
 ) {
     let (finals, partial) = match data {
         Some(t) => t,
         None => return,
     };
+    // Индикатор активной записи маркера (кнопка Tartarus нажата один раз, ждём второго).
+    // Мигает, чтобы читалось как «идёт запись»; появляется даже пока текста ещё нет.
+    if markers.active_start.is_some() {
+        let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 3.0).sin() as f32;
+        ui.label(
+            egui::RichText::new("🔴 идёт запись маркера")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(235, 90, 90).gamma_multiply(pulse)),
+        );
+        ui.add_space(1.0);
+    }
     if finals.is_empty() && partial.is_empty() {
         // Пока тишина/прогрев — тонкая подсказка, чтобы канал не выглядел «сломанным».
         ui.label(
@@ -1356,7 +1701,7 @@ fn draw_transcript(
     // но стоит прокрутить вверх для выделения — остаёмся на месте, текст не «уезжает».
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
-        .max_height(120.0)
+        .max_height(300.0)
         .auto_shrink([false, true])
         .stick_to_bottom(true)
         .show(ui, |ui| {
@@ -1364,14 +1709,23 @@ fn draw_transcript(
                 // Выделяемый текст. По факту read-only: правки в scratch-копию не сохраняем
                 // (перезаписываем каждый кадр из finals). Как только выделение завершено
                 // (отпустили мышь) — выделенное сразу в буфер обмена, без Ctrl+C.
+                // Диапазоны-маркеры (кнопка Tartarus) подсвечиваются фоном через кастомный
+                // layouter: завершённые участки + активная запись, растущая до конца текста.
                 let mut text = finals.clone();
+                let hl = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
+                let mut ranges: Vec<(usize, usize)> = markers.spans.clone();
+                if let Some(start) = markers.active_start {
+                    ranges.push((start, text.len()));
+                }
+                let mut layouter = |ui: &egui::Ui, s: &str, wrap: f32| {
+                    ui.fonts(|f| f.layout_job(transcript_job(s, &ranges, color, hl, wrap)))
+                };
                 let out = egui::TextEdit::multiline(&mut text)
                     .id_salt(id_salt)
                     .frame(false)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(1)
-                    .font(egui::FontId::proportional(12.0))
-                    .text_color(color)
+                    .desired_rows(10)
+                    .layouter(&mut layouter)
                     .show(ui);
                 if ui.input(|i| i.pointer.any_released()) {
                     if let Some(range) = out.cursor_range {
@@ -1394,11 +1748,114 @@ fn draw_transcript(
                 ui.label(
                     egui::RichText::new(&partial)
                         .italics()
-                        .size(12.0)
+                        .size(20.0)
                         .color(egui::Color32::from_rgb(140, 146, 158)),
                 );
             }
         });
+}
+
+/// Положить текст в системный буфер обмена через `wl-copy`. Почему не `egui`/`ctx.copy_text`:
+/// на Wayland eframe ставит буфер через smithay-clipboard, а тот работает только когда окно
+/// в фокусе (нужен input-serial). Копия по кнопке Tartarus прилетает, когда виджет НЕ в фокусе,
+/// поэтому egui-копия молча не проходит. `wl-copy` создаёт свой data-source и не зависит от
+/// фокуса. Пишем в отдельном потоке, чтобы не блокировать UI (wl-copy форкает демон-держатель).
+fn clipboard_set(text: String) {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    });
+}
+
+/// Обработать накопившиеся нажатия кнопки-маркера канала (счётчик сигнального потока минус
+/// уже учтённые). Каждое нажатие — старт/стоп записи участка; на «стоп» возвращает текст
+/// участка для копирования в буфер. `finals` — накопленный текст канала (None — канал выключен).
+fn apply_mark_presses(
+    markers: &mut MarkerState,
+    seen: &mut u32,
+    count: u32,
+    finals: Option<&str>,
+) -> Option<String> {
+    let mut presses = count.wrapping_sub(*seen);
+    *seen = count;
+    if presses == 0 {
+        return None;
+    }
+    // Предохранитель от рассинхрона/переполнения: не прокручиваем абсурдное число нажатий.
+    if presses > 8 {
+        presses = 1;
+    }
+    let text = finals.unwrap_or("");
+    let len = text.len();
+    let mut to_copy = None;
+    for _ in 0..presses {
+        if let Some((s, e)) = markers.toggle(len) {
+            if let Some(slice) = text.get(s..e) {
+                if !slice.is_empty() {
+                    to_copy = Some(slice.to_string());
+                }
+            }
+        }
+    }
+    to_copy
+}
+
+/// Собрать `LayoutJob` для транскрипта: весь текст цветом `color` шрифтом 20, а байтовые
+/// диапазоны `ranges` (маркеры + активная запись) — с фоном `hl`. `wrap` — ширина переноса,
+/// которую даёт layouter egui. Границы диапазонов снапаются к границам символов (панико-безопасно).
+fn transcript_job(
+    text: &str,
+    ranges: &[(usize, usize)],
+    color: egui::Color32,
+    hl: egui::Color32,
+    wrap: f32,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let n = text.len();
+    let mut cuts = vec![0usize, n];
+    for &(s, e) in ranges {
+        for mut b in [s.min(n), e.min(n)] {
+            while b > 0 && !text.is_char_boundary(b) {
+                b -= 1;
+            }
+            cuts.push(b);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let font = egui::FontId::proportional(20.0);
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let inside = ranges.iter().any(|&(s, e)| a >= s && a < e);
+        let bg = if inside { hl } else { egui::Color32::TRANSPARENT };
+        job.append(
+            &text[a..b],
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color,
+                background: bg,
+                ..Default::default()
+            },
+        );
+    }
+    job
 }
 
 /// Нарисовать ручку ресайза в правом-нижнем углу панели и обработать перетаскивание.
@@ -1442,6 +1899,13 @@ fn main() -> eframe::Result<()> {
     // Диагностика: `health-widget --check-capture` печатает, видит ли детектор активный
     // захват экрана прямо сейчас, и выходит (0 = захват идёт, 1 = нет). Удобно проверить
     // авто-скрытие со своим инструментом созвона до боевого звонка (см. README «Проверка»).
+    // Диагностика прямого захвата через KWin (см. kwin_shot): печатает, авторизован
+    // ли бинарь и что вернул CaptureArea. Выходит.
+    if std::env::args().nth(1).as_deref() == Some("--grab-test") {
+        kwin_shot::grab_test();
+        std::process::exit(0);
+    }
+
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
         println!(
             "health-widget v{} (commit {}, сборка {})",
@@ -1532,6 +1996,9 @@ fn main() -> eframe::Result<()> {
     let size = [st.width.unwrap_or(cfg.width), st.height.unwrap_or(cfg.height)];
     let pos = [st.x.unwrap_or(cfg.x), st.y.unwrap_or(cfg.y)];
 
+    // Саморегистрация для права на снимок области (KWin CaptureArea) — best-effort.
+    screenshot::ensure_registered();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("health-widget")
         .with_inner_size(size)
@@ -1556,4 +2023,67 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, cfg_for_app, shared, st)))),
     )
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::{apply_mark_presses, MarkerState};
+
+    #[test]
+    fn start_then_stop_makes_span() {
+        let mut m = MarkerState::default();
+        assert_eq!(m.toggle(5), None); // старт
+        assert_eq!(m.active_start, Some(5));
+        assert_eq!(m.toggle(12), Some((5, 12))); // стоп
+        assert_eq!(m.spans, vec![(5, 12)]);
+        assert_eq!(m.active_start, None);
+    }
+
+    #[test]
+    fn markers_accumulate() {
+        let mut m = MarkerState::default();
+        m.toggle(0);
+        m.toggle(3);
+        m.toggle(5);
+        m.toggle(9);
+        assert_eq!(m.spans, vec![(0, 3), (5, 9)]);
+    }
+
+    #[test]
+    fn empty_span_not_recorded() {
+        let mut m = MarkerState::default();
+        m.toggle(4);
+        assert_eq!(m.toggle(4), None); // стоп на той же позиции — участка нет
+        assert!(m.spans.is_empty());
+    }
+
+    #[test]
+    fn presses_start_grow_stop_copies_grown_slice() {
+        let mut m = MarkerState::default();
+        let mut seen = 0u32;
+        let t1 = "привет"; // 12 байт
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, Some(t1)), None);
+        assert_eq!(m.active_start, Some(12));
+        let t2 = "привет мир"; // 19 байт; участок [12,19) == " мир"
+        let got = apply_mark_presses(&mut m, &mut seen, 2, Some(t2));
+        assert_eq!(got.as_deref(), Some(" мир"));
+        assert_eq!(m.spans, vec![(12, 19)]);
+    }
+
+    #[test]
+    fn no_new_presses_returns_none() {
+        let mut m = MarkerState::default();
+        let mut seen = 5u32;
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 5, Some("abc")), None);
+        assert_eq!(seen, 5);
+    }
+
+    #[test]
+    fn press_on_disabled_channel_no_panic() {
+        let mut m = MarkerState::default();
+        let mut seen = 0u32;
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, None), None); // старт
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 2, None), None); // стоп на пустом
+        assert!(m.spans.is_empty());
+    }
 }
