@@ -1,5 +1,5 @@
 import unittest
-from whisper_stream import parse_hotwords, parse_corrections, apply_corrections
+from whisper_stream import parse_hotwords, parse_corrections, apply_corrections, load_hotwords, load_corrections
 
 class TestHotwords(unittest.TestCase):
     def test_joins_terms(self):
@@ -35,6 +35,13 @@ class TestCorrections(unittest.TestCase):
     def test_skips_malformed_lines(self):
         pairs = parse_corrections(["нет таба", "", "# коммент", "a\tb"])
         self.assertEqual(len(pairs), 1)
+
+class TestLoaders(unittest.TestCase):
+    def test_load_hotwords_missing_file(self):
+        self.assertEqual(load_hotwords("/nonexistent/path/it_hotwords.txt"), "")
+
+    def test_load_corrections_missing_file(self):
+        self.assertEqual(load_corrections("/nonexistent/path/it_corrections.tsv"), [])
 
 if __name__ == "__main__":
     unittest.main()
