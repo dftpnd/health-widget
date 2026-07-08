@@ -193,8 +193,11 @@ struct App {
     /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
-    /// Чат-ассистент (правая колонка). История эфемерная.
+    /// Чат-ассистент (правая колонка). Оставлен в дереве под будущий рефакторинг; сейчас
+    /// колонка рендерит терминал, а не чат.
     chat: chat::ChatState,
+    /// Встроенный терминал колонки. None до первого открытия колонки (ленивый старт shell).
+    terminal: Option<terminal::Terminal>,
     /// Открыта ли чат-колонка (иначе окно — одна колонка, как раньше).
     chat_open: bool,
     /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии чата.
@@ -472,6 +475,7 @@ impl App {
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
             chat: chat::ChatState::default(),
+            terminal: None,
             chat_open: st.chat_open,
             width_one_col: None,
             chat_width: st.chat_width.unwrap_or(CHAT_W),
@@ -733,6 +737,7 @@ impl App {
     }
 
     /// Нарисовать содержимое чат-колонки: шапка + лента сообщений + ввод.
+    #[allow(dead_code)] // чат оставлен в дереве под будущий рефакторинг; колонка рендерит терминал
     fn draw_chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.chat.drain_inbox();
 
@@ -979,7 +984,10 @@ impl eframe::App for App {
                     .default_width(self.chat_width)
                     .frame(frame)
                     .show(ctx, |ui| {
-                        self.draw_chat(ui, ctx);
+                        let term = self
+                            .terminal
+                            .get_or_insert_with(|| terminal::Terminal::new(ctx));
+                        term.ui(ui);
                     });
                 // Запоминаем фактическую ширину колонки (юзер мог перетянуть) для сохранения.
                 self.chat_width = resp.response.rect.width();
@@ -1030,8 +1038,8 @@ impl eframe::App for App {
                             toggle_pin = true;
                         }
                         if ui
-                            .selectable_label(self.chat_open, "💬")
-                            .on_hover_text("Чат-ассистент")
+                            .selectable_label(self.chat_open, "🖥")
+                            .on_hover_text("Терминал")
                             .clicked()
                         {
                             toggle_chat = true;
