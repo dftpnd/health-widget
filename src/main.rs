@@ -690,46 +690,8 @@ impl App {
     /// Нарисовать содержимое чат-колонки: шапка + лента сообщений + ввод.
     fn draw_chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.chat.drain_inbox();
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("💬 Чат")
-                    .size(13.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(180, 200, 255)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("очистить").clicked() {
-                    self.chat.clear();
-                }
-            });
-        });
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("chat_log")
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for msg in &self.chat.messages {
-                    let (who, color) = match msg.role {
-                        chat::Role::User => ("ты", egui::Color32::from_rgb(150, 210, 170)),
-                        chat::Role::Assistant => ("ассистент", egui::Color32::from_rgb(180, 200, 255)),
-                        chat::Role::Error => ("ошибка", egui::Color32::from_rgb(230, 120, 120)),
-                    };
-                    ui.label(egui::RichText::new(who).size(10.0).color(color));
-                    ui.label(egui::RichText::new(&msg.text).size(14.0));
-                    ui.add_space(4.0);
-                }
-                if self.chat.is_sending() {
-                    ui.label(
-                        egui::RichText::new("…думает")
-                            .italics()
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(140, 146, 158)),
-                    );
-                }
-            });
 
-        // Приём картинки перетаскиванием в область чата → OCR в attachment.
+        // Приём картинки перетаскиванием в область чата → OCR в attachment (до отрисовки чипа).
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -747,44 +709,102 @@ impl App {
             }
         }
 
-        ui.separator();
-        // Чип с прикреплённым OCR-текстом (видно, что уйдёт вместе с сообщением).
-        if let Some(att) = self.chat.attachment.clone() {
-            ui.horizontal(|ui| {
-                let short: String = att.chars().take(40).collect();
-                ui.label(
-                    egui::RichText::new(format!("📷 {short}…"))
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(150, 180, 150)),
-                );
-                if ui.small_button("✕").on_hover_text("убрать картинку").clicked() {
-                    self.chat.attachment = None;
+        // Шапка сверху.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("💬 Чат")
+                    .size(13.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(180, 200, 255)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("очистить").clicked() {
+                    self.chat.clear();
                 }
             });
-        }
-        let mut do_send = false;
-        ui.horizontal(|ui| {
-            if ui.button("📎").on_hover_text("вставить картинку из буфера (OCR)").clicked() {
-                match chat::ocr_clipboard() {
-                    Ok(t) => self.chat.attachment = Some(t),
-                    Err(e) => self.chat.messages.push(chat::ChatMessage {
-                        role: chat::Role::Error,
-                        text: e,
-                    }),
-                }
-            }
-            let send_clicked = ui.button("▶").on_hover_text("отправить (Enter)").clicked();
-            let resp = ui.add(
-                egui::TextEdit::multiline(&mut self.chat.input)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("сообщение…"),
-            );
-            // Enter отправляет, Shift+Enter — перенос строки.
-            let enter = resp.has_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-            do_send = send_clicked || enter;
         });
+        ui.separator();
+
+        // Ввод прикреплён к НИЗУ панели через bottom-панель, иначе прокручиваемая лента
+        // (auto_shrink=false) забирает всю высоту и выталкивает поле ввода за край окна.
+        let mut do_send = false;
+        egui::TopBottomPanel::bottom("chat_input")
+            .resizable(false)
+            .frame(egui::Frame::default())
+            .show_inside(ui, |ui| {
+                ui.separator();
+                // Чип с прикреплённым OCR-текстом (видно, что уйдёт вместе с сообщением).
+                if let Some(att) = self.chat.attachment.clone() {
+                    ui.horizontal(|ui| {
+                        let short: String = att.chars().take(40).collect();
+                        let ell = if att.chars().count() > 40 { "…" } else { "" };
+                        ui.label(
+                            egui::RichText::new(format!("📷 {short}{ell}"))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 180, 150)),
+                        );
+                        if ui.small_button("✕").on_hover_text("убрать картинку").clicked() {
+                            self.chat.attachment = None;
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("📎").on_hover_text("вставить картинку из буфера (OCR)").clicked() {
+                        match chat::ocr_clipboard() {
+                            Ok(t) => self.chat.attachment = Some(t),
+                            Err(e) => self.chat.messages.push(chat::ChatMessage {
+                                role: chat::Role::Error,
+                                text: e,
+                            }),
+                        }
+                    }
+                    let send_clicked =
+                        ui.button("▶").on_hover_text("отправить (Enter)").clicked();
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut self.chat.input)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("сообщение…"),
+                    );
+                    // Enter отправляет, Shift+Enter — перенос строки.
+                    let enter = resp.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                    do_send = send_clicked || enter;
+                });
+            });
+
+        // Лента сообщений заполняет оставшееся место над полем ввода.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default())
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("chat_log")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for msg in &self.chat.messages {
+                            let (who, color) = match msg.role {
+                                chat::Role::User => ("ты", egui::Color32::from_rgb(150, 210, 170)),
+                                chat::Role::Assistant => {
+                                    ("ассистент", egui::Color32::from_rgb(180, 200, 255))
+                                }
+                                chat::Role::Error => ("ошибка", egui::Color32::from_rgb(230, 120, 120)),
+                            };
+                            ui.label(egui::RichText::new(who).size(10.0).color(color));
+                            ui.label(egui::RichText::new(&msg.text).size(14.0));
+                            ui.add_space(4.0);
+                        }
+                        if self.chat.is_sending() {
+                            ui.label(
+                                egui::RichText::new("…думает")
+                                    .italics()
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(140, 146, 158)),
+                            );
+                        }
+                    });
+            });
+
         if do_send && !self.chat.is_sending() {
             self.chat.send(
                 ctx,
