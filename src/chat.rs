@@ -227,16 +227,32 @@ pub fn ocr_clipboard() -> Result<String, String> {
     ocr_file(&path)
 }
 
-/// OCR файла-картинки: tesseract rus+eng, распознанный текст из stdout.
+/// Есть ли у tesseract русский языковой пакет (иначе `-l rus+eng` падает целиком).
+fn tesseract_has_rus() -> bool {
+    Command::new("tesseract")
+        .arg("--list-langs")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == "rus")
+        })
+        .unwrap_or(false)
+}
+
+/// OCR файла-картинки: `rus+eng`, если стоит русский пакет, иначе откат на `eng`
+/// (без пакета rus tesseract с `-l rus+eng` не запускается вовсе). Текст — из stdout.
 pub fn ocr_file(path: &Path) -> Result<String, String> {
+    let langs = if tesseract_has_rus() { "rus+eng" } else { "eng" };
     let out = Command::new("tesseract")
         .arg(path)
         .arg("stdout")
-        .args(["-l", "rus+eng"])
+        .args(["-l", langs])
         .output()
         .map_err(|e| format!("tesseract не запущен: {e}"))?;
     if !out.status.success() {
-        return Err("tesseract вернул ошибку (установлен ли пакет rus?)".to_string());
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("tesseract ошибка: {}", err.lines().last().unwrap_or("?")));
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if text.is_empty() {

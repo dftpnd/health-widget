@@ -105,7 +105,20 @@ pub fn grab(x: i32, y: i32, w: u32, h: u32, ctx: egui::Context, status: Arc<Mute
         }
         let path = dir.join(format!("{}.png", timestamp()));
         match img.save(&path) {
-            Ok(_) => finish(&status, &ctx, ShotStatus::Saved(path.display().to_string())),
+            Ok(_) => {
+                // Кладём снимок ещё и в буфер обмена (image/png), чтобы его можно было
+                // сразу вставить — напр. кнопкой 📎 в чат. wl-copy демонизируется и держит
+                // содержимое сам (как в clipboard_set), поэтому просто spawn без ожидания.
+                if let Ok(f) = std::fs::File::open(&path) {
+                    let _ = std::process::Command::new("wl-copy")
+                        .args(["-t", "image/png"])
+                        .stdin(f)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+                finish(&status, &ctx, ShotStatus::Saved(path.display().to_string()))
+            }
             Err(e) => finish(&status, &ctx, ShotStatus::Failed(format!("save: {e}"))),
         }
     });
