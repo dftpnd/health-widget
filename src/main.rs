@@ -24,6 +24,7 @@ mod detect;
 mod pilot;
 mod pilot_scan;
 mod pilot_stats;
+mod pilot_notify;
 mod recorder;
 mod state;
 mod transcribe;
@@ -140,6 +141,8 @@ struct App {
     pilot_scan: Option<pilot_scan::ScanStatus>,
     /// mtime прочитанного scan.json — перечитываем только при изменении.
     pilot_scan_mtime: Option<std::time::SystemTime>,
+    /// Общий тумблер TG-уведомлений автопилота (из data/notify.json).
+    pilot_notify_on: bool,
     /// Последнее сохранённое на диск состояние (чтобы не перезаписывать без изменений).
     last_saved: state::State,
     /// Состояние предыдущего кадра + момент его появления — для дебаунса записи.
@@ -281,6 +284,8 @@ impl App {
             None
         };
 
+        let pilot_notify_on = pilot_notify::read_enabled(&cfg.autopilot_dir.join("data"));
+
         Self {
             cfg,
             shared,
@@ -309,6 +314,7 @@ impl App {
             pilot_stats_mtime: None,
             pilot_scan: None,
             pilot_scan_mtime: None,
+            pilot_notify_on,
             last_saved: st.clone(),
             prev_state: st.clone(),
             stable_since: Instant::now(),
@@ -477,6 +483,9 @@ impl App {
             self.pilot_scan = pilot_scan::load(&scan_path);
             self.pilot_scan_mtime = scan_mtime;
         }
+        // Тумблер уведомлений (дёшево — читаем на каждой перезагрузке метрик).
+        self.pilot_notify_on =
+            pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
     }
 }
 
@@ -866,6 +875,30 @@ impl eframe::App for App {
                                     }
                                 },
                             );
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let on = self.pilot_notify_on;
+                            let label = if on {
+                                "🔔 Уведомления: вкл"
+                            } else {
+                                "🔕 Уведомления: выкл"
+                            };
+                            if ui
+                                .selectable_label(on, label)
+                                .on_hover_text(
+                                    "TG-пинги о собеседовании/контактах/позитиве в чате \
+                                     (общий тумблер на все профили)",
+                                )
+                                .clicked()
+                            {
+                                let data_dir = self.cfg.autopilot_dir.join("data");
+                                if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
+                                    eprintln!("notify.json write failed: {e}");
+                                } else {
+                                    self.pilot_notify_on = !on;
+                                }
+                            }
                         });
                         // Строгость откликов: порог релевантности вакансии к резюме.
                         // «Любые» — весь пул по очереди похожести; «Строго/Средне» —
