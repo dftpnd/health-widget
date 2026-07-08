@@ -272,7 +272,7 @@ mod tests {
         // Фейк повторяет свои аргументы в stderr — так проверяем переданный флаг фазы.
         let bin = fake_bin("echo-args", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None).expect("должен стартовать");
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None).expect("должен стартовать");
         assert_eq!(p.phase(), &Phase::Chat);
         std::thread::sleep(Duration::from_millis(200));
         assert!(p.alive(), "процесс должен быть жив");
@@ -287,7 +287,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("echo-apply", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None).expect("должен стартовать");
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).expect("должен стартовать");
         assert_eq!(p.phase(), &Phase::Apply);
         std::thread::sleep(Duration::from_millis(200));
         let line = p.last_line().unwrap();
@@ -300,7 +300,7 @@ mod tests {
         // Профиль пробрасывается как `--profile <name>` перед флагом фазы.
         let bin = fake_bin("echo-profile", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, Some("back")).unwrap();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, Some("back"), None).unwrap();
         assert_eq!(p.profile(), Some("back"));
         std::thread::sleep(Duration::from_millis(200));
         let line = p.last_line().unwrap();
@@ -313,7 +313,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("longsleep", "sleep 60");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None).unwrap();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None).unwrap();
         let pid = p.pid();
         assert!(alive_pid(pid), "процесс должен быть жив до drop");
         drop(p); // stop(): SIGTERM → браузер закрылся бы, профиль освобождён
@@ -332,7 +332,7 @@ mod tests {
              while true; do sleep 0.05; done",
         );
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None).unwrap();
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).unwrap();
         std::thread::sleep(Duration::from_millis(150));
         assert!(!p.is_paused());
 
@@ -355,7 +355,7 @@ mod tests {
         // Автопилот завершился сам → alive() должен вернуть false (кнопки погаснут).
         let bin = fake_bin("quickexit", "exit 0");
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None).unwrap();
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(!p.alive(), "завершившийся процесс не должен считаться живым");
     }
