@@ -69,6 +69,9 @@ const PILOT_STRICTNESS: &[(&str, &str, f32)] = &[
 /// Пресет строгости по умолчанию (старое состояние без поля).
 const DEFAULT_STRICTNESS: &str = "medium";
 
+/// Ширина скрываемой чат-колонки (точки).
+const CHAT_W: f32 = 340.0;
+
 /// Путь к per-profile сводке откликов. БД вакансий общая, но история/счётчики —
 /// свои у каждого профиля: автопилот пишет `data/stats-<profile>.json`.
 fn profile_stats_path(autopilot_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
@@ -178,6 +181,12 @@ struct App {
     /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
+    /// Чат-ассистент (правая колонка). История эфемерная.
+    chat: chat::ChatState,
+    /// Открыта ли чат-колонка (иначе окно — одна колонка, как раньше).
+    chat_open: bool,
+    /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии чата.
+    width_one_col: Option<f32>,
 }
 
 /// Состояние маркеров транскрипции одного канала. Кнопка стартует запись (запоминаем
@@ -431,6 +440,9 @@ impl App {
             mark_zoom_seen: 0,
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
+            chat: chat::ChatState::default(),
+            chat_open: false,
+            width_one_col: None,
         }
     }
 
@@ -674,6 +686,49 @@ impl App {
             }
         }
     }
+
+    /// Нарисовать содержимое чат-колонки: шапка + лента сообщений. Ввод — в Task 5.
+    fn draw_chat(&mut self, ui: &mut egui::Ui) {
+        self.chat.drain_inbox();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("💬 Чат")
+                    .size(13.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(180, 200, 255)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("очистить").clicked() {
+                    self.chat.clear();
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("chat_log")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for msg in &self.chat.messages {
+                    let (who, color) = match msg.role {
+                        chat::Role::User => ("ты", egui::Color32::from_rgb(150, 210, 170)),
+                        chat::Role::Assistant => ("ассистент", egui::Color32::from_rgb(180, 200, 255)),
+                        chat::Role::Error => ("ошибка", egui::Color32::from_rgb(230, 120, 120)),
+                    };
+                    ui.label(egui::RichText::new(who).size(10.0).color(color));
+                    ui.label(egui::RichText::new(&msg.text).size(14.0));
+                    ui.add_space(4.0);
+                }
+                if self.chat.is_sending() {
+                    ui.label(
+                        egui::RichText::new("…думает")
+                            .italics()
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(140, 146, 158)),
+                    );
+                }
+            });
+    }
 }
 
 impl eframe::App for App {
@@ -737,6 +792,16 @@ impl eframe::App for App {
                 .inner_margin(egui::Margin::same(MARGIN as i8))
                 .corner_radius(10);
 
+            if self.chat_open {
+                egui::SidePanel::right("chat_panel")
+                    .resizable(true)
+                    .default_width(CHAT_W)
+                    .frame(frame)
+                    .show(ctx, |ui| {
+                        self.draw_chat(ui);
+                    });
+            }
+
             let inner = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                 let panel = ui.max_rect();
                 // Угол ресайза (правый-нижний) — резервируем под ручку, чтобы drag-move его не крал.
@@ -762,6 +827,7 @@ impl eframe::App for App {
                 let title = self.metrics.title.clone();
                 let pinned = self.pinned;
                 let mut toggle_pin = false;
+                let mut toggle_chat = false;
                 ui.horizontal(|ui| {
                     if let Some(t) = &title {
                         ui.label(
@@ -780,6 +846,13 @@ impl eframe::App for App {
                         if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
                             toggle_pin = true;
                         }
+                        if ui
+                            .selectable_label(self.chat_open, "💬")
+                            .on_hover_text("Чат-ассистент")
+                            .clicked()
+                        {
+                            toggle_chat = true;
+                        }
                         // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
                         ui.label(
                             egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
@@ -797,6 +870,26 @@ impl eframe::App for App {
                 if toggle_pin {
                     self.pinned = !self.pinned;
                     winctl::set_keep_above(self.pinned);
+                }
+                if toggle_chat {
+                    self.chat_open = !self.chat_open;
+                    let cur = ctx.screen_rect();
+                    if self.chat_open {
+                        self.width_one_col = Some(cur.width());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            cur.width() + CHAT_W,
+                            cur.height(),
+                        )));
+                    } else {
+                        let target = self
+                            .width_one_col
+                            .take()
+                            .unwrap_or((cur.width() - CHAT_W).max(200.0));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            target,
+                            cur.height(),
+                        )));
+                    }
                 }
                 ui.add_space(2.0);
 
