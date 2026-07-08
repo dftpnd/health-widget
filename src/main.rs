@@ -187,6 +187,12 @@ struct App {
     chat_open: bool,
     /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии чата.
     width_one_col: Option<f32>,
+    /// Текущая ширина чат-колонки (точки) — сохраняется в state, восстанавливается при старте.
+    chat_width: f32,
+    /// Свёрнута ли секция «Автопилот» (сохраняется между запусками).
+    autopilot_collapsed: bool,
+    /// Свёрнута ли секция «Показатели» (сохраняется между запусками).
+    metrics_collapsed: bool,
 }
 
 /// Состояние маркеров транскрипции одного канала. Кнопка стартует запись (запоминаем
@@ -443,6 +449,9 @@ impl App {
             chat: chat::ChatState::default(),
             chat_open: false,
             width_one_col: None,
+            chat_width: st.chat_width.unwrap_or(CHAT_W),
+            autopilot_collapsed: st.autopilot_collapsed,
+            metrics_collapsed: st.metrics_collapsed,
         }
     }
 
@@ -563,6 +572,13 @@ impl App {
     /// Собрать текущее состояние для сохранения (размер/позиция/источник/закрепление).
     fn current_state(&self, ctx: &egui::Context) -> state::State {
         let size = ctx.screen_rect().size();
+        // Сохраняем ширину «одной колонки»: если чат открыт, окно шире на чат-колонку —
+        // вычитаем её, чтобы при старте (чат закрыт) окно вернулось к правильной ширине.
+        let win_w = if self.chat_open {
+            (size.x - self.chat_width).max(200.0)
+        } else {
+            size.x
+        };
         // Позицию берём из KWin (её опрашивает фоновый поток); нет данных — держим прежнюю.
         let (x, y) = match self.shared.pos.lock().ok().and_then(|g| *g) {
             Some((px, py)) => (Some(px as f32), Some(py as f32)),
@@ -571,7 +587,7 @@ impl App {
         state::State {
             x,
             y,
-            width: Some(size.x),
+            width: Some(win_w),
             height: Some(size.y),
             mic_on: self.mic.is_some(),
             mic_target: self.mic_target.clone(),
@@ -579,6 +595,9 @@ impl App {
             pinned: self.pinned,
             pilot_profile: Some(self.pilot_profile.clone()),
             pilot_strictness: Some(self.pilot_strictness.clone()),
+            chat_width: Some(self.chat_width),
+            autopilot_collapsed: self.autopilot_collapsed,
+            metrics_collapsed: self.metrics_collapsed,
         }
     }
 
@@ -880,13 +899,15 @@ impl eframe::App for App {
                 .corner_radius(10);
 
             if self.chat_open {
-                egui::SidePanel::right("chat_panel")
+                let resp = egui::SidePanel::right("chat_panel")
                     .resizable(true)
-                    .default_width(CHAT_W)
+                    .default_width(self.chat_width)
                     .frame(frame)
                     .show(ctx, |ui| {
                         self.draw_chat(ui, ctx);
                     });
+                // Запоминаем фактическую ширину колонки (юзер мог перетянуть) для сохранения.
+                self.chat_width = resp.response.rect.width();
             }
 
             let inner = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -964,14 +985,14 @@ impl eframe::App for App {
                     if self.chat_open {
                         self.width_one_col = Some(cur.width());
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            cur.width() + CHAT_W,
+                            cur.width() + self.chat_width,
                             cur.height(),
                         )));
                     } else {
                         let target = self
                             .width_one_col
                             .take()
-                            .unwrap_or((cur.width() - CHAT_W).max(200.0));
+                            .unwrap_or((cur.width() - self.chat_width).max(200.0));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                             target,
                             cur.height(),
@@ -1233,7 +1254,8 @@ impl eframe::App for App {
                             .and_then(|p| p.last_line())
                             .unwrap_or_else(|| self.pilot_status.clone())
                     };
-                    section_collapsible(ui, "🤖 Автопилот", |ui| {
+                    let mut ap_collapsed = self.autopilot_collapsed;
+                    section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
                         // Профиль (аккаунт/резюме): под кем работает автопилот. Смена —
                         // перезапуск под другой аккаунт браузера (свой логин, свои счётчики).
                         ui.horizontal(|ui| {
@@ -1559,6 +1581,7 @@ impl eframe::App for App {
                             );
                         }
                     });
+                    self.autopilot_collapsed = ap_collapsed;
                     if let Some(p) = new_profile {
                         self.pilot_profile = p;
                         // Счётчики откликов свои у каждого профиля — сбрасываем кэш, чтобы
@@ -1597,7 +1620,8 @@ impl eframe::App for App {
                 }
 
                 if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
-                    section_collapsible(ui, "📊 Показатели", |ui| {
+                    let mut metrics_collapsed = self.metrics_collapsed;
+                    section_collapsible(ui, "📊 Показатели", &mut metrics_collapsed, |ui| {
                         for m in &self.metrics.items {
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -1626,6 +1650,7 @@ impl eframe::App for App {
                             );
                         }
                     });
+                    self.metrics_collapsed = metrics_collapsed;
                 }
 
                 // Кнопки-маркеры транскрипции (RT-сигналы Tartarus): обрабатываем каждое новое
@@ -1728,23 +1753,24 @@ fn section<R>(
     title: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, false, add_contents)
+    section_impl(ui, title, None, add_contents)
 }
 
 /// Как [`section`], но с иконкой сворачивания справа от заголовка. Клик по заголовку
-/// или иконке скрывает/показывает содержимое; состояние запоминается на время сессии.
+/// или иконке переключает `collapsed`; вызывающий хранит этот флаг (и может его сохранять).
 fn section_collapsible<R>(
     ui: &mut egui::Ui,
     title: &str,
+    collapsed: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, true, add_contents)
+    section_impl(ui, title, Some(collapsed), add_contents)
 }
 
 fn section_impl<R>(
     ui: &mut egui::Ui,
     title: &str,
-    collapsible: bool,
+    collapsed: Option<&mut bool>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let title_color = egui::Color32::from_rgb(120, 130, 150);
@@ -1760,17 +1786,15 @@ fn section_impl<R>(
                 .strong()
                 .color(title_color);
 
-            if !collapsible {
+            let Some(collapsed) = collapsed else {
                 ui.label(title_rich);
                 ui.add_space(4.0);
                 return Some(add_contents(ui));
-            }
+            };
 
-            let id = ui.make_persistent_id(("section_collapsed", title));
-            let mut collapsed = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
             let toggled = ui
                 .horizontal(|ui| {
-                    let icon = if collapsed { "▸" } else { "▾" };
+                    let icon = if *collapsed { "▸" } else { "▾" };
                     let header = ui.add(
                         egui::Label::new(title_rich).sense(egui::Sense::click()),
                     );
@@ -1792,10 +1816,9 @@ fn section_impl<R>(
                 })
                 .inner;
             if toggled {
-                collapsed = !collapsed;
-                ui.data_mut(|d| d.insert_temp(id, collapsed));
+                *collapsed = !*collapsed;
             }
-            if collapsed {
+            if *collapsed {
                 None
             } else {
                 ui.add_space(4.0);

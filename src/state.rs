@@ -33,6 +33,15 @@ pub struct State {
     /// Прокидывается как MIN_SIMILARITY автопилоту. None — старое состояние → "medium".
     #[serde(default)]
     pub pilot_strictness: Option<String>,
+    /// Ширина чат-колонки (точки). None — старое состояние → дефолт CHAT_W.
+    #[serde(default)]
+    pub chat_width: Option<f32>,
+    /// Свёрнута ли секция «Автопилот».
+    #[serde(default)]
+    pub autopilot_collapsed: bool,
+    /// Свёрнута ли секция «Показатели».
+    #[serde(default)]
+    pub metrics_collapsed: bool,
 }
 
 fn path() -> PathBuf {
