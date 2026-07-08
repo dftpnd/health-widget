@@ -190,6 +190,9 @@ struct App {
     /// Повторное нажатие кнопки возвращает фокус этому окну. Заполняется в фоне (KWin+journal),
     /// поэтому за Mutex; None — возвращать некуда.
     prev_active_window: Arc<std::sync::Mutex<Option<String>>>,
+    /// Нормированная (0..1) позиция курсора до того, как хоткей увёл его в центр виджета.
+    /// Повторное нажатие возвращает курсор сюда. За Mutex — заполняется в фоне; None — некуда.
+    prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
@@ -472,6 +475,7 @@ impl App {
             focus_chat_request,
             focus_chat_pending: false,
             prev_active_window: Arc::new(std::sync::Mutex::new(None)),
+            prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
             chat: chat::ChatState::default(),
@@ -911,11 +915,16 @@ impl eframe::App for App {
         // активировать наше окно; терминал сам забирает клавиатуру (TerminalView::set_focus).
         if self.focus_chat_request.swap(false, Ordering::Relaxed) {
             if ctx.input(|i| i.focused) {
-                // Повторное нажатие: вернуть фокус предыдущему окну (в фоне — не блокируем UI).
+                // Повторное нажатие: вернуть фокус предыдущему окну И курсор туда, где он был
+                // (в фоне — не блокируем UI).
                 let slot = self.prev_active_window.clone();
+                let cslot = self.prev_cursor.clone();
                 std::thread::spawn(move || {
                     if let Some(id) = slot.lock().unwrap().take() {
                         winctl::activate_window_by_id(&id);
+                    }
+                    if let Some((nx, ny)) = cslot.lock().unwrap().take() {
+                        winctl::warp_cursor_norm(nx, ny);
                     }
                 });
             } else {
@@ -931,12 +940,17 @@ impl eframe::App for App {
                         cur.height(),
                     )));
                 }
-                // В фоне: сперва запомнить активное сейчас окно (это НЕ мы — мы не в фокусе),
-                // затем активировать наше. Как только окно активно, терминал получает
-                // клавиатуру (он каждый кадр просит фокус через set_focus(true)).
+                // В фоне: запомнить активное сейчас окно и позицию курсора (это НЕ мы — мы не в
+                // фокусе), переместить курсор в центр виджета, затем активировать наше окно.
+                // Как только окно активно, терминал получает клавиатуру (просит фокус каждый кадр).
                 let slot = self.prev_active_window.clone();
+                let cslot = self.prev_cursor.clone();
                 std::thread::spawn(move || {
                     *slot.lock().unwrap() = winctl::get_active_window_id();
+                    *cslot.lock().unwrap() = winctl::cursor_pos_norm();
+                    if let Some((nx, ny)) = winctl::widget_center_norm() {
+                        winctl::warp_cursor_norm(nx, ny);
+                    }
                     winctl::activate();
                 });
             }
@@ -2298,6 +2312,9 @@ fn main() -> eframe::Result<()> {
 
     // Саморегистрация для права на снимок области (KWin CaptureArea) — best-effort.
     screenshot::ensure_registered();
+
+    // Поднять демон dotool (перемещение курсора по хоткею). Сам завершается, если уже запущен.
+    winctl::ensure_dotoold();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("health-widget")

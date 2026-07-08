@@ -6,11 +6,22 @@
 //! одноразовые: пишем .js во временный файл, грузим (`loadScript`), выполняем (`Script.run`),
 //! выгружаем. Всё через `qdbus6` — без новых зависимостей, в стиле `detect.rs`/`audio.rs`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// resourceClass нашего окна (совпадает с kwin-script excludeFromCapture).
 const RESOURCE_CLASS: &str = "health-widget";
+
+/// Труба демона dotool: `dotoold` держит один живой `dotool` с постоянным uinput-устройством
+/// (первое событие не теряется), а мы пишем в трубу команды. На Wayland клиент сам курсор не
+/// двигает, а KWin `cursorPos` read-only — поэтому двигаем курсор через uinput (dotool).
+/// Координаты `mouseto` нормированы 0..1 по всему рабочему столу.
+const DOTOOL_PIPE: &str = "/tmp/dotool-pipe";
+
+/// Каталог с бинарями dotool/dotoold/dotoolc (ставятся туда при настройке).
+fn dotool_bin(name: &str) -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".local").join("bin").join(name))
+}
 
 /// Обёртка над окном по resourceClass: `for` по всем окнам с проверкой класса.
 /// `inner` — тело, где `w` — наше окно.
@@ -105,6 +116,95 @@ fn parse_field(line: &str, key: &str) -> Option<i32> {
         .take_while(|c| c.is_ascii_digit() || *c == '-')
         .collect();
     tok.parse().ok()
+}
+
+/// Поднять демон `dotoold`, если он ещё не запущен. Скрипт сам мгновенно завершается, если
+/// труба уже читается, поэтому безопасно звать при каждом старте виджета. PATH дополняем
+/// `~/.local/bin`, чтобы `dotoold` нашёл `dotool`. Best-effort, не блокируем UI.
+pub fn ensure_dotoold() {
+    let Some(bin) = dirs::home_dir().map(|h| h.join(".local").join("bin")) else {
+        return;
+    };
+    let dotoold = bin.join("dotoold");
+    if !dotoold.exists() {
+        return;
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = Command::new(&dotoold)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Прочитать из KWin две дробные величины после маркера (нормированные координаты). None —
+/// если скрипт/журнал не дали строку. Тем же journalctl-приёмом, что [`get_position`].
+fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {
+    if !run_kwin_script(body, tag) {
+        return None;
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    let out = Command::new("journalctl")
+        .args(["--user", "-n", "40", "--no-pager", "-o", "cat"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().rev().find(|l| l.contains(marker))?;
+    let rest = &line[line.find(marker)? + marker.len()..];
+    let mut it = rest.split_whitespace();
+    let x: f64 = it.next()?.parse().ok()?;
+    let y: f64 = it.next()?.parse().ok()?;
+    Some((x, y))
+}
+
+/// Нормированный (0..1 по рабочему столу) центр окна виджета. None — окно не найдено.
+pub fn widget_center_norm() -> Option<(f64, f64)> {
+    let body = format!(
+        "var s = workspace.virtualScreenSize;\n\
+         var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
+         for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
+         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\") {{\n\
+         var g = w.frameGeometry;\n\
+         print(\"HW-WNORM \" + ((g.x + g.width / 2) / s.width) + \" \" + ((g.y + g.height / 2) / s.height)); }} }}\n"
+    );
+    read_two_floats(&body, "wnorm", "HW-WNORM")
+}
+
+/// Нормированная (0..1 по рабочему столу) текущая позиция курсора. None — не удалось прочитать.
+pub fn cursor_pos_norm() -> Option<(f64, f64)> {
+    let body = "var s = workspace.virtualScreenSize; \
+                print(\"HW-CNORM \" + (workspace.cursorPos.x / s.width) + \" \" + (workspace.cursorPos.y / s.height));";
+    read_two_floats(body, "cnorm", "HW-CNORM")
+}
+
+/// Мгновенно переместить курсор в нормированную позицию (0..1) через `dotoolc` (пишет в трубу
+/// dotoold; сам выходит, если демона нет, — не виснет). Best-effort, в фоне.
+pub fn warp_cursor_norm(nx: f64, ny: f64) {
+    let Some(dotoolc) = dotool_bin("dotoolc") else {
+        return;
+    };
+    let cmd = format!("mouseto {nx:.6} {ny:.6}\n");
+    let pipe = DOTOOL_PIPE.to_string();
+    std::thread::spawn(move || {
+        if let Ok(mut child) = Command::new(&dotoolc)
+            .env("DOTOOL_PIPE", &pipe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            use std::io::Write;
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(cmd.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    });
 }
 
 /// Загрузить, выполнить и выгрузить одноразовый KWin-скрипт. `tag` — суффикс имени файла.
