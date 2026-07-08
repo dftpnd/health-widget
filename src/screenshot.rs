@@ -106,16 +106,20 @@ pub fn grab(x: i32, y: i32, w: u32, h: u32, ctx: egui::Context, status: Arc<Mute
         let path = dir.join(format!("{}.png", timestamp()));
         match img.save(&path) {
             Ok(_) => {
-                // Кладём снимок ещё и в буфер обмена (image/png), чтобы его можно было
-                // сразу вставить — напр. кнопкой 📎 в чат. wl-copy демонизируется и держит
-                // содержимое сам (как в clipboard_set), поэтому просто spawn без ожидания.
-                if let Ok(f) = std::fs::File::open(&path) {
-                    let _ = std::process::Command::new("wl-copy")
-                        .args(["-t", "image/png"])
-                        .stdin(f)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                // Кладём в буфер ПУТЬ к PNG (а не саму картинку): его удобно вставить во
+                // встроенный терминал колонки и скормить, напр., `claude ... < <путь>`.
+                // wl-copy демонизируется и держит содержимое сам — просто spawn со stdin.
+                let p = path.display().to_string();
+                if let Ok(mut child) = std::process::Command::new("wl-copy")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    use std::io::Write;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(p.as_bytes());
+                    }
                 }
                 finish(&status, &ctx, ShotStatus::Saved(path.display().to_string()))
             }
