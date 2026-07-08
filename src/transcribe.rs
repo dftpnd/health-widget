@@ -1,14 +1,14 @@
-//! Онлайн-транскрипция аудио-канала через Vosk — тем же приёмом, что и остальной проект:
-//! не тянем dev-библиотеку (libvosk) в бинарь, а шеллим готовый инструмент. Здесь это
-//! маленький Python-хелпер `vosk_stream.py` из venv, куда поставлен пакет `vosk`.
+//! Онлайн-транскрипция аудио-канала через faster-whisper — тем же приёмом, что и остальной
+//! проект: не тянем библиотеку в бинарь, а шеллим Python-хелпер `whisper_stream.py` из
+//! отдельного venv (`venv-whisper`, Python 3.12), где стоит `faster-whisper`.
 //!
-//! Поток данных: канал (`audio.rs`) уже декодирует f32 PCM @44100. Мы ресемплим его в
-//! s16 @16000 (частота, на которой обучены small-модели Vosk) и пишем в stdin хелпера.
-//! Фоновый поток читает stdout хелпера — построчный JSON с `partial`/`final` — и копит
-//! текст в общее состояние, которое UI показывает под осциллографом.
+//! Поток данных: канал (`audio.rs`) декодирует f32 PCM @44100. Мы ресемплим его в s16 @16000
+//! и пишем в stdin хелпера. Хелпер режет поток на фразы (VAD по энергии), гоняет модель на
+//! GPU и печатает построчный JSON `{"final": …}`; фоновый поток читает stdout и копит текст.
 //!
-//! Если venv/модель/скрипт не найдены — `start()` возвращает None, и канал просто работает
-//! без текста (как `AudioMonitor::start`, когда нет `pw-record`).
+//! Partial'ов нет (Whisper выдаёт текст фразами) — под осциллографом появляется законченная
+//! фраза с лагом ~1–3 c. Если venv/скрипт не найдены — `start()` возвращает None, и канал
+//! работает без текста.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::transcript_log::TranscriptLog;
 
-/// Частота, которую ждёт Vosk small-модель.
+/// Частота, которую ждёт whisper-хелпер.
 const STT_RATE: f64 = 16000.0;
 /// Верхняя граница накопленного финального текста (символы). Держим весь текст сеанса,
 /// чтобы под осциллографом можно было прокрутить назад и выделить/скопировать; обрезаем
@@ -102,7 +102,7 @@ impl Transcriber {
             return None;
         }
         let python = python_path()?;
-        let model = model_path()?;
+        let model = model_spec();
         let script = ensure_script()?;
 
         let mut child = Command::new(&python)
@@ -183,29 +183,25 @@ fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("health-widget"))
 }
 
-/// Python из venv (`VOSK_PYTHON` переопределяет). None — если не существует.
+/// Python из whisper-venv (`WHISPER_PYTHON` переопределяет). None — если не существует.
 fn python_path() -> Option<PathBuf> {
-    let p = match std::env::var_os("VOSK_PYTHON") {
+    let p = match std::env::var_os("WHISPER_PYTHON") {
         Some(v) => PathBuf::from(v),
-        None => data_dir()?.join("venv/bin/python"),
+        None => data_dir()?.join("venv-whisper").join("bin").join("python"),
     };
     p.exists().then_some(p)
 }
 
-/// Каталог модели Vosk (`VOSK_MODEL` переопределяет). None — если не существует.
-fn model_path() -> Option<PathBuf> {
-    let p = match std::env::var_os("VOSK_MODEL") {
-        Some(v) => PathBuf::from(v),
-        None => data_dir()?.join("vosk-model-small-ru-0.22"),
-    };
-    p.is_dir().then_some(p)
+/// Имя/путь модели whisper (`WHISPER_MODEL` переопределяет; дефолт large-v3).
+fn model_spec() -> String {
+    std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "large-v3".to_string())
 }
 
 /// Скрипт-хелпер зашит в бинарь и распаковывается в data-dir при первом запуске,
 /// чтобы не зависеть от рабочего каталога/расположения репозитория.
 fn ensure_script() -> Option<PathBuf> {
-    const SRC: &str = include_str!("../scripts/vosk_stream.py");
-    let path = data_dir()?.join("vosk_stream.py");
+    const SRC: &str = include_str!("../scripts/whisper_stream.py");
+    let path = data_dir()?.join("whisper_stream.py");
     // Перезаписываем, только если содержимое отличается (обновление бинаря).
     let need_write = std::fs::read_to_string(&path).map(|c| c != SRC).unwrap_or(true);
     if need_write {
