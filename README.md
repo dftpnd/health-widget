@@ -108,22 +108,28 @@ Command: `pkill -SIGUSR1 -x health-widget`, клавиша например `Sup
 ## Онлайн-транскрипция под осциллографами
 
 Под каждым включённым каналом (🎤 микрофон, 🔊 звук программы/созвона) в реальном времени
-идёт транскрипция того, что попадает в захват. Распознавание **потоковое и полностью офлайн**
-(Vosk): текст достраивается по мере речи — накопленные фразы обычным цветом, текущая гипотеза
-серым курсивом. Аудио никуда не отправляется, что важно для приватного виджета.
+идёт транскрипция того, что попадает в захват. Распознавание **полностью офлайн** на движке
+**faster-whisper** (модель Whisper large-v3 на GPU): текст появляется **фразами** по мере пауз
+в речи (лаг ~1–3 с), русские IT-англицизмы распознаются латиницей (`deploy`, `pull request`,
+`Kubernetes`). Аудио никуда не отправляется, что важно для приватного виджета.
 
 Как это устроено: канал уже пишет f32 PCM для волны; те же сэмплы ресемплятся в 16 кГц и
-скармливаются локальному Python-хелперу `scripts/vosk_stream.py` (пакет `vosk` в отдельном
-venv). Rust-либы/линковка libvosk не нужны — тем же приёмом, что и `pw-record`/`pw-dump`.
+скармливаются локальному Python-хелперу `scripts/whisper_stream.py` (пакет `faster-whisper` в
+отдельном venv на Python 3.12). Тем же приёмом, что и `pw-record`/`pw-dump`. Инференс идёт на
+CUDA-видеокарте (CUDA-либы ставятся pip-колёсами — системный CUDA toolkit не нужен).
 
-Один раз поставь движок и русскую модель (~46 МБ, ставится в `~/.local/share/health-widget`):
+Один раз поставь движок и модель (ставится в `~/.local/share/health-widget`):
 
 ```bash
 ./install-transcribe.sh
 ```
 
+Точность на IT-терминах настраивается двумя файлами в `~/.local/share/health-widget`:
+`it_hotwords.txt` (подсказка распознавателю) и `it_corrections.tsv` (словарь пост-коррекции
+`ослышка⇥правильно`) — правь под свой лексикон.
+
 Без установки виджет работает как раньше — просто без текста под осциллографами.
-Выключить транскрипцию, не удаляя модель: `HEALTH_TRANSCRIBE=0`.
+Выключить транскрипцию: `HEALTH_TRANSCRIBE=0`.
 
 ## Кнопки автопилота (💬 Чат / 📨 Отклики)
 
@@ -155,8 +161,10 @@ venv). Rust-либы/линковка libvosk не нужны — тем же п
 | `HEALTH_CLICK_THROUGH`  | клики сквозь окно (1/0)              | 0 |
 | `HEALTH_AUTO_HIDE`      | авто-скрытие при захвате (1/0)       | 1 |
 | `HEALTH_TRANSCRIBE`     | онлайн-транскрипция (1/0)            | 1 |
-| `VOSK_MODEL`            | каталог модели Vosk                 | `~/.local/share/health-widget/vosk-model-small-ru-0.22` |
-| `VOSK_PYTHON`           | python с пакетом `vosk`             | `~/.local/share/health-widget/venv/bin/python` |
+| `WHISPER_MODEL`         | имя/путь модели whisper             | `large-v3` |
+| `WHISPER_PYTHON`        | python с `faster-whisper`           | `~/.local/share/health-widget/venv-whisper/bin/python` |
+| `WHISPER_DEVICE`        | устройство инференса                | `cuda` |
+| `WHISPER_COMPUTE`       | тип вычислений                      | `float16` |
 | `HEALTH_AUTOPILOT_DIR`  | каталог work-autopilot (cwd)        | `~/projects/work-autopilot` |
 | `HEALTH_AUTOPILOT_BIN`  | бинарь автопилота                   | `$HEALTH_AUTOPILOT_DIR/.venv/bin/autopilot` |
 
