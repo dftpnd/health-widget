@@ -1434,6 +1434,7 @@ dependencies = [
 name = "health-widget"
 version = "0.3.0"
 dependencies = [
+ "arboard",
  "dirs",
  "eframe",
  "egui",

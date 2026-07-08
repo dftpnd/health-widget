@@ -21,6 +21,7 @@ mod audio;
 mod config;
 mod data;
 mod detect;
+mod hr_reply;
 mod pilot;
 mod pilot_scan;
 mod pilot_stats;
@@ -143,6 +144,9 @@ struct App {
     pilot_scan_mtime: Option<std::time::SystemTime>,
     /// Общий тумблер TG-уведомлений автопилота (из data/notify.json).
     pilot_notify_on: bool,
+    /// Состояние генерации ответа рекрутёру («Ответить HR»): фоновый поток пишет,
+    /// UI читает каждый кадр и кладёт готовый ответ в буфер обмена.
+    hr_reply: Arc<std::sync::Mutex<hr_reply::HrReplyState>>,
     /// Последнее сохранённое на диск состояние (чтобы не перезаписывать без изменений).
     last_saved: state::State,
     /// Состояние предыдущего кадра + момент его появления — для дебаунса записи.
@@ -315,6 +319,7 @@ impl App {
             pilot_scan: None,
             pilot_scan_mtime: None,
             pilot_notify_on,
+            hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
             prev_state: st.clone(),
             stable_since: Instant::now(),
@@ -508,6 +513,22 @@ impl eframe::App for App {
         }
 
         self.maybe_reload();
+
+        // Готовый ответ рекрутёру кладём в буфер на UI-потоке (надёжный путь copy_text),
+        // затем статус → Done («✓ ответ в буфере»). Забираем строку под коротким локом.
+        let hr_ready = {
+            let mut g = self.hr_reply.lock().unwrap();
+            if let hr_reply::HrReplyState::Ready(s) = &*g {
+                let s = s.clone();
+                *g = hr_reply::HrReplyState::Done;
+                Some(s)
+            } else {
+                None
+            }
+        };
+        if let Some(reply) = hr_ready {
+            ctx.copy_text(reply);
+        }
 
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
         // (скан/обогащение) завершаются сами, дойдя до конца, — сообщаем об этом,
@@ -898,6 +919,58 @@ impl eframe::App for App {
                                 } else {
                                     self.pilot_notify_on = !on;
                                 }
+                            }
+                        });
+                        // «Ответить HR»: текст рекрутёра из буфера → LLM (профиль на выбор)
+                        // → ответ обратно в буфер. Генерация в фоне, пока идёт — спиннер.
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let running = matches!(
+                                &*self.hr_reply.lock().unwrap(),
+                                hr_reply::HrReplyState::Running
+                            );
+                            ui.add_enabled_ui(!running, |ui| {
+                                ui.menu_button("✍️ Ответить HR", |ui| {
+                                    for (key, label) in PILOT_PROFILES {
+                                        if ui.button(*label).clicked() {
+                                            hr_reply::start(
+                                                self.hr_reply.clone(),
+                                                ui.ctx().clone(),
+                                                self.cfg.autopilot_dir.clone(),
+                                                self.cfg.autopilot_bin.clone(),
+                                                (*key).to_string(),
+                                            );
+                                            ui.close_menu();
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Черновик ответа рекрутёру: берёт текст из буфера, \
+                                     отвечает через LLM от лица выбранного профиля и кладёт \
+                                     ответ обратно в буфер",
+                                );
+                            });
+                            match &*self.hr_reply.lock().unwrap() {
+                                hr_reply::HrReplyState::Running => {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                    ui.label(egui::RichText::new("думаю…").size(11.0));
+                                }
+                                hr_reply::HrReplyState::Done => {
+                                    ui.label(
+                                        egui::RichText::new("✓ ответ в буфере")
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(120, 210, 150)),
+                                    );
+                                }
+                                hr_reply::HrReplyState::Error(e) => {
+                                    ui.label(
+                                        egui::RichText::new(e.clone())
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(230, 120, 120)),
+                                    );
+                                }
+                                _ => {}
                             }
                         });
                         // Строгость откликов: порог релевантности вакансии к резюме.
