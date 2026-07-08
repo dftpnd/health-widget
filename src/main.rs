@@ -1148,7 +1148,7 @@ impl eframe::App for App {
                             let color = egui::Color32::from_rgb(120, 210, 150);
                             ui.label(egui::RichText::new("🎤 Микрофон").size(11.0).color(color));
                             draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color);
+                            draw_transcript(ui, mon.transcript(), color, "mic");
                         }
                         if let Some(mon) = &self.zoom {
                             mon.snapshot(&mut self.scope);
@@ -1158,7 +1158,7 @@ impl eframe::App for App {
                                 egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
                             );
                             draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color);
+                            draw_transcript(ui, mon.transcript(), color, "zoom");
                         }
                     });
                 }
@@ -1269,10 +1269,17 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     );
 }
 
-/// Показать онлайн-транскрипцию под осциллографом канала: накопленный текст обычным
-/// цветом канала, текущую (незавершённую) гипотезу — приглушённо и курсивом.
-/// `data` = None — распознавание для канала не запущено (нет venv/модели) → ничего не рисуем.
-fn draw_transcript(ui: &mut egui::Ui, data: Option<(String, String)>, color: egui::Color32) {
+/// Показать онлайн-транскрипцию под осциллографом канала: накопленный текст в
+/// прокручиваемой области (остаётся на месте, можно выделить и скопировать), текущую
+/// незавершённую гипотезу — приглушённо отдельной строкой. `data` = None — распознавание
+/// для канала не запущено (нет venv/модели) → ничего не рисуем. `id_salt` разводит
+/// состояние прокрутки/выделения двух каналов (микрофон/Zoom).
+fn draw_transcript(
+    ui: &mut egui::Ui,
+    data: Option<(String, String)>,
+    color: egui::Color32,
+    id_salt: &str,
+) {
     let (finals, partial) = match data {
         Some(t) => t,
         None => return,
@@ -1288,30 +1295,53 @@ fn draw_transcript(ui: &mut egui::Ui, data: Option<(String, String)>, color: egu
         return;
     }
     ui.add_space(2.0);
-    // Одна переносимая по словам строка: финальный текст + серым «хвост» гипотезы.
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
-    let base = egui::TextFormat {
-        font_id: egui::FontId::proportional(12.0),
-        color,
-        ..Default::default()
-    };
-    if !finals.is_empty() {
-        job.append(&finals, 0.0, base.clone());
-    }
-    if !partial.is_empty() {
-        let sep = if finals.is_empty() { "" } else { " " };
-        job.append(
-            &format!("{sep}{partial}"),
-            0.0,
-            egui::TextFormat {
-                italics: true,
-                color: egui::Color32::from_rgb(140, 146, 158),
-                ..base
-            },
-        );
-    }
-    ui.label(job);
+    // Прокручиваемая область фиксированной высоты: держимся низа (следим за новым текстом),
+    // но стоит прокрутить вверх для выделения — остаёмся на месте, текст не «уезжает».
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(120.0)
+        .auto_shrink([false, true])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            if !finals.is_empty() {
+                // Выделяемый текст. По факту read-only: правки в scratch-копию не сохраняем
+                // (перезаписываем каждый кадр из finals). Как только выделение завершено
+                // (отпустили мышь) — выделенное сразу в буфер обмена, без Ctrl+C.
+                let mut text = finals.clone();
+                let out = egui::TextEdit::multiline(&mut text)
+                    .id_salt(id_salt)
+                    .frame(false)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(1)
+                    .font(egui::FontId::proportional(12.0))
+                    .text_color(color)
+                    .show(ui);
+                if ui.input(|i| i.pointer.any_released()) {
+                    if let Some(range) = out.cursor_range {
+                        let chars = range.as_sorted_char_range();
+                        if chars.start != chars.end {
+                            let selected: String = text
+                                .chars()
+                                .skip(chars.start)
+                                .take(chars.end - chars.start)
+                                .collect();
+                            if !selected.is_empty() {
+                                ui.ctx().copy_text(selected);
+                            }
+                        }
+                    }
+                }
+            }
+            // Текущая (незавершённая) гипотеза — приглушённо, отдельной строкой, не копируем.
+            if !partial.is_empty() {
+                ui.label(
+                    egui::RichText::new(&partial)
+                        .italics()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(140, 146, 158)),
+                );
+            }
+        });
 }
 
 /// Нарисовать ручку ресайза в правом-нижнем углу панели и обработать перетаскивание.
