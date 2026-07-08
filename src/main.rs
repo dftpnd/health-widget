@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod audio;
+mod chat;
 mod config;
 mod data;
 mod detect;
