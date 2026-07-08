@@ -1477,7 +1477,12 @@ impl eframe::App for App {
                         if let Some(mon) = &self.mic {
                             mon.snapshot(&mut self.scope);
                             let color = egui::Color32::from_rgb(120, 210, 150);
-                            ui.label(egui::RichText::new("🎤 Микрофон").size(11.0).color(color));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
+                                );
+                                marker_recording_badge(ui, &self.markers_mic);
+                            });
                             draw_scope(ui, &self.scope, color);
                             draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
                         }
@@ -1485,9 +1490,12 @@ impl eframe::App for App {
                             mon.snapshot(&mut self.scope);
                             let color = egui::Color32::from_rgb(130, 180, 250);
                             ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
+                                );
+                                marker_recording_badge(ui, &self.markers_zoom);
+                            });
                             draw_scope(ui, &self.scope, color);
                             draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
                         }
@@ -1658,6 +1666,20 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     );
 }
 
+/// Мигающий индикатор активной записи маркера (кнопка Tartarus нажата один раз, ждём второго).
+/// Рисуется в строке заголовка канала, чтобы был виден независимо от прокрутки транскрипта.
+/// Пусто, если запись маркера сейчас не идёт.
+fn marker_recording_badge(ui: &mut egui::Ui, markers: &MarkerState) {
+    if markers.active_start.is_some() {
+        let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 3.0).sin() as f32;
+        ui.label(
+            egui::RichText::new("🔴 идёт запись маркера")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(235, 90, 90).gamma_multiply(pulse)),
+        );
+    }
+}
+
 /// Показать онлайн-транскрипцию под осциллографом канала: накопленный текст в
 /// прокручиваемой области (остаётся на месте, можно выделить и скопировать), текущую
 /// незавершённую гипотезу — приглушённо отдельной строкой. `data` = None — распознавание
@@ -1675,17 +1697,6 @@ fn draw_transcript(
         Some(t) => t,
         None => return,
     };
-    // Индикатор активной записи маркера (кнопка Tartarus нажата один раз, ждём второго).
-    // Мигает, чтобы читалось как «идёт запись»; появляется даже пока текста ещё нет.
-    if markers.active_start.is_some() {
-        let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 3.0).sin() as f32;
-        ui.label(
-            egui::RichText::new("🔴 идёт запись маркера")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(235, 90, 90).gamma_multiply(pulse)),
-        );
-        ui.add_space(1.0);
-    }
     if finals.is_empty() && partial.is_empty() {
         // Пока тишина/прогрев — тонкая подсказка, чтобы канал не выглядел «сломанным».
         ui.label(
@@ -1701,7 +1712,7 @@ fn draw_transcript(
     // но стоит прокрутить вверх для выделения — остаёмся на месте, текст не «уезжает».
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
-        .max_height(300.0)
+        .max_height(140.0)
         .auto_shrink([false, true])
         .stick_to_bottom(true)
         .show(ui, |ui| {
@@ -1724,7 +1735,7 @@ fn draw_transcript(
                     .id_salt(id_salt)
                     .frame(false)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(10)
+                    .desired_rows(3)
                     .layouter(&mut layouter)
                     .show(ui);
                 if ui.input(|i| i.pointer.any_released()) {
