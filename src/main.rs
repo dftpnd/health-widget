@@ -760,15 +760,22 @@ impl App {
                     }
                     let send_clicked =
                         ui.button("▶").on_hover_text("отправить (Enter)").clicked();
-                    let resp = ui.add(
+                    // Enter без Shift при фокусе поля = отправка. Клавишу гасим ДО TextEdit,
+                    // чтобы он не вставлял перевод строки и чтобы отправка надёжно срабатывала
+                    // (multiline иначе «съедает» Enter — key_pressed после него не виден).
+                    // Shift+Enter не гасим → это обычный перенос строки внутри поля.
+                    let field_id = egui::Id::new("chat_input_field");
+                    let enter = ui.memory(|m| m.has_focus(field_id))
+                        && ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        });
+                    ui.add(
                         egui::TextEdit::multiline(&mut self.chat.input)
+                            .id(field_id)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY)
                             .hint_text("сообщение…"),
                     );
-                    // Enter отправляет, Shift+Enter — перенос строки.
-                    let enter = resp.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     do_send = send_clicked || enter;
                 });
             });
