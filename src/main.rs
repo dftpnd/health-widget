@@ -447,7 +447,7 @@ impl App {
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
             chat: chat::ChatState::default(),
-            chat_open: false,
+            chat_open: st.chat_open,
             width_one_col: None,
             chat_width: st.chat_width.unwrap_or(CHAT_W),
             autopilot_collapsed: st.autopilot_collapsed,
@@ -598,6 +598,7 @@ impl App {
             chat_width: Some(self.chat_width),
             autopilot_collapsed: self.autopilot_collapsed,
             metrics_collapsed: self.metrics_collapsed,
+            chat_open: self.chat_open,
         }
     }
 
@@ -2208,7 +2209,15 @@ fn main() -> eframe::Result<()> {
     });
 
     // Стартовая геометрия из сохранённого состояния (иначе — из конфига/дефолтов).
-    let size = [st.width.unwrap_or(cfg.width), st.height.unwrap_or(cfg.height)];
+    // Если чат был открыт — окно сразу шире на ширину чат-колонки (в state хранится ширина
+    // «одной колонки»), иначе SidePanel сожмёт основной контент.
+    let base_w = st.width.unwrap_or(cfg.width);
+    let start_w = if st.chat_open {
+        base_w + st.chat_width.unwrap_or(CHAT_W)
+    } else {
+        base_w
+    };
+    let size = [start_w, st.height.unwrap_or(cfg.height)];
     let pos = [st.x.unwrap_or(cfg.x), st.y.unwrap_or(cfg.y)];
 
     // Саморегистрация для права на снимок области (KWin CaptureArea) — best-effort.

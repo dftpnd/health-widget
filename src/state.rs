@@ -42,6 +42,9 @@ pub struct State {
     /// Свёрнута ли секция «Показатели».
     #[serde(default)]
     pub metrics_collapsed: bool,
+    /// Открыта ли чат-колонка.
+    #[serde(default)]
+    pub chat_open: bool,
 }
 
 fn path() -> PathBuf {
