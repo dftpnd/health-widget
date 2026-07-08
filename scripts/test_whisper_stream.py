@@ -36,6 +36,16 @@ class TestCorrections(unittest.TestCase):
         pairs = parse_corrections(["нет таба", "", "# коммент", "a\tb"])
         self.assertEqual(len(pairs), 1)
 
+    def test_replacement_with_backslash_is_literal(self):
+        # users hand-edit the TSV; a backslash in the replacement must stay literal
+        pairs = parse_corrections(["сиошарп\tC\\#"])
+        self.assertEqual(apply_corrections("это сиошарп", pairs), "это C\\#")
+
+    def test_replacement_group_ref_not_interpreted(self):
+        # "\1" must not raise re.error nor be treated as a backreference
+        pairs = parse_corrections(["ромб\t\\1"])
+        self.assertEqual(apply_corrections("ромб тут", pairs), "\\1 тут")
+
 class TestLoaders(unittest.TestCase):
     def test_load_hotwords_missing_file(self):
         self.assertEqual(load_hotwords("/nonexistent/path/it_hotwords.txt"), "")

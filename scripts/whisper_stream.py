@@ -55,7 +55,7 @@ def parse_corrections(lines: Iterable[str]):
 
 def apply_corrections(text: str, pairs) -> str:
     for rx, right in pairs:
-        text = rx.sub(right, text)
+        text = rx.sub(lambda _m, r=right: r, text)
     return text
 
 
