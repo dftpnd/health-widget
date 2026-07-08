@@ -1,5 +1,34 @@
 import unittest
-from whisper_stream import parse_hotwords, parse_corrections, apply_corrections, load_hotwords, load_corrections
+from whisper_stream import (
+    parse_hotwords,
+    parse_corrections,
+    apply_corrections,
+    load_hotwords,
+    load_corrections,
+    is_hallucination,
+)
+
+
+class TestHallucinations(unittest.TestCase):
+    def test_prodolzhenie_sleduet_dropped(self):
+        self.assertTrue(is_hallucination("Продолжение следует..."))
+        self.assertTrue(is_hallucination("продолжение следует"))
+
+    def test_subtitle_credits_dropped(self):
+        self.assertTrue(is_hallucination("Субтитры сделал DimaTorzok"))
+        self.assertTrue(
+            is_hallucination("Редактор субтитров А.Семкин Корректор А.Егорова")
+        )
+
+    def test_empty_dropped(self):
+        self.assertTrue(is_hallucination("   ...  "))
+
+    def test_high_no_speech_prob_dropped(self):
+        self.assertTrue(is_hallucination("любой текст", no_speech_prob=0.9))
+
+    def test_real_speech_kept(self):
+        self.assertFalse(is_hallucination("задеплоил на стейджинг"))
+        self.assertFalse(is_hallucination("подниму кластер", no_speech_prob=0.2))
 
 class TestHotwords(unittest.TestCase):
     def test_joins_terms(self):
