@@ -15,6 +15,7 @@ dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 zbus = "4"
+egui_term = "0.1"
 
 [profile.release]
 opt-level = 2
