@@ -1,0 +1,30 @@
+# IT-термины (топ-частотные) — в hotwords/initial_prompt whisper. Один термин на строку.
+Kubernetes
+Docker
+deploy
+backend
+frontend
+pull request
+merge
+commit
+rebase
+API
+endpoint
+Postgres
+Redis
+Kafka
+Nginx
+DevOps
+CI/CD
+pipeline
+staging
+production
+rollback
+namespace
+container
+cluster
+microservice
+webhook
+payload
+middleware
+runtime

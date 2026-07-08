@@ -1,45 +1,45 @@
 #!/usr/bin/env bash
-# Установка онлайн-транскрипции (Vosk) для health-widget.
+# Установка онлайн-транскрипции (faster-whisper) для health-widget.
 #
-# Ставит локальный движок распознавания речи и русскую модель в data-каталог виджета
-# (~/.local/share/health-widget). Всё офлайн: после установки сеть не нужна, аудио из
-# захвата никуда не уходит. Идемпотентно — повторный запуск ничего не ломает.
+# Ставит faster-whisper (модель Whisper large-v3, движок CTranslate2) в ОТДЕЛЬНЫЙ venv на
+# Python 3.12 в data-каталоге виджета (~/.local/share/health-widget/venv-whisper). Инференс
+# на GPU (CUDA). CUDA-либы ставятся pip-колёсами — системный CUDA toolkit не нужен.
+# Идемпотентно — повторный запуск ничего не ломает.
 #
-# После установки просто запусти виджет: под каждым включённым осциллографом появится
-# бегущая транскрипция. Отключить можно переменной HEALTH_TRANSCRIBE=0.
+# После установки запусти виджет: под каждым включённым осциллографом появится транскрипция
+# фразами. Отключить — HEALTH_TRANSCRIBE=0.
 set -euo pipefail
 
 BASE="${XDG_DATA_HOME:-$HOME/.local/share}/health-widget"
-MODEL_NAME="vosk-model-small-ru-0.22"
-MODEL_URL="https://alphacephei.com/vosk/models/${MODEL_NAME}.zip"
+VENV="$BASE/venv-whisper"
+MODEL="${WHISPER_MODEL:-large-v3}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$BASE"
 
-echo "==> venv: $BASE/venv"
-if [ ! -x "$BASE/venv/bin/python" ]; then
-  python3 -m venv "$BASE/venv"
+echo "==> venv (Python 3.12): $VENV"
+if [ ! -x "$VENV/bin/python" ]; then
+  uv venv "$VENV" --python 3.12
 fi
-"$BASE/venv/bin/pip" install --quiet --upgrade pip
 
-echo "==> ставлю пакет vosk (нативная либа идёт в колесе — отдельный libvosk не нужен)"
-"$BASE/venv/bin/pip" install --quiet vosk
+echo "==> ставлю faster-whisper и CUDA-либы (колёса)"
+uv pip install --python "$VENV/bin/python" \
+  faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
 
-echo "==> проверяю, что движок грузится"
-"$BASE/venv/bin/python" -c "import vosk" \
-  || { echo "ОШИБКА: vosk не импортируется в этом Python"; exit 1; }
+echo "==> копирую хелпер и базы терминов в $BASE (базы — только если их ещё нет)"
+cp "$SCRIPT_DIR/scripts/whisper_stream.py" "$BASE/whisper_stream.py"
+[ -f "$BASE/it_hotwords.txt" ]    || cp "$SCRIPT_DIR/scripts/it_hotwords.txt" "$BASE/it_hotwords.txt"
+[ -f "$BASE/it_corrections.tsv" ] || cp "$SCRIPT_DIR/scripts/it_corrections.tsv" "$BASE/it_corrections.tsv"
 
-if [ -d "$BASE/$MODEL_NAME" ]; then
-  echo "==> модель уже есть: $BASE/$MODEL_NAME"
-else
-  echo "==> качаю русскую модель (~46 МБ): $MODEL_URL"
-  curl -fL --retry 3 -o "$BASE/model.zip" "$MODEL_URL"
-  echo "==> распаковываю"
-  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
-    "$BASE/model.zip" "$BASE"
-  rm -f "$BASE/model.zip"
-fi
+echo "==> предзагрузка модели $MODEL и проверка GPU-инференса"
+# CUDA-либы стоят колёсами внутри venv, не на пути линкера — smoke-скрипт guard'а не имеет,
+# поэтому выставляем путь здесь (whisper_stream.py в рантайме чинит это сам).
+SITE="$VENV/lib/python3.12/site-packages"
+export LD_LIBRARY_PATH="$SITE/nvidia/cublas/lib:$SITE/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+"$VENV/bin/python" "$SCRIPT_DIR/scripts/whisper_smoke.py"
 
 echo
-echo "Готово. Транскрипция установлена в $BASE"
+echo "Готово. Whisper-транскрипция установлена в $BASE"
 echo "Запусти виджет и включи каналы 🎤 / 🔊 — текст пойдёт под осциллографами."
-echo "Переопределения: VOSK_MODEL=<каталог модели>, VOSK_PYTHON=<python>, HEALTH_TRANSCRIBE=0 (выкл)."
+echo "Переопределения: WHISPER_MODEL, WHISPER_PYTHON, WHISPER_DEVICE, WHISPER_COMPUTE; HEALTH_TRANSCRIBE=0 (выкл)."
+echo "Базы IT-терминов: $BASE/it_hotwords.txt (hotwords), $BASE/it_corrections.tsv (пост-коррекция) — правь под себя."

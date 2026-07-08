@@ -1,0 +1,23 @@
+# ослышка<TAB>правильно — регистронезависимая замена по границам слов на готовом тексте.
+кубернетис	Kubernetes
+кубернетес	Kubernetes
+докер	Docker
+дэплой	deploy
+деплой	deploy
+пул реквест	pull request
+пулреквест	pull request
+мёрдж	merge
+мердж	merge
+коммит	commit
+ребейз	rebase
+эндпоинт	endpoint
+постгрес	Postgres
+редис	Redis
+кафка	Kafka
+нгинкс	Nginx
+пайплайн	pipeline
+стейджинг	staging
+продакшн	production
+роллбэк	rollback
+неймспейс	namespace
+кластер	cluster

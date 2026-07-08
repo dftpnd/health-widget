@@ -1,5 +1,8 @@
 # Rust build artifacts (в т.ч. в spikes/*/target)
 target/
 
+# Python cache
+__pycache__/
+
 # Экспорт колов (--export по умолчанию сюда)
 tmp/
