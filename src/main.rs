@@ -31,6 +31,7 @@ mod kwin_shot;
 mod recorder;
 mod screenshot;
 mod state;
+mod terminal;
 mod transcribe;
 mod transcript_log;
 mod winctl;
@@ -178,6 +179,17 @@ struct App {
     /// Сколько нажатий уже обработано UI-потоком (микрофон/телемост).
     mark_mic_seen: u32,
     mark_zoom_seen: u32,
+    /// Запрос перевести фокус на поле ввода чата (кнопка Tartarus → SIGRTMIN+2).
+    /// Сигнальный поток ставит флаг, update() открывает чат (если закрыт), показывает
+    /// виджет и запрашивает фокус поля на этом же кадре — через флаг, т.к. сигнал
+    /// прилетает в другом потоке.
+    focus_chat_request: Arc<AtomicBool>,
+    /// Фокус поля ввода нужно запросить при ближайшей отрисовке чата.
+    focus_chat_pending: bool,
+    /// internalId окна, которое было активным до того, как кнопка забрала фокус на чат.
+    /// Повторное нажатие кнопки возвращает фокус этому окну. Заполняется в фоне (KWin+journal),
+    /// поэтому за Mutex; None — возвращать некуда.
+    prev_active_window: Arc<std::sync::Mutex<Option<String>>>,
     /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
@@ -253,6 +265,8 @@ impl App {
         // Счётчики нажатий кнопок-маркеров (RT-сигналы от Tartarus: 10=микрофон, 15=телемост).
         let mark_mic = Arc::new(AtomicU32::new(0));
         let mark_zoom = Arc::new(AtomicU32::new(0));
+        // Запрос фокуса поля ввода чата — ставит SIGRTMIN+2 (кнопка Tartarus), читает update().
+        let focus_chat_request = Arc::new(AtomicBool::new(false));
 
         // Поток обработки сигналов: SIGUSR1 — тумблер видимости; SIGUSR2 — начать
         // разметку области под снимок (кнопка «Скрин»); SIGRTMIN+0/+1 — тумблеры выделения
@@ -263,16 +277,19 @@ impl App {
             let shot_request = shot_request.clone();
             let mark_mic = mark_mic.clone();
             let mark_zoom = mark_zoom.clone();
+            let focus_chat_request = focus_chat_request.clone();
             // SIGRTMIN зависит от glibc (обычно 34); вычисляем один раз, тем же значением
-            // Tartarus шлёт `pkill --signal 34/35`.
+            // Tartarus шлёт `pkill --signal 34/35/36`.
             let rt_mic = libc::SIGRTMIN();
             let rt_zoom = libc::SIGRTMIN() + 1;
+            let rt_focus_chat = libc::SIGRTMIN() + 2;
             std::thread::spawn(move || {
                 let mut signals = signal_hook::iterator::Signals::new([
                     signal_hook::consts::SIGUSR1,
                     signal_hook::consts::SIGUSR2,
                     rt_mic,
                     rt_zoom,
+                    rt_focus_chat,
                 ])
                 .expect("cannot register signal handler");
                 for sig in signals.forever() {
@@ -288,6 +305,11 @@ impl App {
                     }
                     if sig == rt_zoom {
                         mark_zoom.fetch_add(1, Ordering::Relaxed);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                    if sig == rt_focus_chat {
+                        focus_chat_request.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
                         continue;
                     }
@@ -444,6 +466,9 @@ impl App {
             mark_zoom,
             mark_mic_seen: 0,
             mark_zoom_seen: 0,
+            focus_chat_request,
+            focus_chat_pending: false,
+            prev_active_window: Arc::new(std::sync::Mutex::new(None)),
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
             chat: chat::ChatState::default(),
@@ -789,13 +814,18 @@ impl App {
                         && ui.input_mut(|i| {
                             i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                         });
-                    ui.add(
+                    let field = ui.add(
                         egui::TextEdit::multiline(&mut self.chat.input)
                             .id(field_id)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY)
                             .hint_text("сообщение…"),
                     );
+                    // Кнопка Tartarus (SIGRTMIN+2) попросила фокус — отдаём его полю ровно раз.
+                    if self.focus_chat_pending {
+                        field.request_focus();
+                        self.focus_chat_pending = false;
+                    }
                     do_send = send_clicked || enter;
                 });
             });
@@ -867,6 +897,50 @@ impl eframe::App for App {
         }
         if self.shot_active {
             self.show_shot_overlay(ctx);
+        }
+
+        // Фокус на поле ввода чата по кнопке Tartarus (SIGRTMIN+2): показываем виджет,
+        // открываем чат (если закрыт — с тем же ресайзом окна, что и переключатель 💬),
+        // и просим фокус поля при отрисовке чата этого/следующего кадра.
+        // Кнопка Tartarus (SIGRTMIN+2) работает как тумблер фокуса чата. Наше окно уже в
+        // фокусе → это повторное нажатие: возвращаем фокус окну, которое было активным до нас.
+        // Иначе → запоминаем текущее активное окно и забираем фокус на поле ввода чата.
+        if self.focus_chat_request.swap(false, Ordering::Relaxed) {
+            if ctx.input(|i| i.focused) {
+                // Повторное нажатие: вернуть фокус предыдущему окну (активируем его в фоне —
+                // qdbus + sleep не должны блокировать UI-поток) и снять каретку с поля.
+                let slot = self.prev_active_window.clone();
+                std::thread::spawn(move || {
+                    if let Some(id) = slot.lock().unwrap().take() {
+                        winctl::activate_window_by_id(&id);
+                    }
+                });
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("chat_input_field")));
+                self.focus_chat_pending = false;
+            } else {
+                // Первое нажатие: показать виджет, открыть чат (с ресайзом окна как у 💬,
+                // если был закрыт) и забрать фокус на поле.
+                self.shared.user_visible.store(true, Ordering::Relaxed);
+                if !self.chat_open {
+                    self.chat_open = true;
+                    let cur = ctx.screen_rect();
+                    self.width_one_col = Some(cur.width());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        cur.width() + self.chat_width,
+                        cur.height(),
+                    )));
+                }
+                self.focus_chat_pending = true;
+                // В фоне: сперва запомнить активное сейчас окно (это НЕ мы — мы не в фокусе),
+                // затем активировать наше. На Wayland фокус egui-поля работает только когда
+                // окно активно (клавиатурный фокус компоновщика), а сам клиент активироваться
+                // не может — просит KWin.
+                let slot = self.prev_active_window.clone();
+                std::thread::spawn(move || {
+                    *slot.lock().unwrap() = winctl::get_active_window_id();
+                    winctl::activate();
+                });
+            }
         }
 
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
