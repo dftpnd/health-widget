@@ -514,22 +514,6 @@ impl eframe::App for App {
 
         self.maybe_reload();
 
-        // Готовый ответ рекрутёру кладём в буфер на UI-потоке (надёжный путь copy_text),
-        // затем статус → Done («✓ ответ в буфере»). Забираем строку под коротким локом.
-        let hr_ready = {
-            let mut g = self.hr_reply.lock().unwrap();
-            if let hr_reply::HrReplyState::Ready(s) = &*g {
-                let s = s.clone();
-                *g = hr_reply::HrReplyState::Done;
-                Some(s)
-            } else {
-                None
-            }
-        };
-        if let Some(reply) = hr_ready {
-            ctx.copy_text(reply);
-        }
-
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
         // (скан/обогащение) завершаются сами, дойдя до конца, — сообщаем об этом,
         // а не «остановлен».
