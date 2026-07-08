@@ -310,17 +310,27 @@ git commit -m "feat(transcribe): базы IT-терминов для whisper (ho
 
 - [ ] **Step 1: Написать интеграционный тест-скрипт (ручной прогон)**
 
-Проверяем на реальной записи, скармливая её raw-PCM в stdin хелпера. WAV из колов — s16 mono @16000 (так пишет рекордер), но health-widget пишет заголовок WAV; для теста берём только PCM-данные. Команда:
+Проверяем сквозной проход хелпера на реальной записи. **Важно (из Task 1):** WAV-дорожки колов записаны в 44100 Гц, а хелпер ждёт сырой s16le @16000 — поэтому ресемплим перед подачей в stdin (в проде это делает Rust `Feeder`; нет ffmpeg/sox → ресемплим numpy'ем, линейной интерполяцией, как в `Feeder`). Команда:
 
 ```bash
 BASE="$HOME/.local/share/health-widget"
 PY="$BASE/venv-whisper/bin/python"
-WAV=$(ls "$BASE"/calls/*/mic.wav 2>/dev/null | head -1)
-# срезаем 44-байтный WAV-заголовок -> сырой s16le, в stdin хелпера
-tail -c +45 "$WAV" | "$PY" scripts/whisper_stream.py large-v3
+WAV="$BASE/calls/2/mic.wav"   # дорожка с реальным сигналом (calls/1 — тишина)
+"$PY" - "$WAV" <<'PYEOF' | "$PY" scripts/whisper_stream.py large-v3
+import sys, wave, numpy as np
+w = wave.open(sys.argv[1]); sr = w.getframerate()
+a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+n = int(len(a) * 16000 / sr)
+idx = np.arange(n) * sr / 16000.0
+lo = np.clip(np.floor(idx).astype(int), 0, len(a) - 1)
+hi = np.clip(lo + 1, 0, len(a) - 1)
+frac = idx - np.floor(idx)
+out = (a[lo] * (1 - frac) + a[hi] * frac).clip(-32768, 32767).astype(np.int16)
+sys.stdout.buffer.write(out.tobytes())
+PYEOF
 ```
 
-Expected (после Step 2): одна или несколько строк `{"final": "..."}` с осмысленным русским текстом. (Записей нет → отложить до Task 6.)
+Expected (после Step 2): хелпер проходит сквозь **без падений**, грузит модель на GPU (LD-guard срабатывает сам), и печатает ≥1 строку `{"final": "..."}`. Это проверка ПЛУМБИНГА (drain-поток + VAD-эндпоинтинг + emit), не качества: единственные записи на диске тихие/пустые (Task 1), whisper на них может выдавать неточный текст — итоговую проверку качества делаем в Task 6 на живом микрофоне. Если хелпер падает, зависает или не печатает ни одной строки — это баг цикла.
 
 - [ ] **Step 2: Дописать главный цикл в `scripts/whisper_stream.py`**
 
@@ -466,9 +476,9 @@ if __name__ == "__main__":
 Run (из `scripts/`): `python3 -m unittest test_whisper_stream -v`
 Expected: PASS (импорт `main`/цикла не ломает чистые функции; `numpy`/`faster_whisper` импортируются лениво внутри `main`, поэтому тесты идут без GPU-зависимостей).
 
-- [ ] **Step 4: Прогнать интеграционный тест из Step 1 (если есть запись)**
+- [ ] **Step 4: Прогнать интеграционный тест из Step 1**
 
-Expected: строки `{"final": "..."}` с осмысленным текстом; в `nvidia-smi` видно нагрузку. Если текст пустой на явно речевом WAV — подстрой `SILENCE_RMS`/`SILENCE_TAIL`.
+Expected: хелпер завершается без ошибок и печатает ≥1 строку `{"final": "..."}`; в `nvidia-smi` во время прогона видно venv-python с занятой VRAM. Текст может быть неточным (тихие тестовые записи) — это ок на данном этапе. Если ни одной строки не напечатано, хелпер завис или упал — чини цикл/пороги (`SILENCE_RMS`/`SILENCE_TAIL`). Качество проверим в Task 6.
 
 - [ ] **Step 5: Commit**
 
