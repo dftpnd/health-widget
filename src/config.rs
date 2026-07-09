@@ -50,7 +50,7 @@ impl Default for AvatarCfg {
             scope_gain: 6.0,
             scope_thickness: 5,
             text_color: [140, 255, 0],
-            text_size: 24,
+            text_size: 14,
             text_font: "Noto Sans".to_string(),
             phrase_ttl: 30.0,
         }

@@ -457,31 +457,25 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn render_text(opts: &usvg::Options, text: &str, size: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let esc = xml_escape(text);
-    let chars = text.chars().count().max(1) as f32;
-    let w = (chars * size as f32 * 0.62 + size as f32).ceil() as u32;
-    let h = (size as f32 * 1.4).ceil() as u32;
-    let baseline = (size as f32 * 1.05) as u32;
+    let s = size as f32;
+    let lh = s * 1.05;
+    let n = text.chars().count().max(1);
+    let w = (s * 1.7).ceil() as u32;
+    let h = (n as f32 * lh + s * 0.5).ceil() as u32;
+    let cx = w as f32 / 2.0;
+    let mut spans = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        let dy = if i == 0 { 0.0 } else { lh };
+        let esc = xml_escape(&ch.to_string());
+        spans.push_str(&format!("<tspan x=\"{cx}\" dy=\"{dy}\">{esc}</tspan>"));
+    }
     let svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"><text x=\"2\" y=\"{baseline}\" font-family=\"sans-serif\" font-size=\"{size}\" font-weight=\"bold\" fill=\"#ffffff\">{esc}</text></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"><text x=\"{cx}\" y=\"{s}\" font-family=\"sans-serif\" font-size=\"{size}\" font-weight=\"bold\" text-anchor=\"middle\" fill=\"#ffffff\">{spans}</text></svg>"
     );
     let tree = usvg::Tree::from_data(svg.as_bytes(), opts).ok()?;
     let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
     resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
     Some((w, h, pixmap.take()))
-}
-
-fn rotate90_cw(src: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
-    let (nw, nh) = (h, w);
-    let mut out = vec![0u8; (nw * nh) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let nx = h - 1 - y;
-            let ny = x;
-            out[(ny * nw + nx) as usize] = src[(y * w + x) as usize];
-        }
-    }
-    (nw, nh, out)
 }
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
@@ -548,15 +542,11 @@ impl Phrase {
         fh: u32,
         rng: &mut Rng,
     ) -> Option<Phrase> {
-        let (rw, rh, rgba) = render_text(opts, text, size)?;
-        if rw == 0 || rh == 0 {
+        let (w, h, rgba) = render_text(opts, text, size)?;
+        if w == 0 || h == 0 || w >= fw {
             return None;
         }
-        let flat: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
-        let (w, h, alpha) = rotate90_cw(&flat, rw, rh);
-        if w >= fw {
-            return None;
-        }
+        let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
         let x = rng.range(6, (fw - w) as i32 - 6).max(0) as u32;
         let ymax = fh as i32 - h as i32 - 6;
         let y = if ymax > 6 { rng.range(6, ymax) } else { 0 } as u32;
