@@ -740,6 +740,804 @@ impl App {
             }
         }
     }
+    /// Строка заголовка: название, тумблеры «поверх всех»/терминал, версия сборки.
+    fn draw_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Строка заголовка: слева — название, справа — кнопка «поверх всех» (📌).
+        let title = self.metrics.title.clone();
+        let pinned = self.pinned;
+        let mut toggle_pin = false;
+        let mut toggle_terminal = false;
+        ui.horizontal(|ui| {
+            if let Some(t) = &title {
+                ui.label(
+                    egui::RichText::new(t)
+                        .size(15.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(180, 200, 255)),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = if pinned {
+                    "Закреплено поверх всех — открепить"
+                } else {
+                    "Закрепить поверх всех окон"
+                };
+                if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
+                    toggle_pin = true;
+                }
+                if ui
+                    .selectable_label(self.terminal_open, "🖥")
+                    .on_hover_text("Терминал")
+                    .clicked()
+                {
+                    toggle_terminal = true;
+                }
+                // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .size(10.0)
+                        .color(egui::Color32::from_rgb(90, 96, 108)),
+                )
+                .on_hover_text(format!(
+                    "health-widget v{}\ncommit {}\nсборка {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("GIT_HASH"),
+                    env!("BUILD_TIME"),
+                ));
+            });
+        });
+        if toggle_pin {
+            self.pinned = !self.pinned;
+            winctl::set_keep_above(self.pinned);
+        }
+        if toggle_terminal {
+            self.terminal_open = !self.terminal_open;
+            let cur = ctx.screen_rect();
+            if self.terminal_open {
+                self.width_one_col = Some(cur.width());
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    cur.width() + self.terminal_width,
+                    cur.height(),
+                )));
+            } else {
+                let target = self
+                    .width_one_col
+                    .take()
+                    .unwrap_or((cur.width() - self.terminal_width).max(200.0));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    target,
+                    cur.height(),
+                )));
+            }
+        }
+        ui.add_space(2.0);
+    }
+
+    /// Секция «Звук и транскрипция»: два канала (микрофон/программа) с тумблерами и селекторами.
+    fn draw_sound(&mut self, ui: &mut egui::Ui) {
+        // Два канала: микрофон и программа/вывод. У каждого — тумблер + селектор.
+        let mic_on = self.mic.is_some();
+        let zoom_on = self.zoom.is_some();
+        let mic_target = self.mic_target.clone();
+        let prog_target = self.prog_target.clone();
+        let mut toggle_mic = false;
+        let mut toggle_zoom = false;
+        let mut mic_off = false;
+        let mut zoom_off = false;
+        let mut new_mic: Option<Option<String>> = None;
+        let mut new_prog: Option<Option<String>> = None;
+        let mut refresh = false;
+        let mut refresh_mic = false;
+
+        section(ui, "🎧 Звук и транскрипция", |ui| {
+        // Строка 1 — микрофон: тумблер + выбор устройства.
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(mic_on, "🎤")
+                .on_hover_text("Слушать микрофон")
+                .clicked()
+            {
+                toggle_mic = true;
+            }
+            // Подпись селектора отражает состояние: выключен — «⊘ выключено».
+            let cur = if mic_on {
+                device_label(&mic_target, &self.mics, "🎤 по умолчанию")
+            } else {
+                "⊘ выключено".to_string()
+            };
+            egui::ComboBox::from_id_salt("mic-src")
+                .width(150.0)
+                .selected_text(egui::RichText::new(cur).size(11.0))
+                .show_ui(ui, |ui| {
+                    // Первый пункт — отключить источник.
+                    if ui.selectable_label(!mic_on, "⊘ выключено").clicked() {
+                        mic_off = true;
+                    }
+                    if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
+                        new_mic = Some(None);
+                    }
+                    for d in &self.mics {
+                        let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
+                        if ui.selectable_label(sel, &d.label).clicked() {
+                            new_mic = Some(Some(d.target.clone()));
+                        }
+                    }
+                });
+            if ui.small_button("⟳").on_hover_text("обновить список микрофонов").clicked() {
+                refresh_mic = true;
+            }
+        });
+
+        // Строка 2 — программа/вывод: тумблер + выбор программы + обновление списка.
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(zoom_on, "🔊")
+                .on_hover_text("Слушать звук программы или всего вывода")
+                .clicked()
+            {
+                toggle_zoom = true;
+            }
+            let cur = if zoom_on {
+                device_label(&prog_target, &self.programs, "🔊 весь вывод")
+            } else {
+                "⊘ выключено".to_string()
+            };
+            egui::ComboBox::from_id_salt("prog-src")
+                .width(150.0)
+                .selected_text(egui::RichText::new(cur).size(11.0))
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        if ui.selectable_label(!zoom_on, "⊘ выключено").clicked() {
+                            zoom_off = true;
+                        }
+                        if ui.selectable_label(zoom_on && prog_target.is_none(), "🔊 весь вывод").clicked() {
+                            new_prog = Some(None);
+                        }
+                        for d in &self.programs {
+                            let sel = zoom_on && prog_target.as_deref() == Some(d.target.as_str());
+                            if ui.selectable_label(sel, &d.label).clicked() {
+                                new_prog = Some(Some(d.target.clone()));
+                            }
+                        }
+                    });
+                });
+            if ui.small_button("⟳").on_hover_text("обновить список программ").clicked() {
+                refresh = true;
+            }
+        });
+        }); // конец блока «Звук»
+
+        // Применяем изменения выбора/тумблеров.
+        if refresh {
+            self.mics = audio::list_mics();
+            self.programs = audio::list_programs();
+        }
+        if refresh_mic {
+            self.mics = audio::list_mics();
+        }
+        // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
+        if let Some(sel) = new_mic {
+            self.mic_target = sel;
+            self.mic = audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
+        }
+        if let Some(sel) = new_prog {
+            self.prog_target = sel;
+            self.zoom = self.start_program();
+        }
+        // Пункт «⊘ выключено» — погасить канал.
+        if mic_off {
+            self.mic = None;
+        }
+        if zoom_off {
+            self.zoom = None;
+        }
+        if toggle_mic {
+            self.mic = if self.mic.is_some() {
+                None
+            } else {
+                audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone())
+            };
+        }
+        if toggle_zoom {
+            self.zoom = if self.zoom.is_some() {
+                None
+            } else {
+                self.start_program()
+            };
+        }
+        ui.add_space(2.0);
+    }
+
+    /// Строка «Кол» (запись звонка) + «Скрин» (снимок области) в две колонки.
+    fn draw_call_and_screen(&mut self, ui: &mut egui::Ui) {
+        // Кол + Скрин в одной линии, по 50% ширины каждому. Слева — запись
+        // звонка (две дорожки WAV + транскрипт), справа — снимок области экрана
+        // через Spectacle. Каналы могли смениться выше — приводим запись к колу.
+        self.reconcile_call_recording();
+        let mut call_toggle = false;
+        let active_name = self.active_call.as_ref().map(|c| c.name.clone());
+        let mut name_buf = self.call_name_input.clone();
+
+        let mut shoot = false;
+        let shot_line = {
+            use screenshot::ShotStatus::*;
+            match &*self.shot_status.lock().unwrap() {
+                Idle => None,
+                Marking => Some((
+                    "⧗ кликни две точки…".to_string(),
+                    egui::Color32::from_rgb(210, 200, 120),
+                )),
+                Working => Some((
+                    "⧗ режу…".to_string(),
+                    egui::Color32::from_rgb(210, 200, 120),
+                )),
+                Saved(p) => {
+                    let name = std::path::Path::new(p)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("сохранено");
+                    Some((
+                        format!("✔ {name}"),
+                        egui::Color32::from_rgb(120, 200, 120),
+                    ))
+                }
+                Cancelled => Some(("отменено".to_string(), egui::Color32::GRAY)),
+                Failed(e) => {
+                    Some((format!("✖ {e}"), egui::Color32::from_rgb(230, 120, 120)))
+                }
+            }
+        };
+
+        ui.columns(2, |cols| {
+            section(&mut cols[0], "🎙 Кол", |ui| {
+                ui.horizontal(|ui| {
+                    let recording = active_name.is_some();
+                    let (label, hint) = if recording {
+                        ("⏹ Завершить", "Остановить запись и сохранить кол")
+                    } else {
+                        ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
+                    };
+                    if ui.button(label).on_hover_text(hint).clicked() {
+                        call_toggle = true;
+                    }
+                    if let Some(n) = &active_name {
+                        ui.label(
+                            egui::RichText::new(format!("● {n}"))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(230, 120, 120)),
+                        );
+                    } else {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut name_buf)
+                                .hint_text("название")
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                });
+            });
+            section(&mut cols[1], "📸 Скрин", |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.shot_active,
+                            egui::Button::new("📸 Область"),
+                        )
+                        .on_hover_text(
+                            "Кликнуть две точки на экране — сохранить PNG области \
+                             в ~/.local/share/health-widget/screenshots/",
+                        )
+                        .clicked()
+                    {
+                        shoot = true;
+                    }
+                    if let Some((text, color)) = &shot_line {
+                        ui.label(egui::RichText::new(text).size(11.0).color(*color));
+                    }
+                });
+            });
+        });
+
+        self.call_name_input = name_buf;
+        if call_toggle {
+            if self.active_call.is_some() {
+                self.end_call();
+            } else {
+                self.start_call();
+            }
+        }
+        if shoot {
+            self.shot_request.store(true, Ordering::Relaxed);
+        }
+        ui.add_space(2.0);
+    }
+
+    /// Секция «Автопилот»: фазы (чат/отклики/скан/обогащение), профиль, строгость, статус.
+    fn draw_autopilot(&mut self, ui: &mut egui::Ui) {
+        // Автопилот: взаимоисключающие тумблеры фаз (чат / отклики / скан группы) +
+        // «Выключить»/«Пауза». Одно окно браузера → одна фаза за раз, любой выбор
+        // (пере)запускает процесс. Показываем только если бинарь установлен.
+        if self.cfg.autopilot_bin.exists() {
+            use pilot::Phase;
+            let mut new_want: Option<Option<Phase>> = None;
+            let mut new_profile: Option<String> = None;
+            let mut new_strictness: Option<String> = None;
+            let mut toggle_pause = false;
+            let running = self.want.is_some();
+            let paused = self.pilot.as_ref().is_some_and(|p| p.is_paused());
+            // Краткий статус: пауза → явная метка, иначе последняя строка лога
+            // автопилота либо сообщение об ошибке.
+            let status = if paused {
+                "⏸ на паузе".to_string()
+            } else {
+                self.pilot
+                    .as_ref()
+                    .and_then(|p| p.last_line())
+                    .unwrap_or_else(|| self.pilot_status.clone())
+            };
+            let mut ap_collapsed = self.autopilot_collapsed;
+            section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
+                // Профиль (аккаунт/резюме): под кем работает автопилот. Смена —
+                // перезапуск под другой аккаунт браузера (свой логин, свои счётчики).
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
+                        "Профиль автопилота: аккаунт браузера, резюме и контакты",
+                    );
+                    let cur = PILOT_PROFILES
+                        .iter()
+                        .find(|(k, _)| *k == self.pilot_profile)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Fullstack");
+                    egui::ComboBox::from_id_salt("pilot-profile")
+                        .width(150.0)
+                        .selected_text(egui::RichText::new(cur).size(11.0))
+                        .show_ui(ui, |ui| {
+                            for (key, label) in PILOT_PROFILES {
+                                if ui
+                                    .selectable_label(self.pilot_profile == *key, *label)
+                                    .clicked()
+                                    && self.pilot_profile != *key
+                                {
+                                    new_profile = Some((*key).to_string());
+                                }
+                            }
+                        });
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.want == Some(Phase::Chat), "💬 Чат")
+                        .on_hover_text("Автопилот: вести чаты с работодателями")
+                        .clicked()
+                    {
+                        // Повторный клик по активной — выключить; иначе переключить.
+                        new_want = Some(if self.want == Some(Phase::Chat) {
+                            None
+                        } else {
+                            Some(Phase::Chat)
+                        });
+                    }
+                    if ui
+                        .selectable_label(self.want == Some(Phase::Apply), "📨 Отклики")
+                        .on_hover_text("Автопилот: разбирать очередь скана — откликаться")
+                        .clicked()
+                    {
+                        new_want = Some(if self.want == Some(Phase::Apply) {
+                            None
+                        } else {
+                            Some(Phase::Apply)
+                        });
+                    }
+                    // Справа: «Выключить» (гасит фазу) и «Пауза» (заморозить/
+                    // продолжить на месте). В right_to_left первым идёт правый край.
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .add_enabled(running, egui::Button::new("⏻ Выключить"))
+                                .on_hover_text("Остановить автопилот и закрыть браузер")
+                                .clicked()
+                            {
+                                new_want = Some(None);
+                            }
+                            let (label, hint) = if paused {
+                                ("▶ Продолжить", "Снять паузу — продолжить с того же места")
+                            } else {
+                                ("⏸ Пауза", "Заморозить автопилот на месте (браузер не закрывается)")
+                            };
+                            if ui
+                                .add_enabled(self.pilot.is_some(), egui::Button::new(label))
+                                .on_hover_text(hint)
+                                .clicked()
+                            {
+                                toggle_pause = true;
+                            }
+                        },
+                    );
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let on = self.pilot_notify_on;
+                    let label = if on {
+                        "🔔 Уведомления: вкл"
+                    } else {
+                        "🔕 Уведомления: выкл"
+                    };
+                    if ui
+                        .selectable_label(on, label)
+                        .on_hover_text(
+                            "TG-пинги о собеседовании/контактах/позитиве в чате \
+                             (общий тумблер на все профили)",
+                        )
+                        .clicked()
+                    {
+                        let data_dir = self.cfg.autopilot_dir.join("data");
+                        if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
+                            eprintln!("notify.json write failed: {e}");
+                        } else {
+                            self.pilot_notify_on = !on;
+                        }
+                    }
+                });
+                // «Ответить HR»: текст рекрутёра из буфера → LLM (профиль на выбор)
+                // → ответ обратно в буфер. Генерация в фоне, пока идёт — спиннер.
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let running = matches!(
+                        &*self.hr_reply.lock().unwrap(),
+                        hr_reply::HrReplyState::Running
+                    );
+                    ui.add_enabled_ui(!running, |ui| {
+                        ui.menu_button("✍️ Ответить HR", |ui| {
+                            for (key, label) in PILOT_PROFILES {
+                                if ui.button(*label).clicked() {
+                                    hr_reply::start(
+                                        self.hr_reply.clone(),
+                                        ui.ctx().clone(),
+                                        self.cfg.autopilot_dir.clone(),
+                                        self.cfg.autopilot_bin.clone(),
+                                        (*key).to_string(),
+                                    );
+                                    ui.close_menu();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Черновик ответа рекрутёру: берёт текст из буфера, \
+                             отвечает через LLM от лица выбранного профиля и кладёт \
+                             ответ обратно в буфер",
+                        );
+                    });
+                    match &*self.hr_reply.lock().unwrap() {
+                        hr_reply::HrReplyState::Running => {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(egui::RichText::new("думаю…").size(11.0));
+                        }
+                        hr_reply::HrReplyState::Done => {
+                            ui.label(
+                                egui::RichText::new("✓ ответ в буфере")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(120, 210, 150)),
+                            );
+                        }
+                        hr_reply::HrReplyState::Error(e) => {
+                            ui.label(
+                                egui::RichText::new(e.clone())
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(230, 120, 120)),
+                            );
+                        }
+                        _ => {}
+                    }
+                });
+                // Строгость откликов: порог релевантности вакансии к резюме.
+                // «Любые» — весь пул по очереди похожести; «Строго/Средне» —
+                // откликаться только на достаточно близкое. Уходит автопилоту как
+                // MIN_SIMILARITY; смена на ходу перезапускает фазу откликов.
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("🎯 Отклик на:").size(11.0))
+                        .on_hover_text(
+                            "Порог соответствия вакансии твоему резюме (косинус \
+                             эмбеддингов). Ниже порога — не откликаемся.",
+                        );
+                    for (key, label, thr) in PILOT_STRICTNESS {
+                        let active = self.pilot_strictness == *key;
+                        if ui
+                            .selectable_label(active, *label)
+                            .on_hover_text(if *thr > 0.0 {
+                                format!("Порог ≥ {thr:.2} — только достаточно близкие вакансии")
+                            } else {
+                                "Без порога — откликаться на весь пул (по убыванию похожести)"
+                                    .to_string()
+                            })
+                            .clicked()
+                            && !active
+                        {
+                            new_strictness = Some((*key).to_string());
+                        }
+                    }
+                    // Старт/стоп откликов прямо в ряду строгости: «выбрал порог →
+                    // нажал» одним жестом. Это та же фаза, что и «📨 Отклики» сверху
+                    // (обе подсвечиваются вместе). Запускает разбор пула по
+                    // соответствию резюме с выбранным порогом.
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let applying = self.want == Some(Phase::Apply);
+                            let (lbl, hint) = if applying {
+                                ("⏹ Стоп", "Остановить отклики")
+                            } else {
+                                (
+                                    "▶ Начать",
+                                    "Начать отклики по соответствию резюме \
+                                     (с выбранной строгостью)",
+                                )
+                            };
+                            if ui.button(lbl).on_hover_text(hint).clicked() {
+                                new_want =
+                                    Some(if applying { None } else { Some(Phase::Apply) });
+                            }
+                        },
+                    );
+                });
+                // Скан по группам: своя кнопка-тумблер на каждую группу поиска
+                // (из scan.json). В скобках — число новых (ещё не отработанных)
+                // вакансий в очереди. Клик запускает скан группы, повторный —
+                // останавливает; скан гаснет и сам, дойдя до конца выдачи.
+                if let Some(scan) = &self.pilot_scan {
+                    if !scan.groups.is_empty() {
+                        ui.add_space(2.0);
+                        // «Все группы» — один процесс сканирует группы по очереди.
+                        let total: i64 = scan.groups.iter().map(|g| g.pending).sum();
+                        if ui
+                            .selectable_label(
+                                self.want == Some(Phase::ScanAll),
+                                format!("🔎 Все группы ({total})"),
+                            )
+                            .on_hover_text(
+                                "Сканировать все группы подряд в очередь \
+                                 (повторно — стоп)",
+                            )
+                            .clicked()
+                        {
+                            new_want = Some(if self.want == Some(Phase::ScanAll) {
+                                None
+                            } else {
+                                Some(Phase::ScanAll)
+                            });
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for g in &scan.groups {
+                                let active =
+                                    self.want == Some(Phase::Scan(g.name.clone()));
+                                let label = format!("🔎 {} ({})", g.name, g.pending);
+                                if ui
+                                    .selectable_label(active, label)
+                                    .on_hover_text(
+                                        "Скан группы в очередь откликов \
+                                         (повторно — стоп)",
+                                    )
+                                    .clicked()
+                                {
+                                    new_want = Some(if active {
+                                        None
+                                    } else {
+                                        Some(Phase::Scan(g.name.clone()))
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+                // Дообогащение пула: открыть необогащённые вакансии и сохранить
+                // полное описание + дату публикации + вектор (для точного подбора
+                // под резюме). Разовая фаза-тумблер; пока идёт — спиннер загрузки.
+                // Число в скобках — остаток необогащённых (из scan.json).
+                if let Some(scan) = &self.pilot_scan {
+                    let enrich_active = self.want == Some(Phase::Enrich);
+                    if enrich_active || scan.unenriched > 0 {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    enrich_active,
+                                    format!("✨ Дообогатить ({})", scan.unenriched),
+                                )
+                                .on_hover_text(
+                                    "Открыть необогащённые вакансии пула и сохранить \
+                                     полное описание, дату публикации и вектор \
+                                     (точный подбор под резюме). Повторно — стоп; \
+                                     по завершении гаснет сама.",
+                                )
+                                .clicked()
+                            {
+                                new_want = Some(if enrich_active {
+                                    None
+                                } else {
+                                    Some(Phase::Enrich)
+                                });
+                            }
+                            // Индикатор загрузки, пока обогащение идёт (Spinner сам
+                            // просит перерисовку — статус-лог ниже тикает вживую).
+                            if enrich_active {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            }
+                        });
+                    }
+                }
+                if !status.is_empty() {
+                    let mut job = egui::text::LayoutJob::default();
+                    job.wrap.max_width = ui.available_width();
+                    job.append(
+                        &status,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(10.0),
+                            color: egui::Color32::from_rgb(120, 128, 140),
+                            ..Default::default()
+                        },
+                    );
+                    ui.label(job);
+                }
+                // Счётчики: сколько откликов и обработанных чатов (из stats.json).
+                if let Some(s) = &self.pilot_stats {
+                    let color = egui::Color32::from_rgb(150, 160, 175);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "📨 откликов: {} (сегодня {})",
+                            s.applied_total, s.applied_today
+                        ))
+                        .size(11.0)
+                        .color(color),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "💬 чатов обработано: {}",
+                            s.chats_acted
+                        ))
+                        .size(11.0)
+                        .color(color),
+                    );
+                }
+            });
+            self.autopilot_collapsed = ap_collapsed;
+            if let Some(p) = new_profile {
+                self.pilot_profile = p;
+                // Счётчики откликов свои у каждого профиля — сбрасываем кэш, чтобы
+                // maybe_reload перечитал stats нового аккаунта. Пул (scan.json)
+                // общий, но mtime тоже сбросим — перечитается при следующем кадре.
+                self.pilot_scan_mtime = None;
+                self.pilot_stats = None;
+                self.pilot_stats_mtime = None;
+                // Если автопилот запущен — перезапустить под новый аккаунт.
+                if self.want.is_some() {
+                    self.reconcile_pilot();
+                }
+            }
+            if let Some(s) = new_strictness {
+                self.pilot_strictness = s;
+                // Порог читается автопилотом при старте. Если сейчас крутятся
+                // отклики — перезапустить с новым MIN_SIMILARITY; иначе применится
+                // при следующем запуске фазы откликов.
+                if self.want == Some(Phase::Apply) {
+                    self.reconcile_pilot();
+                }
+            }
+            if let Some(w) = new_want {
+                self.want = w;
+                self.reconcile_pilot();
+            }
+            if toggle_pause {
+                if let Some(p) = self.pilot.as_mut() {
+                    if p.is_paused() {
+                        p.resume();
+                    } else {
+                        p.pause();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Секция «Показатели»: список метрик из JSON либо сообщение об отсутствии данных.
+    fn draw_metrics(&mut self, ui: &mut egui::Ui) {
+        if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
+            let mut metrics_collapsed = self.metrics_collapsed;
+            section_collapsible(ui, "📊 Показатели", &mut metrics_collapsed, |ui| {
+                for m in &self.metrics.items {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&m.label)
+                                .color(egui::Color32::from_rgb(150, 150, 160)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(&m.value)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(235, 235, 240)),
+                                );
+                            },
+                        );
+                    });
+                }
+                if self.metrics.items.is_empty() && self.metrics.title.is_none() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "нет данных: {}",
+                            self.cfg.json_path.display()
+                        ))
+                        .color(egui::Color32::from_rgb(200, 120, 120)),
+                    );
+                }
+            });
+            self.metrics_collapsed = metrics_collapsed;
+        }
+    }
+
+    /// Обработать нажатия кнопок-маркеров транскрипции (старт/стоп участка → буфер).
+    fn process_marker_presses(&mut self) {
+        // Кнопки-маркеры транскрипции (RT-сигналы Tartarus): обрабатываем каждое новое
+        // нажатие как старт/стоп записи участка. На «стоп» — текст участка в буфер обмена;
+        // сами диапазоны-маркеры хранятся в markers_* и рисуются в draw_transcript.
+        let c_mic = self.mark_mic.load(Ordering::Relaxed);
+        let mic_finals = self.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+        if let Some(txt) = apply_mark_presses(
+            &mut self.markers_mic,
+            &mut self.mark_mic_seen,
+            c_mic,
+            mic_finals.as_deref(),
+        ) {
+            clipboard_set(txt);
+        }
+        let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
+        let zoom_finals = self.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+        if let Some(txt) = apply_mark_presses(
+            &mut self.markers_zoom,
+            &mut self.mark_zoom_seen,
+            c_zoom,
+            zoom_finals.as_deref(),
+        ) {
+            clipboard_set(txt);
+        }
+    }
+
+    /// Осциллограммы активных каналов с подписями, бейджами записи и лентой транскрипта.
+    fn draw_scopes(&mut self, ui: &mut egui::Ui) {
+        // Осциллограммы активных каналов (у каждого — своя подпись и цвет).
+        if self.mic.is_some() || self.zoom.is_some() {
+            section(ui, "📈 Осциллограммы", |ui| {
+                if let Some(mon) = &self.mic {
+                    mon.snapshot(&mut self.scope);
+                    let color = egui::Color32::from_rgb(120, 210, 150);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
+                        );
+                        marker_recording_badge(ui, &self.markers_mic);
+                    });
+                    draw_scope(ui, &self.scope, color);
+                    draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
+                }
+                if let Some(mon) = &self.zoom {
+                    mon.snapshot(&mut self.scope);
+                    let color = egui::Color32::from_rgb(130, 180, 250);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
+                        );
+                        marker_recording_badge(ui, &self.markers_zoom);
+                    });
+                    draw_scope(ui, &self.scope, color);
+                    draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
+                }
+            });
+        }
+    }
+
 }
 
 impl eframe::App for App {
@@ -859,782 +1657,19 @@ impl eframe::App for App {
 
                 ui.spacing_mut().item_spacing.y = 6.0;
 
-                // Строка заголовка: слева — название, справа — кнопка «поверх всех» (📌).
-                let title = self.metrics.title.clone();
-                let pinned = self.pinned;
-                let mut toggle_pin = false;
-                let mut toggle_terminal = false;
-                ui.horizontal(|ui| {
-                    if let Some(t) = &title {
-                        ui.label(
-                            egui::RichText::new(t)
-                                .size(15.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(180, 200, 255)),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let hint = if pinned {
-                            "Закреплено поверх всех — открепить"
-                        } else {
-                            "Закрепить поверх всех окон"
-                        };
-                        if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
-                            toggle_pin = true;
-                        }
-                        if ui
-                            .selectable_label(self.terminal_open, "🖥")
-                            .on_hover_text("Терминал")
-                            .clicked()
-                        {
-                            toggle_terminal = true;
-                        }
-                        // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(10.0)
-                                .color(egui::Color32::from_rgb(90, 96, 108)),
-                        )
-                        .on_hover_text(format!(
-                            "health-widget v{}\ncommit {}\nсборка {}",
-                            env!("CARGO_PKG_VERSION"),
-                            env!("GIT_HASH"),
-                            env!("BUILD_TIME"),
-                        ));
-                    });
-                });
-                if toggle_pin {
-                    self.pinned = !self.pinned;
-                    winctl::set_keep_above(self.pinned);
-                }
-                if toggle_terminal {
-                    self.terminal_open = !self.terminal_open;
-                    let cur = ctx.screen_rect();
-                    if self.terminal_open {
-                        self.width_one_col = Some(cur.width());
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            cur.width() + self.terminal_width,
-                            cur.height(),
-                        )));
-                    } else {
-                        let target = self
-                            .width_one_col
-                            .take()
-                            .unwrap_or((cur.width() - self.terminal_width).max(200.0));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            target,
-                            cur.height(),
-                        )));
-                    }
-                }
-                ui.add_space(2.0);
+                self.draw_header(ui, ctx);
 
-                // Два канала: микрофон и программа/вывод. У каждого — тумблер + селектор.
-                let mic_on = self.mic.is_some();
-                let zoom_on = self.zoom.is_some();
-                let mic_target = self.mic_target.clone();
-                let prog_target = self.prog_target.clone();
-                let mut toggle_mic = false;
-                let mut toggle_zoom = false;
-                let mut mic_off = false;
-                let mut zoom_off = false;
-                let mut new_mic: Option<Option<String>> = None;
-                let mut new_prog: Option<Option<String>> = None;
-                let mut refresh = false;
-                let mut refresh_mic = false;
+                self.draw_sound(ui);
 
-                section(ui, "🎧 Звук и транскрипция", |ui| {
-                // Строка 1 — микрофон: тумблер + выбор устройства.
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(mic_on, "🎤")
-                        .on_hover_text("Слушать микрофон")
-                        .clicked()
-                    {
-                        toggle_mic = true;
-                    }
-                    // Подпись селектора отражает состояние: выключен — «⊘ выключено».
-                    let cur = if mic_on {
-                        device_label(&mic_target, &self.mics, "🎤 по умолчанию")
-                    } else {
-                        "⊘ выключено".to_string()
-                    };
-                    egui::ComboBox::from_id_salt("mic-src")
-                        .width(150.0)
-                        .selected_text(egui::RichText::new(cur).size(11.0))
-                        .show_ui(ui, |ui| {
-                            // Первый пункт — отключить источник.
-                            if ui.selectable_label(!mic_on, "⊘ выключено").clicked() {
-                                mic_off = true;
-                            }
-                            if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
-                                new_mic = Some(None);
-                            }
-                            for d in &self.mics {
-                                let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
-                                if ui.selectable_label(sel, &d.label).clicked() {
-                                    new_mic = Some(Some(d.target.clone()));
-                                }
-                            }
-                        });
-                    if ui.small_button("⟳").on_hover_text("обновить список микрофонов").clicked() {
-                        refresh_mic = true;
-                    }
-                });
+                self.draw_call_and_screen(ui);
 
-                // Строка 2 — программа/вывод: тумблер + выбор программы + обновление списка.
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(zoom_on, "🔊")
-                        .on_hover_text("Слушать звук программы или всего вывода")
-                        .clicked()
-                    {
-                        toggle_zoom = true;
-                    }
-                    let cur = if zoom_on {
-                        device_label(&prog_target, &self.programs, "🔊 весь вывод")
-                    } else {
-                        "⊘ выключено".to_string()
-                    };
-                    egui::ComboBox::from_id_salt("prog-src")
-                        .width(150.0)
-                        .selected_text(egui::RichText::new(cur).size(11.0))
-                        .show_ui(ui, |ui| {
-                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                                if ui.selectable_label(!zoom_on, "⊘ выключено").clicked() {
-                                    zoom_off = true;
-                                }
-                                if ui.selectable_label(zoom_on && prog_target.is_none(), "🔊 весь вывод").clicked() {
-                                    new_prog = Some(None);
-                                }
-                                for d in &self.programs {
-                                    let sel = zoom_on && prog_target.as_deref() == Some(d.target.as_str());
-                                    if ui.selectable_label(sel, &d.label).clicked() {
-                                        new_prog = Some(Some(d.target.clone()));
-                                    }
-                                }
-                            });
-                        });
-                    if ui.small_button("⟳").on_hover_text("обновить список программ").clicked() {
-                        refresh = true;
-                    }
-                });
-                }); // конец блока «Звук»
+                self.draw_autopilot(ui);
 
-                // Применяем изменения выбора/тумблеров.
-                if refresh {
-                    self.mics = audio::list_mics();
-                    self.programs = audio::list_programs();
-                }
-                if refresh_mic {
-                    self.mics = audio::list_mics();
-                }
-                // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
-                if let Some(sel) = new_mic {
-                    self.mic_target = sel;
-                    self.mic = audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
-                }
-                if let Some(sel) = new_prog {
-                    self.prog_target = sel;
-                    self.zoom = self.start_program();
-                }
-                // Пункт «⊘ выключено» — погасить канал.
-                if mic_off {
-                    self.mic = None;
-                }
-                if zoom_off {
-                    self.zoom = None;
-                }
-                if toggle_mic {
-                    self.mic = if self.mic.is_some() {
-                        None
-                    } else {
-                        audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone())
-                    };
-                }
-                if toggle_zoom {
-                    self.zoom = if self.zoom.is_some() {
-                        None
-                    } else {
-                        self.start_program()
-                    };
-                }
-                ui.add_space(2.0);
+                self.draw_metrics(ui);
 
-                // Кол + Скрин в одной линии, по 50% ширины каждому. Слева — запись
-                // звонка (две дорожки WAV + транскрипт), справа — снимок области экрана
-                // через Spectacle. Каналы могли смениться выше — приводим запись к колу.
-                self.reconcile_call_recording();
-                let mut call_toggle = false;
-                let active_name = self.active_call.as_ref().map(|c| c.name.clone());
-                let mut name_buf = self.call_name_input.clone();
+                self.process_marker_presses();
 
-                let mut shoot = false;
-                let shot_line = {
-                    use screenshot::ShotStatus::*;
-                    match &*self.shot_status.lock().unwrap() {
-                        Idle => None,
-                        Marking => Some((
-                            "⧗ кликни две точки…".to_string(),
-                            egui::Color32::from_rgb(210, 200, 120),
-                        )),
-                        Working => Some((
-                            "⧗ режу…".to_string(),
-                            egui::Color32::from_rgb(210, 200, 120),
-                        )),
-                        Saved(p) => {
-                            let name = std::path::Path::new(p)
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("сохранено");
-                            Some((
-                                format!("✔ {name}"),
-                                egui::Color32::from_rgb(120, 200, 120),
-                            ))
-                        }
-                        Cancelled => Some(("отменено".to_string(), egui::Color32::GRAY)),
-                        Failed(e) => {
-                            Some((format!("✖ {e}"), egui::Color32::from_rgb(230, 120, 120)))
-                        }
-                    }
-                };
-
-                ui.columns(2, |cols| {
-                    section(&mut cols[0], "🎙 Кол", |ui| {
-                        ui.horizontal(|ui| {
-                            let recording = active_name.is_some();
-                            let (label, hint) = if recording {
-                                ("⏹ Завершить", "Остановить запись и сохранить кол")
-                            } else {
-                                ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
-                            };
-                            if ui.button(label).on_hover_text(hint).clicked() {
-                                call_toggle = true;
-                            }
-                            if let Some(n) = &active_name {
-                                ui.label(
-                                    egui::RichText::new(format!("● {n}"))
-                                        .size(11.0)
-                                        .color(egui::Color32::from_rgb(230, 120, 120)),
-                                );
-                            } else {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut name_buf)
-                                        .hint_text("название")
-                                        .desired_width(f32::INFINITY),
-                                );
-                            }
-                        });
-                    });
-                    section(&mut cols[1], "📸 Скрин", |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.shot_active,
-                                    egui::Button::new("📸 Область"),
-                                )
-                                .on_hover_text(
-                                    "Кликнуть две точки на экране — сохранить PNG области \
-                                     в ~/.local/share/health-widget/screenshots/",
-                                )
-                                .clicked()
-                            {
-                                shoot = true;
-                            }
-                            if let Some((text, color)) = &shot_line {
-                                ui.label(egui::RichText::new(text).size(11.0).color(*color));
-                            }
-                        });
-                    });
-                });
-
-                self.call_name_input = name_buf;
-                if call_toggle {
-                    if self.active_call.is_some() {
-                        self.end_call();
-                    } else {
-                        self.start_call();
-                    }
-                }
-                if shoot {
-                    self.shot_request.store(true, Ordering::Relaxed);
-                }
-                ui.add_space(2.0);
-
-                // Автопилот: взаимоисключающие тумблеры фаз (чат / отклики / скан группы) +
-                // «Выключить»/«Пауза». Одно окно браузера → одна фаза за раз, любой выбор
-                // (пере)запускает процесс. Показываем только если бинарь установлен.
-                if self.cfg.autopilot_bin.exists() {
-                    use pilot::Phase;
-                    let mut new_want: Option<Option<Phase>> = None;
-                    let mut new_profile: Option<String> = None;
-                    let mut new_strictness: Option<String> = None;
-                    let mut toggle_pause = false;
-                    let running = self.want.is_some();
-                    let paused = self.pilot.as_ref().is_some_and(|p| p.is_paused());
-                    // Краткий статус: пауза → явная метка, иначе последняя строка лога
-                    // автопилота либо сообщение об ошибке.
-                    let status = if paused {
-                        "⏸ на паузе".to_string()
-                    } else {
-                        self.pilot
-                            .as_ref()
-                            .and_then(|p| p.last_line())
-                            .unwrap_or_else(|| self.pilot_status.clone())
-                    };
-                    let mut ap_collapsed = self.autopilot_collapsed;
-                    section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
-                        // Профиль (аккаунт/резюме): под кем работает автопилот. Смена —
-                        // перезапуск под другой аккаунт браузера (свой логин, свои счётчики).
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
-                                "Профиль автопилота: аккаунт браузера, резюме и контакты",
-                            );
-                            let cur = PILOT_PROFILES
-                                .iter()
-                                .find(|(k, _)| *k == self.pilot_profile)
-                                .map(|(_, l)| *l)
-                                .unwrap_or("Fullstack");
-                            egui::ComboBox::from_id_salt("pilot-profile")
-                                .width(150.0)
-                                .selected_text(egui::RichText::new(cur).size(11.0))
-                                .show_ui(ui, |ui| {
-                                    for (key, label) in PILOT_PROFILES {
-                                        if ui
-                                            .selectable_label(self.pilot_profile == *key, *label)
-                                            .clicked()
-                                            && self.pilot_profile != *key
-                                        {
-                                            new_profile = Some((*key).to_string());
-                                        }
-                                    }
-                                });
-                        });
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(self.want == Some(Phase::Chat), "💬 Чат")
-                                .on_hover_text("Автопилот: вести чаты с работодателями")
-                                .clicked()
-                            {
-                                // Повторный клик по активной — выключить; иначе переключить.
-                                new_want = Some(if self.want == Some(Phase::Chat) {
-                                    None
-                                } else {
-                                    Some(Phase::Chat)
-                                });
-                            }
-                            if ui
-                                .selectable_label(self.want == Some(Phase::Apply), "📨 Отклики")
-                                .on_hover_text("Автопилот: разбирать очередь скана — откликаться")
-                                .clicked()
-                            {
-                                new_want = Some(if self.want == Some(Phase::Apply) {
-                                    None
-                                } else {
-                                    Some(Phase::Apply)
-                                });
-                            }
-                            // Справа: «Выключить» (гасит фазу) и «Пауза» (заморозить/
-                            // продолжить на месте). В right_to_left первым идёт правый край.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(running, egui::Button::new("⏻ Выключить"))
-                                        .on_hover_text("Остановить автопилот и закрыть браузер")
-                                        .clicked()
-                                    {
-                                        new_want = Some(None);
-                                    }
-                                    let (label, hint) = if paused {
-                                        ("▶ Продолжить", "Снять паузу — продолжить с того же места")
-                                    } else {
-                                        ("⏸ Пауза", "Заморозить автопилот на месте (браузер не закрывается)")
-                                    };
-                                    if ui
-                                        .add_enabled(self.pilot.is_some(), egui::Button::new(label))
-                                        .on_hover_text(hint)
-                                        .clicked()
-                                    {
-                                        toggle_pause = true;
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            let on = self.pilot_notify_on;
-                            let label = if on {
-                                "🔔 Уведомления: вкл"
-                            } else {
-                                "🔕 Уведомления: выкл"
-                            };
-                            if ui
-                                .selectable_label(on, label)
-                                .on_hover_text(
-                                    "TG-пинги о собеседовании/контактах/позитиве в чате \
-                                     (общий тумблер на все профили)",
-                                )
-                                .clicked()
-                            {
-                                let data_dir = self.cfg.autopilot_dir.join("data");
-                                if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
-                                    eprintln!("notify.json write failed: {e}");
-                                } else {
-                                    self.pilot_notify_on = !on;
-                                }
-                            }
-                        });
-                        // «Ответить HR»: текст рекрутёра из буфера → LLM (профиль на выбор)
-                        // → ответ обратно в буфер. Генерация в фоне, пока идёт — спиннер.
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            let running = matches!(
-                                &*self.hr_reply.lock().unwrap(),
-                                hr_reply::HrReplyState::Running
-                            );
-                            ui.add_enabled_ui(!running, |ui| {
-                                ui.menu_button("✍️ Ответить HR", |ui| {
-                                    for (key, label) in PILOT_PROFILES {
-                                        if ui.button(*label).clicked() {
-                                            hr_reply::start(
-                                                self.hr_reply.clone(),
-                                                ui.ctx().clone(),
-                                                self.cfg.autopilot_dir.clone(),
-                                                self.cfg.autopilot_bin.clone(),
-                                                (*key).to_string(),
-                                            );
-                                            ui.close_menu();
-                                        }
-                                    }
-                                })
-                                .response
-                                .on_hover_text(
-                                    "Черновик ответа рекрутёру: берёт текст из буфера, \
-                                     отвечает через LLM от лица выбранного профиля и кладёт \
-                                     ответ обратно в буфер",
-                                );
-                            });
-                            match &*self.hr_reply.lock().unwrap() {
-                                hr_reply::HrReplyState::Running => {
-                                    ui.add(egui::Spinner::new().size(14.0));
-                                    ui.label(egui::RichText::new("думаю…").size(11.0));
-                                }
-                                hr_reply::HrReplyState::Done => {
-                                    ui.label(
-                                        egui::RichText::new("✓ ответ в буфере")
-                                            .size(11.0)
-                                            .color(egui::Color32::from_rgb(120, 210, 150)),
-                                    );
-                                }
-                                hr_reply::HrReplyState::Error(e) => {
-                                    ui.label(
-                                        egui::RichText::new(e.clone())
-                                            .size(11.0)
-                                            .color(egui::Color32::from_rgb(230, 120, 120)),
-                                    );
-                                }
-                                _ => {}
-                            }
-                        });
-                        // Строгость откликов: порог релевантности вакансии к резюме.
-                        // «Любые» — весь пул по очереди похожести; «Строго/Средне» —
-                        // откликаться только на достаточно близкое. Уходит автопилоту как
-                        // MIN_SIMILARITY; смена на ходу перезапускает фазу откликов.
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("🎯 Отклик на:").size(11.0))
-                                .on_hover_text(
-                                    "Порог соответствия вакансии твоему резюме (косинус \
-                                     эмбеддингов). Ниже порога — не откликаемся.",
-                                );
-                            for (key, label, thr) in PILOT_STRICTNESS {
-                                let active = self.pilot_strictness == *key;
-                                if ui
-                                    .selectable_label(active, *label)
-                                    .on_hover_text(if *thr > 0.0 {
-                                        format!("Порог ≥ {thr:.2} — только достаточно близкие вакансии")
-                                    } else {
-                                        "Без порога — откликаться на весь пул (по убыванию похожести)"
-                                            .to_string()
-                                    })
-                                    .clicked()
-                                    && !active
-                                {
-                                    new_strictness = Some((*key).to_string());
-                                }
-                            }
-                            // Старт/стоп откликов прямо в ряду строгости: «выбрал порог →
-                            // нажал» одним жестом. Это та же фаза, что и «📨 Отклики» сверху
-                            // (обе подсвечиваются вместе). Запускает разбор пула по
-                            // соответствию резюме с выбранным порогом.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let applying = self.want == Some(Phase::Apply);
-                                    let (lbl, hint) = if applying {
-                                        ("⏹ Стоп", "Остановить отклики")
-                                    } else {
-                                        (
-                                            "▶ Начать",
-                                            "Начать отклики по соответствию резюме \
-                                             (с выбранной строгостью)",
-                                        )
-                                    };
-                                    if ui.button(lbl).on_hover_text(hint).clicked() {
-                                        new_want =
-                                            Some(if applying { None } else { Some(Phase::Apply) });
-                                    }
-                                },
-                            );
-                        });
-                        // Скан по группам: своя кнопка-тумблер на каждую группу поиска
-                        // (из scan.json). В скобках — число новых (ещё не отработанных)
-                        // вакансий в очереди. Клик запускает скан группы, повторный —
-                        // останавливает; скан гаснет и сам, дойдя до конца выдачи.
-                        if let Some(scan) = &self.pilot_scan {
-                            if !scan.groups.is_empty() {
-                                ui.add_space(2.0);
-                                // «Все группы» — один процесс сканирует группы по очереди.
-                                let total: i64 = scan.groups.iter().map(|g| g.pending).sum();
-                                if ui
-                                    .selectable_label(
-                                        self.want == Some(Phase::ScanAll),
-                                        format!("🔎 Все группы ({total})"),
-                                    )
-                                    .on_hover_text(
-                                        "Сканировать все группы подряд в очередь \
-                                         (повторно — стоп)",
-                                    )
-                                    .clicked()
-                                {
-                                    new_want = Some(if self.want == Some(Phase::ScanAll) {
-                                        None
-                                    } else {
-                                        Some(Phase::ScanAll)
-                                    });
-                                }
-                                ui.horizontal_wrapped(|ui| {
-                                    for g in &scan.groups {
-                                        let active =
-                                            self.want == Some(Phase::Scan(g.name.clone()));
-                                        let label = format!("🔎 {} ({})", g.name, g.pending);
-                                        if ui
-                                            .selectable_label(active, label)
-                                            .on_hover_text(
-                                                "Скан группы в очередь откликов \
-                                                 (повторно — стоп)",
-                                            )
-                                            .clicked()
-                                        {
-                                            new_want = Some(if active {
-                                                None
-                                            } else {
-                                                Some(Phase::Scan(g.name.clone()))
-                                            });
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        // Дообогащение пула: открыть необогащённые вакансии и сохранить
-                        // полное описание + дату публикации + вектор (для точного подбора
-                        // под резюме). Разовая фаза-тумблер; пока идёт — спиннер загрузки.
-                        // Число в скобках — остаток необогащённых (из scan.json).
-                        if let Some(scan) = &self.pilot_scan {
-                            let enrich_active = self.want == Some(Phase::Enrich);
-                            if enrich_active || scan.unenriched > 0 {
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            enrich_active,
-                                            format!("✨ Дообогатить ({})", scan.unenriched),
-                                        )
-                                        .on_hover_text(
-                                            "Открыть необогащённые вакансии пула и сохранить \
-                                             полное описание, дату публикации и вектор \
-                                             (точный подбор под резюме). Повторно — стоп; \
-                                             по завершении гаснет сама.",
-                                        )
-                                        .clicked()
-                                    {
-                                        new_want = Some(if enrich_active {
-                                            None
-                                        } else {
-                                            Some(Phase::Enrich)
-                                        });
-                                    }
-                                    // Индикатор загрузки, пока обогащение идёт (Spinner сам
-                                    // просит перерисовку — статус-лог ниже тикает вживую).
-                                    if enrich_active {
-                                        ui.add(egui::Spinner::new().size(14.0));
-                                    }
-                                });
-                            }
-                        }
-                        if !status.is_empty() {
-                            let mut job = egui::text::LayoutJob::default();
-                            job.wrap.max_width = ui.available_width();
-                            job.append(
-                                &status,
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::proportional(10.0),
-                                    color: egui::Color32::from_rgb(120, 128, 140),
-                                    ..Default::default()
-                                },
-                            );
-                            ui.label(job);
-                        }
-                        // Счётчики: сколько откликов и обработанных чатов (из stats.json).
-                        if let Some(s) = &self.pilot_stats {
-                            let color = egui::Color32::from_rgb(150, 160, 175);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "📨 откликов: {} (сегодня {})",
-                                    s.applied_total, s.applied_today
-                                ))
-                                .size(11.0)
-                                .color(color),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "💬 чатов обработано: {}",
-                                    s.chats_acted
-                                ))
-                                .size(11.0)
-                                .color(color),
-                            );
-                        }
-                    });
-                    self.autopilot_collapsed = ap_collapsed;
-                    if let Some(p) = new_profile {
-                        self.pilot_profile = p;
-                        // Счётчики откликов свои у каждого профиля — сбрасываем кэш, чтобы
-                        // maybe_reload перечитал stats нового аккаунта. Пул (scan.json)
-                        // общий, но mtime тоже сбросим — перечитается при следующем кадре.
-                        self.pilot_scan_mtime = None;
-                        self.pilot_stats = None;
-                        self.pilot_stats_mtime = None;
-                        // Если автопилот запущен — перезапустить под новый аккаунт.
-                        if self.want.is_some() {
-                            self.reconcile_pilot();
-                        }
-                    }
-                    if let Some(s) = new_strictness {
-                        self.pilot_strictness = s;
-                        // Порог читается автопилотом при старте. Если сейчас крутятся
-                        // отклики — перезапустить с новым MIN_SIMILARITY; иначе применится
-                        // при следующем запуске фазы откликов.
-                        if self.want == Some(Phase::Apply) {
-                            self.reconcile_pilot();
-                        }
-                    }
-                    if let Some(w) = new_want {
-                        self.want = w;
-                        self.reconcile_pilot();
-                    }
-                    if toggle_pause {
-                        if let Some(p) = self.pilot.as_mut() {
-                            if p.is_paused() {
-                                p.resume();
-                            } else {
-                                p.pause();
-                            }
-                        }
-                    }
-                }
-
-                if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
-                    let mut metrics_collapsed = self.metrics_collapsed;
-                    section_collapsible(ui, "📊 Показатели", &mut metrics_collapsed, |ui| {
-                        for m in &self.metrics.items {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&m.label)
-                                        .color(egui::Color32::from_rgb(150, 150, 160)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&m.value)
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(235, 235, 240)),
-                                        );
-                                    },
-                                );
-                            });
-                        }
-                        if self.metrics.items.is_empty() && self.metrics.title.is_none() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "нет данных: {}",
-                                    self.cfg.json_path.display()
-                                ))
-                                .color(egui::Color32::from_rgb(200, 120, 120)),
-                            );
-                        }
-                    });
-                    self.metrics_collapsed = metrics_collapsed;
-                }
-
-                // Кнопки-маркеры транскрипции (RT-сигналы Tartarus): обрабатываем каждое новое
-                // нажатие как старт/стоп записи участка. На «стоп» — текст участка в буфер обмена;
-                // сами диапазоны-маркеры хранятся в markers_* и рисуются в draw_transcript.
-                let c_mic = self.mark_mic.load(Ordering::Relaxed);
-                let mic_finals = self.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-                if let Some(txt) = apply_mark_presses(
-                    &mut self.markers_mic,
-                    &mut self.mark_mic_seen,
-                    c_mic,
-                    mic_finals.as_deref(),
-                ) {
-                    clipboard_set(txt);
-                }
-                let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
-                let zoom_finals = self.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-                if let Some(txt) = apply_mark_presses(
-                    &mut self.markers_zoom,
-                    &mut self.mark_zoom_seen,
-                    c_zoom,
-                    zoom_finals.as_deref(),
-                ) {
-                    clipboard_set(txt);
-                }
-
-                // Осциллограммы активных каналов (у каждого — своя подпись и цвет).
-                if self.mic.is_some() || self.zoom.is_some() {
-                    section(ui, "📈 Осциллограммы", |ui| {
-                        if let Some(mon) = &self.mic {
-                            mon.snapshot(&mut self.scope);
-                            let color = egui::Color32::from_rgb(120, 210, 150);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
-                                );
-                                marker_recording_badge(ui, &self.markers_mic);
-                            });
-                            draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
-                        }
-                        if let Some(mon) = &self.zoom {
-                            mon.snapshot(&mut self.scope);
-                            let color = egui::Color32::from_rgb(130, 180, 250);
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
-                                );
-                                marker_recording_badge(ui, &self.markers_zoom);
-                            });
-                            draw_scope(ui, &self.scope, color);
-                            draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
-                        }
-                    });
-                }
+                self.draw_scopes(ui);
 
                 // Ручка ресайза в правом-нижнем углу: тянешь — композитор растягивает окно.
                 draw_resize_grip(ui, ctx, grip_rect);
