@@ -233,6 +233,12 @@ impl AudioMonitor {
         self.transcriber.as_ref().map(|t| t.text())
     }
 
+    pub fn clear_transcript(&self) {
+        if let Some(t) = &self.transcriber {
+            t.clear();
+        }
+    }
+
     pub fn start_recording(&self, path: &Path) -> std::io::Result<()> {
         let w = WavRecorder::create(path, RATE_HZ)?;
         if let Ok(mut g) = self.recorder.lock() {

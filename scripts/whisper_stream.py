@@ -74,14 +74,20 @@ HALLUCINATIONS = {
     "ставьте лайки",
 }
 
+HALLUCINATION_RE = (
+    re.compile(r"^подпи(шись|шитесь|сывайся|сывайтесь)( на канал\w*)?$"),
+    re.compile(r"^ставьте лайк\w*$"),
+    re.compile(r"^(лайк\w*|не забуд\w+|ставь\w*).*подпи\w+"),
+    re.compile(r"^раз[,\s]+два[,\s]+три([,\s]+четыре)?[,\s]*$"),
+)
+
 def _norm(text: str) -> str:
     """Нормализовать сегмент для сравнения с чёрным списком: lower, без внешней пунктуации
     и обрамляющих скобок (whisper пишет теги как «[Аплодисменты]»/«(музыка)»)."""
     return " ".join(text.strip().lower().strip(" .…!?,-—:;\"'[](){}«»").split())
 
-def is_hallucination(text: str, no_speech_prob: float = 0.0) -> bool:
-    """True, если сегмент — фантомная вставка whisper (пустой, из чёрного списка, титры-кредиты
-    или помеченный моделью как не-речь). Тогда сегмент не показываем."""
+def is_hallucination(text: str, no_speech_prob: float = 0.0,
+                     avg_logprob: float = 0.0, compression_ratio: float = 0.0) -> bool:
     raw = text.strip()
     n = _norm(text)
     if not n:
@@ -90,9 +96,15 @@ def is_hallucination(text: str, no_speech_prob: float = 0.0) -> bool:
         return True
     if n in HALLUCINATIONS:
         return True
+    if any(rx.match(n) for rx in HALLUCINATION_RE):
+        return True
     if "субтитр" in n and ("dimatorzok" in n or "семкин" in n or "корректор" in n):
         return True
     if no_speech_prob >= 0.85:
+        return True
+    if avg_logprob <= -1.0:
+        return True
+    if compression_ratio >= 2.4:
         return True
     return False
 
@@ -190,7 +202,12 @@ def main() -> int:
         parts = [
             s.text.strip()
             for s in segments
-            if not is_hallucination(s.text, getattr(s, "no_speech_prob", 0.0))
+            if not is_hallucination(
+                s.text,
+                getattr(s, "no_speech_prob", 0.0),
+                getattr(s, "avg_logprob", 0.0),
+                getattr(s, "compression_ratio", 0.0),
+            )
         ]
         text = " ".join(p for p in parts if p).strip()
         text = apply_corrections(text, corrections)

@@ -6,6 +6,7 @@ use egui_term::{BackendSettings, PtyEvent, TerminalBackend, TerminalView};
 pub struct Terminal {
     backend: TerminalBackend,
     pty_rx: Receiver<(u64, PtyEvent)>,
+    focused: bool,
 }
 
 impl Terminal {
@@ -19,7 +20,11 @@ impl Terminal {
         };
         let backend = TerminalBackend::new(0, ctx.clone(), pty_tx, settings)
             .expect("не удалось поднять PTY терминала");
-        Self { backend, pty_rx }
+        Self {
+            backend,
+            pty_rx,
+            focused: true,
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -33,7 +38,19 @@ impl Terminal {
             let ctx = ui.ctx().clone();
             *self = Terminal::new(&ctx);
         }
-        let view = TerminalView::new(ui, &mut self.backend).set_focus(true);
-        ui.add(view);
+        let view = TerminalView::new(ui, &mut self.backend).set_focus(self.focused);
+        let resp = ui.add(view);
+        if resp.clicked() {
+            self.focused = true;
+        }
+        let clicked_outside = ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !resp.rect.contains(p))
+        });
+        if clicked_outside {
+            self.focused = false;
+        }
     }
 }

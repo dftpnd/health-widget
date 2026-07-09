@@ -135,6 +135,13 @@ impl Transcriber {
             Err(_) => (String::new(), String::new()),
         }
     }
+
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.state.lock() {
+            g.finals.clear();
+            g.partial.clear();
+        }
+    }
 }
 
 impl Drop for Transcriber {

@@ -26,6 +26,8 @@ pub struct State {
     pub autopilot_collapsed: bool,
     #[serde(default)]
     pub metrics_collapsed: bool,
+    #[serde(default)]
+    pub chat_collapsed: bool,
     #[serde(default, alias = "chat_open")]
     pub terminal_open: bool,
 }

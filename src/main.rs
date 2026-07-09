@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod audio;
+mod chat;
 mod clip;
 mod config;
 mod data;
+mod deepseek;
 mod detect;
 mod hr_reply;
 mod pilot;
@@ -105,7 +107,6 @@ struct App {
     currently_visible: bool,
     transcript_log: Option<Arc<TranscriptLog>>,
     active_call: Option<ActiveCall>,
-    call_name_input: String,
     audio: AudioState,
     pinned: bool,
     autopilot: AutopilotState,
@@ -128,6 +129,9 @@ struct App {
     terminal_width: f32,
     autopilot_collapsed: bool,
     metrics_collapsed: bool,
+    chat: chat::Chat,
+    chat_collapsed: bool,
+    deepseek: Option<deepseek::Slot>,
 }
 
 #[derive(Default)]
@@ -331,7 +335,6 @@ impl App {
             currently_visible: true,
             transcript_log,
             active_call: None,
-            call_name_input: String::new(),
             audio: AudioState {
                 mic,
                 zoom,
@@ -378,6 +381,9 @@ impl App {
             terminal_width: st.terminal_width.unwrap_or(TERMINAL_W),
             autopilot_collapsed: st.autopilot_collapsed,
             metrics_collapsed: st.metrics_collapsed,
+            chat: chat::Chat::default(),
+            chat_collapsed: st.chat_collapsed,
+            deepseek: None,
         }
     }
 
@@ -390,10 +396,7 @@ impl App {
         let Some(log) = self.transcript_log.clone() else {
             return;
         };
-        let name = match self.call_name_input.trim() {
-            "" => "без названия".to_string(),
-            n => n.to_string(),
-        };
+        let name = call_name_now();
         let Some(id) = log.start_call(&name) else {
             return;
         };
@@ -513,6 +516,7 @@ impl App {
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             metrics_collapsed: self.metrics_collapsed,
+            chat_collapsed: self.chat_collapsed,
             terminal_open: self.terminal_open,
         }
     }
@@ -612,6 +616,7 @@ impl App {
         let pinned = self.pinned;
         let mut toggle_pin = false;
         let mut toggle_terminal = false;
+        let mut do_restart = false;
         ui.horizontal(|ui| {
             if let Some(t) = &title {
                 ui.label(
@@ -636,6 +641,13 @@ impl App {
                     .clicked()
                 {
                     toggle_terminal = true;
+                }
+                if ui
+                    .button("⟳")
+                    .on_hover_text("Пересобрать (--release) и перезапустить")
+                    .clicked()
+                {
+                    do_restart = true;
                 }
                 ui.label(
                     egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
@@ -673,6 +685,9 @@ impl App {
                     cur.height(),
                 )));
             }
+        }
+        if do_restart {
+            rebuild_and_restart();
         }
         ui.add_space(2.0);
     }
@@ -807,7 +822,6 @@ impl App {
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
-        let mut name_buf = self.call_name_input.clone();
 
         let mut shoot = false;
         let shot_line = {
@@ -857,12 +871,6 @@ impl App {
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(230, 120, 120)),
                         );
-                    } else {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut name_buf)
-                                .hint_text("название")
-                                .desired_width(f32::INFINITY),
-                        );
                     }
                 });
             });
@@ -888,7 +896,6 @@ impl App {
             });
         });
 
-        self.call_name_input = name_buf;
         if call_toggle {
             if self.active_call.is_some() {
                 self.end_call();
@@ -1314,6 +1321,9 @@ impl App {
 
     fn draw_scopes(&mut self, ui: &mut egui::Ui) {
         if self.audio.mic.is_some() || self.audio.zoom.is_some() {
+            let mut picked: Option<String> = None;
+            let mut clear_mic = false;
+            let mut clear_zoom = false;
             section(ui, "📈 Осциллограммы", |ui| {
                 if let Some(mon) = &self.audio.mic {
                     mon.snapshot(&mut self.audio.scope);
@@ -1323,9 +1333,15 @@ impl App {
                             egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
                         );
                         marker_recording_badge(ui, &self.markers_mic);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
+                                clear_mic = true;
+                            }
+                        });
                     });
                     draw_scope(ui, &self.audio.scope, color);
-                    draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
+                    picked = draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic)
+                        .or(picked.take());
                 }
                 if let Some(mon) = &self.audio.zoom {
                     mon.snapshot(&mut self.audio.scope);
@@ -1336,11 +1352,77 @@ impl App {
                             egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
                         );
                         marker_recording_badge(ui, &self.markers_zoom);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
+                                clear_zoom = true;
+                            }
+                        });
                     });
                     draw_scope(ui, &self.audio.scope, color);
-                    draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
+                    picked = draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom)
+                        .or(picked.take());
                 }
             });
+            if clear_mic {
+                if let Some(mon) = &self.audio.mic {
+                    mon.clear_transcript();
+                }
+                self.markers_mic = MarkerState::default();
+            }
+            if clear_zoom {
+                if let Some(mon) = &self.audio.zoom {
+                    mon.clear_transcript();
+                }
+                self.markers_zoom = MarkerState::default();
+            }
+            if let Some(q) = picked {
+                self.start_deepseek(ui.ctx().clone(), q);
+            }
+        }
+    }
+
+    fn start_deepseek(&mut self, ctx: egui::Context, question: String) {
+        let q = question.trim().to_string();
+        if q.is_empty() || self.deepseek.is_some() {
+            return;
+        }
+        telemetry::event(
+            "chat.ask",
+            serde_json::json!({ "len": q.len(), "profile": self.autopilot.profile }),
+        );
+        self.chat.push_user(q.clone());
+        self.chat.set_pending(true);
+        self.chat_collapsed = false;
+        self.deepseek = Some(deepseek::ask(
+            ctx,
+            self.cfg.autopilot_dir.clone(),
+            self.autopilot.profile.clone(),
+            q,
+        ));
+    }
+
+    fn poll_deepseek(&mut self) {
+        let done = self
+            .deepseek
+            .as_ref()
+            .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+        if let Some(res) = done {
+            self.deepseek = None;
+            self.chat.set_pending(false);
+            match res {
+                Ok(answer) => self.chat.push_bot(answer),
+                Err(e) => self.chat.push_bot(format!("⚠ {e}")),
+            }
+        }
+    }
+
+    fn draw_chat(&mut self, ui: &mut egui::Ui) {
+        let submitted = section_collapsible(ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
+            self.chat.ui(ui)
+        })
+        .flatten();
+        if let Some(q) = submitted {
+            self.start_deepseek(ui.ctx().clone(), q);
         }
     }
 
@@ -1362,6 +1444,8 @@ impl eframe::App for App {
         }
 
         self.maybe_reload();
+
+        self.poll_deepseek();
 
         if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
             telemetry::event("shot.request", serde_json::json!({}));
@@ -1462,6 +1546,8 @@ impl eframe::App for App {
                 self.process_marker_presses();
 
                 self.draw_scopes(ui);
+
+                self.draw_chat(ui);
 
                 draw_resize_grip(ui, ctx, grip_rect);
 
@@ -1571,6 +1657,18 @@ fn section_impl<R>(
         .inner
 }
 
+fn call_name_now() -> String {
+    rusqlite::Connection::open_in_memory()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT strftime('%Y-%m-%d %H:%M','now','localtime')",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+        })
+        .unwrap_or_else(|_| "кол".to_string())
+}
+
 fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) -> String {
     match target {
         None => default.to_string(),
@@ -1627,27 +1725,29 @@ fn draw_transcript(
     color: egui::Color32,
     id_salt: &str,
     markers: &MarkerState,
-) {
+) -> Option<String> {
     let (finals, partial) = match data {
         Some(t) => t,
-        None => return,
+        None => return None,
     };
-    if finals.is_empty() && partial.is_empty() {
-        ui.label(
-            egui::RichText::new("… слушаю")
-                .size(11.0)
-                .italics()
-                .color(egui::Color32::from_rgb(90, 96, 108)),
-        );
-        return;
-    }
     ui.add_space(2.0);
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
         .max_height(140.0)
-        .auto_shrink([false, true])
+        .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
+            ui.set_min_height(140.0);
+            if finals.is_empty() && partial.is_empty() {
+                ui.label(
+                    egui::RichText::new("… слушаю")
+                        .size(11.0)
+                        .italics()
+                        .color(egui::Color32::from_rgb(90, 96, 108)),
+                );
+                return None;
+            }
+            let mut picked = None;
             if !finals.is_empty() {
                 let mut text = finals.clone();
                 let hl = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
@@ -1675,7 +1775,8 @@ fn draw_transcript(
                                 .take(chars.end - chars.start)
                                 .collect();
                             if !selected.is_empty() {
-                                ui.ctx().copy_text(selected);
+                                ui.ctx().copy_text(selected.clone());
+                                picked = Some(selected);
                             }
                         }
                     }
@@ -1689,7 +1790,9 @@ fn draw_transcript(
                         .color(egui::Color32::from_rgb(140, 146, 158)),
                 );
             }
-        });
+            picked
+        })
+        .inner
 }
 
 fn apply_mark_presses(
@@ -1796,6 +1899,37 @@ fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
             egui::Stroke::new(1.5, color),
         );
     }
+}
+
+fn rebuild_and_restart() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let pid = std::process::id();
+    let manifest = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .map(|d| d.join("Cargo.toml"))
+        .filter(|m| m.exists());
+    let build = match &manifest {
+        Some(m) => format!(
+            "cargo build --release --manifest-path '{}' > '{}' 2>&1; ",
+            m.display(),
+            m.with_file_name("target").join("restart-build.log").display(),
+        ),
+        None => String::new(),
+    };
+    let script = format!(
+        "while kill -0 {pid} 2>/dev/null; do sleep 0.1; done; {build}exec '{}'",
+        exe.display(),
+    );
+    let _ = std::process::Command::new("setsid")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .spawn();
+    std::process::exit(0);
 }
 
 fn main() -> eframe::Result<()> {
