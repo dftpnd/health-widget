@@ -53,6 +53,7 @@ const PILOT_FRESH_KEY: &str = "fresh";
 const DEFAULT_STRICTNESS: &str = "medium";
 
 const TERMINAL_W: f32 = 340.0;
+const TOP_ROW_H: f32 = 64.0;
 
 fn profile_stats_path(autopilot_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
     autopilot_dir
@@ -790,7 +791,7 @@ impl App {
         }
     }
 
-    fn draw_sound(&mut self, ui: &mut egui::Ui) {
+    fn draw_sound(&mut self, ui: &mut egui::Ui, min_height: f32) {
         let mic_on = self.audio.mic.is_some();
         let zoom_on = self.audio.zoom.is_some();
         let mic_target = self.audio.mic_target.clone();
@@ -804,7 +805,7 @@ impl App {
         let mut refresh = false;
         let mut refresh_mic = false;
 
-        section(ui, "🎧 Звук и транскрипция", |ui| {
+        section_sized(ui, "🎧 Звук и транскрипция", min_height, |ui| {
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(mic_on, "🎤")
@@ -946,11 +947,40 @@ impl App {
         });
     }
 
-    fn draw_call_and_screen(&mut self, ui: &mut egui::Ui) {
+    fn draw_call(&mut self, ui: &mut egui::Ui, min_height: f32) {
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
+        section_sized(ui, "🎙 Кол", min_height, |ui| {
+            ui.horizontal(|ui| {
+                let recording = active_name.is_some();
+                let (label, hint) = if recording {
+                    ("⏹ Завершить", "Остановить запись и сохранить кол")
+                } else {
+                    ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
+                };
+                if ui.button(label).on_hover_text(hint).clicked() {
+                    call_toggle = true;
+                }
+                if let Some(n) = &active_name {
+                    ui.label(
+                        egui::RichText::new(format!("● {n}"))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(230, 120, 120)),
+                    );
+                }
+            });
+        });
+        if call_toggle {
+            if self.active_call.is_some() {
+                self.end_call();
+            } else {
+                self.start_call();
+            }
+        }
+    }
 
+    fn draw_screen(&mut self, ui: &mut egui::Ui, min_height: f32) {
         let mut shoot = false;
         let shot_line = {
             use screenshot::ShotStatus::*;
@@ -980,61 +1010,29 @@ impl App {
                 }
             }
         };
-
-        ui.columns(2, |cols| {
-            section(&mut cols[0], "🎙 Кол", |ui| {
-                ui.horizontal(|ui| {
-                    let recording = active_name.is_some();
-                    let (label, hint) = if recording {
-                        ("⏹ Завершить", "Остановить запись и сохранить кол")
-                    } else {
-                        ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
-                    };
-                    if ui.button(label).on_hover_text(hint).clicked() {
-                        call_toggle = true;
-                    }
-                    if let Some(n) = &active_name {
-                        ui.label(
-                            egui::RichText::new(format!("● {n}"))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(230, 120, 120)),
-                        );
-                    }
-                });
-            });
-            section(&mut cols[1], "📸 Скрин", |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.shot.active,
-                            egui::Button::new("📸 Область"),
-                        )
-                        .on_hover_text(
-                            "Кликнуть две точки на экране — сохранить PNG области \
-                             в ~/.local/share/health-widget/screenshots/",
-                        )
-                        .clicked()
-                    {
-                        shoot = true;
-                    }
-                    if let Some((text, color)) = &shot_line {
-                        ui.label(egui::RichText::new(text).size(11.0).color(*color));
-                    }
-                });
+        section_sized(ui, "📸 Скрин", min_height, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.shot.active,
+                        egui::Button::new("📸 Область"),
+                    )
+                    .on_hover_text(
+                        "Кликнуть две точки на экране — сохранить PNG области \
+                         в ~/.local/share/health-widget/screenshots/",
+                    )
+                    .clicked()
+                {
+                    shoot = true;
+                }
+                if let Some((text, color)) = &shot_line {
+                    ui.label(egui::RichText::new(text).size(11.0).color(*color));
+                }
             });
         });
-
-        if call_toggle {
-            if self.active_call.is_some() {
-                self.end_call();
-            } else {
-                self.start_call();
-            }
-        }
         if shoot {
             self.shot.request.store(true, Ordering::Relaxed);
         }
-        ui.add_space(2.0);
     }
 
     fn draw_autopilot(&mut self, ui: &mut egui::Ui) {
@@ -1390,42 +1388,6 @@ impl App {
         }
     }
 
-    fn draw_metrics(&mut self, ui: &mut egui::Ui) {
-        if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
-            let mut metrics_collapsed = self.metrics_collapsed;
-            section_collapsible(ui, "📊 Показатели", &mut metrics_collapsed, |ui| {
-                for m in &self.metrics.items {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&m.label)
-                                .color(egui::Color32::from_rgb(150, 150, 160)),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(&m.value)
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(235, 235, 240)),
-                                );
-                            },
-                        );
-                    });
-                }
-                if self.metrics.items.is_empty() && self.metrics.title.is_none() {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "нет данных: {}",
-                            self.cfg.json_path.display()
-                        ))
-                        .color(egui::Color32::from_rgb(200, 120, 120)),
-                    );
-                }
-            });
-            self.metrics_collapsed = metrics_collapsed;
-        }
-    }
-
     fn process_transcript_keys(&mut self, ctx: &egui::Context) {
         if self.transcript_keys.clear_mic.swap(false, Ordering::Relaxed) {
             if let Some(mon) = &self.audio.mic {
@@ -1695,15 +1657,16 @@ impl eframe::App for App {
 
                 self.draw_header(ui, ctx);
 
-                self.draw_sound(ui);
+                ui.columns(3, |cols| {
+                    self.draw_sound(&mut cols[0], TOP_ROW_H);
+                    self.draw_call(&mut cols[1], TOP_ROW_H);
+                    self.draw_screen(&mut cols[2], TOP_ROW_H);
+                });
+                ui.add_space(2.0);
 
                 self.draw_avatar(ui, ctx);
 
-                self.draw_call_and_screen(ui);
-
                 self.draw_autopilot(ui);
-
-                self.draw_metrics(ui);
 
                 self.process_transcript_keys(ctx);
 
@@ -1748,7 +1711,16 @@ fn section<R>(
     title: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, None, add_contents)
+    section_impl(ui, title, None, None, add_contents)
+}
+
+fn section_sized<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    min_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    section_impl(ui, title, None, Some(min_height), add_contents)
 }
 
 fn section_collapsible<R>(
@@ -1757,13 +1729,14 @@ fn section_collapsible<R>(
     collapsed: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, Some(collapsed), add_contents)
+    section_impl(ui, title, Some(collapsed), None, add_contents)
 }
 
 fn section_impl<R>(
     ui: &mut egui::Ui,
     title: &str,
     collapsed: Option<&mut bool>,
+    min_height: Option<f32>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let title_color = egui::Color32::from_rgb(120, 130, 150);
@@ -1774,6 +1747,9 @@ fn section_impl<R>(
         .corner_radius(8)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            if let Some(h) = min_height {
+                ui.set_min_height(h);
+            }
             let title_rich = egui::RichText::new(title)
                 .size(10.5)
                 .strong()
