@@ -24,6 +24,10 @@ pub struct AvatarCfg {
     pub scope_color: [u8; 3],
     pub scope_gain: f32,
     pub scope_thickness: u32,
+    pub text_color: [u8; 3],
+    pub text_size: u32,
+    pub text_font: String,
+    pub phrase_ttl: f32,
 }
 
 impl Default for AvatarCfg {
@@ -45,6 +49,10 @@ impl Default for AvatarCfg {
             scope_color: [200, 0, 0],
             scope_gain: 6.0,
             scope_thickness: 5,
+            text_color: [170, 175, 190],
+            text_size: 34,
+            text_font: "Noto Sans".to_string(),
+            phrase_ttl: 30.0,
         }
     }
 }
@@ -144,6 +152,15 @@ impl Config {
         }
         if let Some(v) = env_bool("HEALTH_AVATAR_FLIP") {
             c.avatar.flip_h = v;
+        }
+        if let Some(v) = env_f32("HEALTH_AVATAR_TTL") {
+            c.avatar.phrase_ttl = v;
+        }
+        if let Some(v) = env_f32("HEALTH_AVATAR_TEXT_SIZE") {
+            c.avatar.text_size = v.max(6.0) as u32;
+        }
+        if let Ok(v) = std::env::var("HEALTH_AVATAR_FONT") {
+            c.avatar.text_font = v;
         }
         c
     }

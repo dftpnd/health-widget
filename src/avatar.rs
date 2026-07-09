@@ -34,7 +34,11 @@ pub struct Avatar {
 }
 
 impl Avatar {
-    pub fn start(cfg: &AvatarCfg, samples: Arc<Mutex<VecDeque<f32>>>) -> Result<Avatar, AvatarError> {
+    pub fn start(
+        cfg: &AvatarCfg,
+        samples: Arc<Mutex<VecDeque<f32>>>,
+        phrases: Arc<Mutex<VecDeque<String>>>,
+    ) -> Result<Avatar, AvatarError> {
         if !cfg.device.exists() {
             return Err(AvatarError::NoDevice(cfg.device.clone()));
         }
@@ -62,17 +66,39 @@ impl Avatar {
         let last_w = last.clone();
         let cfg = cfg.clone();
         let frame_dt = Duration::from_secs_f32(1.0 / cfg.fps.max(1) as f32);
+        let text_opts = text_options(&cfg.text_font);
 
         let handle = std::thread::spawn(move || {
             let mut buf: Vec<f32> = Vec::with_capacity(4096);
             let mut fail_streak = 0u32;
+            let mut active: Vec<Phrase> = Vec::new();
+            let mut rng = Rng::seed();
             while run.load(Ordering::Relaxed) {
                 let tick = Instant::now();
                 buf.clear();
                 if let Ok(g) = samples.lock() {
                     buf.extend(g.iter().copied());
                 }
+                if let Ok(mut q) = phrases.lock() {
+                    while let Some(text) = q.pop_front() {
+                        if let Some(p) = Phrase::spawn(
+                            &text_opts,
+                            &text,
+                            cfg.text_size,
+                            cfg.width,
+                            cfg.height,
+                            &mut rng,
+                        ) {
+                            active.push(p);
+                        }
+                    }
+                }
+                let ttl = cfg.phrase_ttl.max(1.0);
+                active.retain(|p| p.born.elapsed().as_secs_f32() < ttl);
                 let mut frame = base.clone();
+                for p in &active {
+                    p.composite(&mut frame, cfg.width, cfg.height, cfg.text_color, ttl);
+                }
                 draw_scope(
                     &mut frame,
                     cfg.width,
@@ -415,6 +441,145 @@ pub fn draw_scope(
     }
 }
 
+fn text_options(font: &str) -> usvg::Options<'static> {
+    let mut opts = usvg::Options::default();
+    opts.font_family = font.to_string();
+    opts.fontdb_mut().load_system_fonts();
+    opts.fontdb_mut().set_sans_serif_family(font.to_string());
+    opts
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn render_text(opts: &usvg::Options, text: &str, size: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let esc = xml_escape(text);
+    let chars = text.chars().count().max(1) as f32;
+    let w = (chars * size as f32 * 0.62 + size as f32).ceil() as u32;
+    let h = (size as f32 * 1.4).ceil() as u32;
+    let baseline = (size as f32 * 1.05) as u32;
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"><text x=\"2\" y=\"{baseline}\" font-family=\"sans-serif\" font-size=\"{size}\" font-weight=\"bold\" fill=\"#ffffff\">{esc}</text></svg>"
+    );
+    let tree = usvg::Tree::from_data(svg.as_bytes(), opts).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    Some((w, h, pixmap.take()))
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
+}
+
+fn fade_factor(age: f32, ttl: f32) -> f32 {
+    let fade_in = 0.6;
+    let fade_out = 2.5;
+    if age < fade_in {
+        (age / fade_in).max(0.0)
+    } else if age >= ttl {
+        0.0
+    } else if age > ttl - fade_out {
+        (ttl - age) / fade_out
+    } else {
+        1.0
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn seed() -> Rng {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        Rng(n | 1)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 32) as u32
+    }
+
+    fn range(&mut self, lo: i32, hi: i32) -> i32 {
+        if hi <= lo {
+            return lo;
+        }
+        lo + (self.next_u32() % (hi - lo) as u32) as i32
+    }
+}
+
+struct Phrase {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    alpha: Vec<u8>,
+    born: Instant,
+}
+
+impl Phrase {
+    fn spawn(
+        opts: &usvg::Options,
+        text: &str,
+        size: u32,
+        fw: u32,
+        fh: u32,
+        rng: &mut Rng,
+    ) -> Option<Phrase> {
+        let (w, h, rgba) = render_text(opts, text, size)?;
+        if w == 0 || h == 0 || w >= fw || h >= fh {
+            return None;
+        }
+        let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+        let x = rng.range(6, (fw - w) as i32 - 6).max(0) as u32;
+        let y = rng.range(6, (fh - h) as i32 - 6).max(0) as u32;
+        Some(Phrase { x, y, w, h, alpha, born: Instant::now() })
+    }
+
+    fn composite(&self, frame: &mut [u8], fw: u32, fh: u32, color: [u8; 3], ttl: f32) {
+        let age = self.born.elapsed().as_secs_f32();
+        let fade = fade_factor(age, ttl);
+        if fade <= 0.0 {
+            return;
+        }
+        let drift = (age / ttl * 26.0) as i32;
+        let bg = [0x2bu8, 0x2b, 0x2b];
+        for sy in 0..self.h {
+            let dy = self.y as i32 + sy as i32 - drift;
+            if dy < 0 || dy as u32 >= fh {
+                continue;
+            }
+            for sx in 0..self.w {
+                let a = self.alpha[(sy * self.w + sx) as usize];
+                if a == 0 {
+                    continue;
+                }
+                let dx = self.x + sx;
+                if dx >= fw {
+                    continue;
+                }
+                let di = ((dy as u32 * fw + dx) * 4) as usize;
+                if frame[di] != bg[0] || frame[di + 1] != bg[1] || frame[di + 2] != bg[2] {
+                    continue;
+                }
+                let cov = (a as f32 / 255.0) * fade;
+                frame[di] = lerp_u8(bg[0], color[0], cov);
+                frame[di + 1] = lerp_u8(bg[1], color[1], cov);
+                frame[di + 2] = lerp_u8(bg[2], color[2], cov);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +670,8 @@ mod tests {
         cfg.device = std::path::PathBuf::from("/dev/does-not-exist-999");
         cfg.svg_path = std::path::PathBuf::from("/dev/does-not-exist-999.svg");
         let samples = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let r = Avatar::start(&cfg, samples);
+        let phrases = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let r = Avatar::start(&cfg, samples, phrases);
         assert!(matches!(r, Err(AvatarError::NoDevice(_))));
     }
 }

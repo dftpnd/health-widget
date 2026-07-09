@@ -1,4 +1,5 @@
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -8,6 +9,7 @@ use crate::transcript_log::TranscriptLog;
 
 const STT_RATE: f64 = 16000.0;
 const MAX_FINALS: usize = 50_000;
+const FRESH_CAP: usize = 32;
 
 #[derive(Default)]
 struct Transcript {
@@ -17,6 +19,7 @@ struct Transcript {
 
 pub struct Transcriber {
     state: Arc<Mutex<Transcript>>,
+    fresh: Arc<Mutex<VecDeque<String>>>,
     child: Child,
     channel: &'static str,
 }
@@ -82,9 +85,11 @@ impl Transcriber {
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let state = Arc::new(Mutex::new(Transcript::default()));
+        let fresh: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
         {
             let state = state.clone();
+            let fresh = fresh.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
@@ -106,6 +111,12 @@ impl Transcriber {
                         g.finals.push_str(t);
                         trim_head(&mut g.finals, MAX_FINALS);
                         g.partial.clear();
+                        if let Ok(mut q) = fresh.lock() {
+                            if q.len() >= FRESH_CAP {
+                                q.pop_front();
+                            }
+                            q.push_back(t.to_string());
+                        }
                         if let Some(log) = &log {
                             log.append(channel, t);
                         }
@@ -126,7 +137,11 @@ impl Transcriber {
             "stt.start",
             serde_json::json!({ "channel": channel, "model": model }),
         );
-        Some((Transcriber { state, child, channel }, feeder))
+        Some((Transcriber { state, fresh, child, channel }, feeder))
+    }
+
+    pub fn fresh_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
+        self.fresh.clone()
     }
 
     pub fn text(&self) -> (String, String) {

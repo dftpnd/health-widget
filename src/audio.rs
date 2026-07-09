@@ -267,6 +267,10 @@ impl AudioMonitor {
     pub fn samples_handle(&self) -> Arc<Mutex<VecDeque<f32>>> {
         self.samples.clone()
     }
+
+    pub fn fresh_finals(&self) -> Option<Arc<Mutex<VecDeque<String>>>> {
+        self.transcriber.as_ref().map(|t| t.fresh_handle())
+    }
 }
 
 impl Drop for AudioMonitor {
