@@ -911,7 +911,7 @@ impl App {
 
     fn draw_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         section(ui, "🐼 Виртуальная камера", |ui| {
-            let on = self.avatar.cam.is_some();
+            let on = self.avatar.cam.as_ref().is_some_and(|c| c.is_running());
             let label = if on { "🐼 Камера: в эфире" } else { "🐼 Камера" };
             if ui.button(label).clicked() {
                 self.toggle_avatar();

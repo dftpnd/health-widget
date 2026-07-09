@@ -22,7 +22,7 @@ impl std::fmt::Display for AvatarError {
             AvatarError::NoDevice(p) => write!(f, "нет устройства {}", p.display()),
             AvatarError::Svg(e) => write!(f, "SVG: {e}"),
             AvatarError::Format(e) => write!(f, "формат: {e}"),
-            AvatarError::Io(e) => write!(f, " io: {e}"),
+            AvatarError::Io(e) => write!(f, "io: {e}"),
         }
     }
 }
