@@ -29,6 +29,7 @@ struct V4l2PixFormat {
 #[repr(C)]
 struct V4l2Format {
     type_: u32,
+    pad: u32,
     raw: [u8; 200],
 }
 
@@ -45,11 +46,9 @@ pub struct Vcam {
 
 impl Vcam {
     pub fn open(path: &std::path::Path) -> std::io::Result<Vcam> {
-        use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_RDWR)
             .open(path)?;
         Ok(Vcam { fd: OwnedFd::from(file), frame_len: 0 })
     }
@@ -69,7 +68,7 @@ impl Vcam {
             quantization: 0,
             xfer_func: 0,
         };
-        let mut fmt = V4l2Format { type_: V4L2_BUF_TYPE_VIDEO_OUTPUT, raw: [0u8; 200] };
+        let mut fmt = V4l2Format { type_: V4L2_BUF_TYPE_VIDEO_OUTPUT, pad: 0, raw: [0u8; 200] };
         let pix_bytes = unsafe {
             std::slice::from_raw_parts(
                 (&pix as *const V4l2PixFormat) as *const u8,
@@ -97,6 +96,9 @@ impl Vcam {
         };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        if n as usize != frame.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short frame write"));
         }
         Ok(())
     }
@@ -311,5 +313,10 @@ mod tests {
     fn open_missing_device_errors() {
         let r = Vcam::open(std::path::Path::new("/dev/does-not-exist-999"));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn v4l2_format_matches_kernel_abi_size() {
+        assert_eq!(std::mem::size_of::<V4l2Format>(), 208);
     }
 }
