@@ -102,3 +102,51 @@ fn value_to_string(v: &serde_json::Value) -> String {
         other => other.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_format_keeps_title_and_order() {
+        let m = parse(r#"{"title":"Здоровье","metrics":[
+            {"label":"Пульс","value":"62 bpm"},
+            {"label":"Шаги","value":8420}
+        ]}"#)
+        .expect("должно распарситься");
+        assert_eq!(m.title.as_deref(), Some("Здоровье"));
+        assert_eq!(m.items.len(), 2);
+        // Порядок метрик сохраняется как в массиве.
+        assert_eq!(m.items[0].label, "Пульс");
+        assert_eq!(m.items[0].value, "62 bpm");
+        // Числовое значение печатается без кавычек.
+        assert_eq!(m.items[1].value, "8420");
+    }
+
+    #[test]
+    fn flat_object_has_no_title_and_sorts_keys() {
+        // serde_json::Map по умолчанию сортирует ключи — порядок детерминирован.
+        let m = parse(r#"{"steps":8420,"hr":62}"#).expect("плоский объект");
+        assert!(m.title.is_none());
+        let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["hr", "steps"]);
+    }
+
+    #[test]
+    fn null_value_becomes_dash() {
+        assert_eq!(value_to_string(&serde_json::Value::Null), "—");
+    }
+
+    #[test]
+    fn string_value_has_no_quotes() {
+        let v = serde_json::json!("7ч 10м");
+        assert_eq!(value_to_string(&v), "7ч 10м");
+    }
+
+    #[test]
+    fn invalid_json_returns_none() {
+        assert!(parse("не json вовсе").is_none());
+        // Валидный JSON, но не объект и не структурированный документ.
+        assert!(parse("[1,2,3]").is_none());
+    }
+}

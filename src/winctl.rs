@@ -203,3 +203,30 @@ fn qdbus(args: &[&str]) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_field;
+
+    #[test]
+    fn reads_positive_int_after_key() {
+        let line = "HW-GEOM x=1918 y=741";
+        assert_eq!(parse_field(line, "x="), Some(1918));
+        assert_eq!(parse_field(line, "y="), Some(741));
+    }
+
+    #[test]
+    fn reads_negative_int() {
+        assert_eq!(parse_field("x=-5 y=10", "x="), Some(-5));
+    }
+
+    #[test]
+    fn missing_key_is_none() {
+        assert_eq!(parse_field("нет координат", "x="), None);
+    }
+
+    #[test]
+    fn non_numeric_value_is_none() {
+        assert_eq!(parse_field("x=abc", "x="), None);
+    }
+}

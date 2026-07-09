@@ -292,3 +292,29 @@ pub fn call_dir(call_id: i64) -> Option<PathBuf> {
             .join(call_id.to_string())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize;
+
+    #[test]
+    fn spaces_become_underscores() {
+        assert_eq!(sanitize("созвон с HR"), "созвон_с_HR");
+    }
+
+    #[test]
+    fn strips_path_and_special_chars() {
+        assert_eq!(sanitize("a/b:c*?"), "abc");
+    }
+
+    #[test]
+    fn trims_edge_underscores() {
+        assert_eq!(sanitize(" foo "), "foo");
+    }
+
+    #[test]
+    fn empty_after_cleanup_gets_fallback() {
+        assert_eq!(sanitize("   "), "без_названия");
+        assert_eq!(sanitize("///"), "без_названия");
+    }
+}

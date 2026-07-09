@@ -228,3 +228,32 @@ fn trim_head(s: &mut String, max: usize) {
     }
     s.replace_range(..cut, "");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::trim_head;
+
+    #[test]
+    fn short_string_unchanged() {
+        let mut s = "коротко".to_string();
+        trim_head(&mut s, 100);
+        assert_eq!(s, "коротко");
+    }
+
+    #[test]
+    fn trims_head_to_word_boundary() {
+        // 13 символов, оставляем 5 → отрезаем «one two », не рвём слово.
+        let mut s = "one two three".to_string();
+        trim_head(&mut s, 5);
+        assert_eq!(s, "three");
+    }
+
+    #[test]
+    fn unicode_boundary_no_panic() {
+        // Кириллица (по 2 байта): срез не должен падать на границе символа.
+        let mut s = "аб вг де".to_string();
+        trim_head(&mut s, 2);
+        assert_eq!(s, "де");
+        assert_eq!(s.chars().count(), 2);
+    }
+}
