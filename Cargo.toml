@@ -17,6 +17,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 zbus = "4"
 egui_term = "0.1"
 evdev = "0.13.2"
+resvg = "0.47.0"
 
 [profile.release]
 opt-level = 2

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod audio;
+mod avatar;
 mod chat;
 mod clip;
 mod config;
