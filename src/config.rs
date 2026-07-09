@@ -38,11 +38,11 @@ impl Default for AvatarCfg {
             height: 480,
             fps: 30,
             margin: 0.08,
-            mouth: MouthBox { x: 42, y: 176, w: 276, h: 46 },
-            mouth_curve: 50,
+            mouth: MouthBox { x: 45, y: 198, w: 270, h: 46 },
+            mouth_curve: 6,
             scope_color: [200, 0, 0],
             scope_gain: 6.0,
-            scope_thickness: 9,
+            scope_thickness: 5,
         }
     }
 }
