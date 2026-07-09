@@ -102,6 +102,12 @@ struct ShotState {
     points: Vec<[u32; 2]>,
 }
 
+struct AvatarState {
+    cam: Option<avatar::Avatar>,
+    error: Option<String>,
+    tex: Option<egui::TextureHandle>,
+}
+
 #[derive(Clone)]
 struct TranscriptKeys {
     clear_mic: Arc<AtomicBool>,
@@ -151,6 +157,7 @@ struct App {
     transcript_log: Option<Arc<TranscriptLog>>,
     active_call: Option<ActiveCall>,
     audio: AudioState,
+    avatar: AvatarState,
     pinned: bool,
     autopilot: AutopilotState,
     hr_reply: Arc<std::sync::Mutex<hr_reply::HrReplyState>>,
@@ -347,6 +354,7 @@ impl App {
                 programs: audio::list_programs(),
                 scope: Vec::with_capacity(2048),
             },
+            avatar: AvatarState { cam: None, error: None, tex: None },
             pinned: st.pinned,
             autopilot: AutopilotState {
                 proc: None,
@@ -384,6 +392,25 @@ impl App {
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
             help_open: false,
+        }
+    }
+
+    fn toggle_avatar(&mut self) {
+        if let Some(cam) = self.avatar.cam.take() {
+            cam.stop();
+            self.avatar.error = None;
+            return;
+        }
+        let samples = match &self.audio.mic {
+            Some(m) => m.samples_handle(),
+            None => Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        };
+        match avatar::Avatar::start(&self.cfg.avatar, samples) {
+            Ok(cam) => {
+                self.avatar.cam = Some(cam);
+                self.avatar.error = None;
+            }
+            Err(e) => self.avatar.error = Some(e.to_string()),
         }
     }
 
@@ -880,6 +907,36 @@ impl App {
             };
         }
         ui.add_space(2.0);
+    }
+
+    fn draw_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        section(ui, "🐼 Виртуальная камера", |ui| {
+            let on = self.avatar.cam.is_some();
+            let label = if on { "🐼 Камера: в эфире" } else { "🐼 Камера" };
+            if ui.button(label).clicked() {
+                self.toggle_avatar();
+            }
+            if let Some(err) = &self.avatar.error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            let frame = self.avatar.cam.as_ref().and_then(|cam| cam.last_frame());
+            if let Some((w, h, rgba)) = frame {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                match &mut self.avatar.tex {
+                    Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                    None => {
+                        self.avatar.tex =
+                            Some(ctx.load_texture("avatar_preview", img, egui::TextureOptions::LINEAR));
+                    }
+                }
+            }
+            if on {
+                if let Some(tex) = &self.avatar.tex {
+                    ui.image((tex.id(), egui::vec2(160.0, 120.0)));
+                }
+                ctx.request_repaint_after(Duration::from_millis(66));
+            }
+        });
     }
 
     fn draw_call_and_screen(&mut self, ui: &mut egui::Ui) {
@@ -1632,6 +1689,8 @@ impl eframe::App for App {
                 self.draw_header(ui, ctx);
 
                 self.draw_sound(ui);
+
+                self.draw_avatar(ui, ctx);
 
                 self.draw_call_and_screen(ui);
 
