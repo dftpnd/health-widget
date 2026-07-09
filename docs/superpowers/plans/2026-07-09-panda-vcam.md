@@ -139,7 +139,7 @@ mod tests {
 
 - [ ] **Step 2: Запустить тест — убедиться, что не компилируется/падает**
 
-Run: `cargo test --lib config`
+Run: `cargo test config::`
 Expected: FAIL — `AvatarCfg` не найден.
 
 - [ ] **Step 3: Реализовать типы и дефолты**
@@ -221,7 +221,7 @@ impl Default for AvatarCfg {
 
 - [ ] **Step 5: Запустить тест**
 
-Run: `cargo test --lib config`
+Run: `cargo test config::`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -276,7 +276,7 @@ mod tests {
 
 - [ ] **Step 2: Запустить — убедиться, что падает**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: FAIL — `rgba_to_yuyv` не найдена.
 
 - [ ] **Step 3: Реализовать**
@@ -330,7 +330,7 @@ pub fn rgba_to_yuyv(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 - [ ] **Step 4: Запустить тесты**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: PASS (оба теста).
 
 - [ ] **Step 5: Commit**
@@ -375,7 +375,7 @@ git commit -m "feat(avatar): RGBA→YUYV конвертация кадра"
 
 - [ ] **Step 2: Запустить — падает**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: FAIL — `rasterize` не найдена.
 
 - [ ] **Step 3: Реализовать**
@@ -407,7 +407,7 @@ pub fn rasterize(svg: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String>
 
 - [ ] **Step 4: Запустить тесты**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: PASS. Если API `usvg`/`resvg` в поставленной версии отличается (напр. `Options`/`render` сигнатуры), поправить по докам крейта — семантика та же: parse → pixmap с фоном → render с трансформом вписывания → `take()`.
 
 - [ ] **Step 5: Commit**
@@ -469,7 +469,7 @@ git commit -m "feat(avatar): растеризация SVG в RGBA через res
 
 - [ ] **Step 2: Запустить — падает**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: FAIL — `draw_scope` не найдена.
 
 - [ ] **Step 3: Реализовать**
@@ -553,7 +553,7 @@ pub fn draw_scope(
 
 - [ ] **Step 4: Запустить тесты**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: PASS (все тесты avatar).
 
 - [ ] **Step 5: Commit**
@@ -591,7 +591,7 @@ git commit -m "feat(avatar): осциллограф сигнала в короб
 
 - [ ] **Step 2: Запустить — падает**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: FAIL — `Vcam` не найден.
 
 - [ ] **Step 3: Реализовать FFI-обёртку**
@@ -703,7 +703,7 @@ impl Vcam {
 
 - [ ] **Step 4: Запустить тест**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -780,7 +780,7 @@ git commit -m "feat(audio): samples_handle() для шаринга кольца 
 
 - [ ] **Step 2: Запустить — падает**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: FAIL (нет `Avatar::start`).
 
 - [ ] **Step 3: Реализовать контроллер**
@@ -911,7 +911,7 @@ impl Drop for Avatar {
 
 - [ ] **Step 4: Запустить тесты**
 
-Run: `cargo test --lib avatar`
+Run: `cargo test avatar::`
 Expected: PASS (все тесты avatar, включая `start_without_device_returns_no_device`).
 
 - [ ] **Step 5: Commit**
