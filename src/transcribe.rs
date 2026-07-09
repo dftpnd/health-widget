@@ -18,6 +18,7 @@ struct Transcript {
 pub struct Transcriber {
     state: Arc<Mutex<Transcript>>,
     child: Child,
+    channel: &'static str,
 }
 
 pub struct Feeder {
@@ -121,7 +122,11 @@ impl Transcriber {
             out: Vec::with_capacity(4096),
             dead: false,
         };
-        Some((Transcriber { state, child }, feeder))
+        crate::telemetry::event(
+            "stt.start",
+            serde_json::json!({ "channel": channel, "model": model }),
+        );
+        Some((Transcriber { state, child, channel }, feeder))
     }
 
     pub fn text(&self) -> (String, String) {
@@ -134,6 +139,7 @@ impl Transcriber {
 
 impl Drop for Transcriber {
     fn drop(&mut self) {
+        crate::telemetry::event("stt.stop", serde_json::json!({ "channel": self.channel }));
         let _ = self.child.kill();
     }
 }

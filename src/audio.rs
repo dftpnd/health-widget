@@ -142,6 +142,7 @@ pub struct AudioMonitor {
     child: Child,
     transcriber: Option<Transcriber>,
     recorder: Arc<Mutex<Option<WavRecorder>>>,
+    channel: &'static str,
 }
 
 impl AudioMonitor {
@@ -155,12 +156,18 @@ impl AudioMonitor {
         if let Some(t) = target {
             cmd.args(["--target", t]);
         }
-        let mut child = cmd
+        let mut child = match cmd
             .arg("-")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                crate::telemetry::error("audio.fail", &format!("{channel}: {e}"));
+                return None;
+            }
+        };
 
         let mut stdout = child.stdout.take()?;
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(CAP)));
@@ -215,7 +222,11 @@ impl AudioMonitor {
             }
         });
 
-        Some(Self { samples, child, transcriber, recorder })
+        crate::telemetry::event(
+            "audio.start",
+            serde_json::json!({ "channel": channel, "target": target }),
+        );
+        Some(Self { samples, child, transcriber, recorder, channel })
     }
 
     pub fn transcript(&self) -> Option<(String, String)> {
@@ -250,6 +261,7 @@ impl AudioMonitor {
 
 impl Drop for AudioMonitor {
     fn drop(&mut self) {
+        crate::telemetry::event("audio.stop", serde_json::json!({ "channel": self.channel }));
         let _ = self.child.kill();
     }
 }

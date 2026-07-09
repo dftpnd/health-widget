@@ -51,6 +51,16 @@ fn timestamp() -> String {
 
 pub fn grab(x: i32, y: i32, w: u32, h: u32, ctx: egui::Context, status: Arc<Mutex<ShotStatus>>) {
     let finish = |status: &Arc<Mutex<ShotStatus>>, ctx: &egui::Context, s: ShotStatus| {
+        match &s {
+            ShotStatus::Saved(p) => {
+                crate::telemetry::event("shot.saved", serde_json::json!({ "path": p }))
+            }
+            ShotStatus::Failed(e) => crate::telemetry::error("shot.fail", e),
+            ShotStatus::Cancelled => {
+                crate::telemetry::event("shot.cancelled", serde_json::json!({}))
+            }
+            _ => {}
+        }
         *status.lock().unwrap() = s;
         ctx.request_repaint();
     };

@@ -18,6 +18,7 @@ mod recorder;
 mod screenshot;
 mod state;
 mod tartarus;
+mod telemetry;
 mod terminal;
 mod transcribe;
 mod transcript_log;
@@ -396,6 +397,7 @@ impl App {
         let Some(id) = log.start_call(&name) else {
             return;
         };
+        telemetry::event("call.start", serde_json::json!({ "id": id, "name": name }));
         self.active_call = Some(ActiveCall { id, name });
         self.reconcile_call_recording();
     }
@@ -404,6 +406,7 @@ impl App {
         let Some(call) = self.active_call.take() else {
             return;
         };
+        telemetry::event("call.end", serde_json::json!({ "id": call.id, "name": call.name }));
         if let Some(mon) = &self.audio.mic {
             mon.stop_recording();
         }
@@ -448,11 +451,15 @@ impl App {
     fn reconcile_pilot(&mut self) {
         let desired = match self.autopilot.want.clone() {
             None => {
+                if self.autopilot.proc.is_some() {
+                    telemetry::event("pilot.stop", serde_json::json!({}));
+                }
                 self.autopilot.proc = None;
                 return;
             }
             Some(p) => p,
         };
+        let phase = format!("{desired:?}");
         let same_phase = self.autopilot.proc.as_ref().map(|p| p.phase()) == Some(&desired);
         let same_profile =
             self.autopilot.proc.as_ref().map(|p| p.profile()) == Some(Some(self.autopilot.profile.as_str()));
@@ -471,8 +478,13 @@ impl App {
         if self.autopilot.proc.is_none() {
             self.autopilot.want = None;
             self.autopilot.status = "не удалось запустить автопилот".to_string();
+            telemetry::error("pilot.fail", "не удалось запустить автопилот");
         } else {
             self.autopilot.status.clear();
+            telemetry::event(
+                "pilot.spawn",
+                serde_json::json!({ "phase": phase, "profile": self.autopilot.profile }),
+            );
         }
     }
 
@@ -1284,6 +1296,7 @@ impl App {
             c_mic,
             mic_finals.as_deref(),
         ) {
+            telemetry::event("mark.copy", serde_json::json!({ "channel": CH_MIC, "len": txt.len() }));
             clip::set_async(txt);
         }
         let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
@@ -1294,6 +1307,7 @@ impl App {
             c_zoom,
             zoom_finals.as_deref(),
         ) {
+            telemetry::event("mark.copy", serde_json::json!({ "channel": CH_ZOOM, "len": txt.len() }));
             clip::set_async(txt);
         }
     }
@@ -1339,6 +1353,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.shared.shutdown.load(Ordering::Relaxed) {
+            telemetry::event("app.shutdown", serde_json::json!({}));
             self.end_call();
             self.autopilot.want = None;
             self.reconcile_pilot();
@@ -1349,6 +1364,7 @@ impl eframe::App for App {
         self.maybe_reload();
 
         if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
+            telemetry::event("shot.request", serde_json::json!({}));
             self.shot.active = true;
             self.shot.points.clear();
             *self.shot.status.lock().unwrap() = screenshot::ShotStatus::Marking;
@@ -1358,6 +1374,7 @@ impl eframe::App for App {
         }
 
         if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
+            telemetry::event("hotkey.cursor_warp", serde_json::json!({}));
             let cslot = self.prev_cursor.clone();
             std::thread::spawn(move || {
                 let mut slot = cslot.lock().unwrap();
@@ -1380,13 +1397,16 @@ impl eframe::App for App {
             };
             self.autopilot.proc = None;
             self.autopilot.want = None;
-            self.autopilot.status = done_msg.unwrap_or("автопилот остановлен").to_string();
+            let msg = done_msg.unwrap_or("автопилот остановлен");
+            self.autopilot.status = msg.to_string();
+            telemetry::event("pilot.exit", serde_json::json!({ "reason": msg }));
         }
 
         let want_visible = self.shared.user_visible.load(Ordering::Relaxed)
             && !(self.cfg.auto_hide_on_share && self.shared.sharing_active.load(Ordering::Relaxed));
 
         if want_visible != self.currently_visible {
+            telemetry::event("vis.change", serde_json::json!({ "visible": want_visible }));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want_visible));
             self.currently_visible = want_visible;
         }
@@ -1855,6 +1875,21 @@ fn main() -> eframe::Result<()> {
         std::process::exit(if active { 0 } else { 1 });
     }
 
+    if let Some(arg @ ("--telemetry" | "--telemetry-today")) =
+        std::env::args().nth(1).as_deref()
+    {
+        let today = arg == "--telemetry-today";
+        let limit = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(200);
+        match telemetry::dump(limit, today) {
+            Some(s) => println!("{s}"),
+            None => eprintln!("нет телеметрии: {:?}", telemetry::path()),
+        }
+        std::process::exit(0);
+    }
+
     let cfg = Config::load();
     let st = state::load();
 
@@ -1895,6 +1930,8 @@ fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
+
+    telemetry::init();
 
     let cfg_for_app = cfg.clone();
     eframe::run_native(
