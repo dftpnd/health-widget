@@ -405,12 +405,13 @@ impl App {
             Some(m) => m.samples_handle(),
             None => Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         };
-        let phrases = self
-            .audio
-            .mic
-            .as_ref()
-            .and_then(|m| m.fresh_finals())
-            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())));
+        let mut phrases = Vec::new();
+        if let Some(q) = self.audio.mic.as_ref().and_then(|m| m.fresh_finals()) {
+            phrases.push(q);
+        }
+        if let Some(q) = self.audio.zoom.as_ref().and_then(|z| z.fresh_finals()) {
+            phrases.push(q);
+        }
         match avatar::Avatar::start(&self.cfg.avatar, samples, phrases) {
             Ok(cam) => {
                 self.avatar.cam = Some(cam);

@@ -37,7 +37,7 @@ impl Avatar {
     pub fn start(
         cfg: &AvatarCfg,
         samples: Arc<Mutex<VecDeque<f32>>>,
-        phrases: Arc<Mutex<VecDeque<String>>>,
+        phrases: Vec<Arc<Mutex<VecDeque<String>>>>,
     ) -> Result<Avatar, AvatarError> {
         if !cfg.device.exists() {
             return Err(AvatarError::NoDevice(cfg.device.clone()));
@@ -79,17 +79,19 @@ impl Avatar {
                 if let Ok(g) = samples.lock() {
                     buf.extend(g.iter().copied());
                 }
-                if let Ok(mut q) = phrases.lock() {
-                    while let Some(text) = q.pop_front() {
-                        if let Some(p) = Phrase::spawn(
-                            &text_opts,
-                            &text,
-                            cfg.text_size,
-                            cfg.width,
-                            cfg.height,
-                            &mut rng,
-                        ) {
-                            active.push(p);
+                for src in &phrases {
+                    if let Ok(mut q) = src.lock() {
+                        while let Some(text) = q.pop_front() {
+                            if let Some(p) = Phrase::spawn(
+                                &text_opts,
+                                &text,
+                                cfg.text_size,
+                                cfg.width,
+                                cfg.height,
+                                &mut rng,
+                            ) {
+                                active.push(p);
+                            }
                         }
                     }
                 }
@@ -677,7 +679,7 @@ mod tests {
         cfg.device = std::path::PathBuf::from("/dev/does-not-exist-999");
         cfg.svg_path = std::path::PathBuf::from("/dev/does-not-exist-999.svg");
         let samples = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let phrases = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let phrases = Vec::new();
         let r = Avatar::start(&cfg, samples, phrases);
         assert!(matches!(r, Err(AvatarError::NoDevice(_))));
     }
