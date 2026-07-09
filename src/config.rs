@@ -3,6 +3,45 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone)]
+pub struct MouthBox {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[derive(Clone)]
+pub struct AvatarCfg {
+    pub svg_path: PathBuf,
+    pub device: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub mouth: MouthBox,
+    pub scope_color: [u8; 3],
+    pub scope_gain: f32,
+}
+
+impl Default for AvatarCfg {
+    fn default() -> Self {
+        let svg_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Pictures")
+            .join("panda.svg");
+        Self {
+            svg_path,
+            device: PathBuf::from("/dev/video10"),
+            width: 640,
+            height: 480,
+            fps: 30,
+            mouth: MouthBox { x: 150, y: 330, w: 340, h: 90 },
+            scope_color: [220, 30, 20],
+            scope_gain: 6.0,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub json_path: PathBuf,
     pub x: f32,
@@ -15,6 +54,7 @@ pub struct Config {
     pub detect_poll: Duration,
     pub autopilot_dir: PathBuf,
     pub autopilot_bin: PathBuf,
+    pub avatar: AvatarCfg,
 }
 
 impl Default for Config {
@@ -40,6 +80,7 @@ impl Default for Config {
             detect_poll: Duration::from_millis(1000),
             autopilot_dir,
             autopilot_bin,
+            avatar: AvatarCfg::default(),
         }
     }
 }
@@ -78,6 +119,15 @@ impl Config {
         if let Ok(v) = std::env::var("HEALTH_AUTOPILOT_BIN") {
             c.autopilot_bin = PathBuf::from(v);
         }
+        if let Ok(v) = std::env::var("HEALTH_AVATAR_SVG") {
+            c.avatar.svg_path = PathBuf::from(v);
+        }
+        if let Ok(v) = std::env::var("HEALTH_AVATAR_DEVICE") {
+            c.avatar.device = PathBuf::from(v);
+        }
+        if let Some(v) = env_f32("HEALTH_AVATAR_GAIN") {
+            c.avatar.scope_gain = v;
+        }
         c
     }
 }
@@ -92,5 +142,23 @@ fn env_bool(k: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_defaults_are_sane() {
+        let c = AvatarCfg::default();
+        assert_eq!(c.device, std::path::PathBuf::from("/dev/video10"));
+        assert_eq!(c.width, 640);
+        assert_eq!(c.height, 480);
+        assert_eq!(c.fps, 30);
+        assert_eq!(c.scope_color, [220, 30, 20]);
+        assert!(c.mouth.w > 0 && c.mouth.h > 0);
+        assert!(c.mouth.x + c.mouth.w <= c.width);
+        assert!(c.mouth.y + c.mouth.h <= c.height);
     }
 }
