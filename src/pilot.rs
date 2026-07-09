@@ -36,6 +36,7 @@ pub struct Pilot {
     phase: Phase,
     profile: Option<String>,
     min_sim: f32,
+    apply_fresh: bool,
     log: Arc<Mutex<VecDeque<String>>>,
     paused: bool,
 }
@@ -47,6 +48,7 @@ impl Pilot {
         phase: Phase,
         profile: Option<&str>,
         min_similarity: Option<f32>,
+        apply_fresh: bool,
     ) -> Option<Self> {
         let mut cmd = Command::new(bin);
         cmd.arg("run");
@@ -56,6 +58,9 @@ impl Pilot {
         cmd.args(phase.args());
         if let Some(sim) = min_similarity {
             cmd.env("MIN_SIMILARITY", format!("{sim}"));
+        }
+        if apply_fresh {
+            cmd.env("APPLY_ORDER", "fresh");
         }
         cmd.current_dir(dir)
             .stdin(Stdio::null())
@@ -86,6 +91,7 @@ impl Pilot {
             phase,
             profile: profile.map(str::to_string),
             min_sim: min_similarity.unwrap_or(0.0),
+            apply_fresh,
             log,
             paused: false,
         })
@@ -93,6 +99,10 @@ impl Pilot {
 
     pub fn min_sim(&self) -> f32 {
         self.min_sim
+    }
+
+    pub fn apply_fresh(&self) -> bool {
+        self.apply_fresh
     }
 
     pub fn alive(&mut self) -> bool {
@@ -215,7 +225,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("echo-args", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None).expect("должен стартовать");
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None, false).expect("должен стартовать");
         assert_eq!(p.phase(), &Phase::Chat);
         std::thread::sleep(Duration::from_millis(200));
         assert!(p.alive(), "процесс должен быть жив");
@@ -230,7 +240,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("echo-apply", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).expect("должен стартовать");
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None, false).expect("должен стартовать");
         assert_eq!(p.phase(), &Phase::Apply);
         std::thread::sleep(Duration::from_millis(200));
         let line = p.last_line().unwrap();
@@ -238,11 +248,35 @@ mod tests {
     }
 
     #[test]
+    fn apply_fresh_sets_order_env() {
+        let _serial = SERIAL.lock().unwrap();
+        let bin = fake_bin("echo-order", "while true; do echo \"order: $APPLY_ORDER\" >&2; sleep 0.05; done");
+        let dir = std::env::temp_dir();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, Some(0.0), true).unwrap();
+        assert!(p.apply_fresh());
+        std::thread::sleep(Duration::from_millis(200));
+        let line = p.last_line().unwrap();
+        assert!(line.contains("order: fresh"), "APPLY_ORDER не передан: {line}");
+    }
+
+    #[test]
+    fn no_fresh_leaves_order_env_empty() {
+        let _serial = SERIAL.lock().unwrap();
+        let bin = fake_bin("echo-order-off", "while true; do echo \"order: $APPLY_ORDER\" >&2; sleep 0.05; done");
+        let dir = std::env::temp_dir();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, Some(0.5), false).unwrap();
+        assert!(!p.apply_fresh());
+        std::thread::sleep(Duration::from_millis(200));
+        let line = p.last_line().unwrap();
+        assert!(line.contains("order:") && !line.contains("fresh"), "лишний APPLY_ORDER: {line}");
+    }
+
+    #[test]
     fn profile_passes_profile_flag() {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("echo-profile", "while true; do echo \"args: $*\" >&2; sleep 0.05; done");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, Some("back"), None).unwrap();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, Some("back"), None, false).unwrap();
         assert_eq!(p.profile(), Some("back"));
         std::thread::sleep(Duration::from_millis(200));
         let line = p.last_line().unwrap();
@@ -255,7 +289,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("longsleep", "sleep 60");
         let dir = std::env::temp_dir();
-        let p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None).unwrap();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Chat, None, None, false).unwrap();
         let pid = p.pid();
         assert!(alive_pid(pid), "процесс должен быть жив до drop");
         drop(p);
@@ -272,7 +306,7 @@ mod tests {
              while true; do sleep 0.05; done",
         );
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).unwrap();
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None, false).unwrap();
         std::thread::sleep(Duration::from_millis(150));
         assert!(!p.is_paused());
 
@@ -294,7 +328,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         let bin = fake_bin("quickexit", "exit 0");
         let dir = std::env::temp_dir();
-        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None).unwrap();
+        let mut p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None, None, false).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(!p.alive(), "завершившийся процесс не должен считаться живым");
     }

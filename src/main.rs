@@ -46,7 +46,9 @@ const PILOT_STRICTNESS: &[(&str, &str, f32)] = &[
     ("strict", "Строго", 0.55),
     ("medium", "Средне", 0.50),
     ("any", "Любые", 0.0),
+    ("fresh", "🆕 Свежие", 0.0),
 ];
+const PILOT_FRESH_KEY: &str = "fresh";
 const DEFAULT_STRICTNESS: &str = "medium";
 
 const TERMINAL_W: f32 = 340.0;
@@ -448,6 +450,10 @@ impl App {
             .unwrap_or(0.0)
     }
 
+    fn pilot_apply_fresh(&self) -> bool {
+        self.autopilot.strictness == PILOT_FRESH_KEY
+    }
+
     fn reconcile_pilot(&mut self) {
         let desired = match self.autopilot.want.clone() {
             None => {
@@ -464,7 +470,9 @@ impl App {
         let same_profile =
             self.autopilot.proc.as_ref().map(|p| p.profile()) == Some(Some(self.autopilot.profile.as_str()));
         let same_sim = self.autopilot.proc.as_ref().map(|p| p.min_sim()) == Some(self.pilot_min_sim());
-        if same_phase && same_profile && same_sim {
+        let same_order =
+            self.autopilot.proc.as_ref().map(|p| p.apply_fresh()) == Some(self.pilot_apply_fresh());
+        if same_phase && same_profile && same_sim && same_order {
             return;
         }
         self.autopilot.proc = None;
@@ -474,6 +482,7 @@ impl App {
             desired,
             Some(self.autopilot.profile.as_str()),
             Some(self.pilot_min_sim()),
+            self.pilot_apply_fresh(),
         );
         if self.autopilot.proc.is_none() {
             self.autopilot.want = None;
@@ -1138,14 +1147,18 @@ impl App {
                         );
                     for (key, label, thr) in PILOT_STRICTNESS {
                         let active = self.autopilot.strictness == *key;
+                        let hint = if *key == PILOT_FRESH_KEY {
+                            "Без порога — самые свежие вакансии пула по дате публикации"
+                                .to_string()
+                        } else if *thr > 0.0 {
+                            format!("Порог ≥ {thr:.2} — только достаточно близкие вакансии")
+                        } else {
+                            "Без порога — откликаться на весь пул (по убыванию похожести)"
+                                .to_string()
+                        };
                         if ui
                             .selectable_label(active, *label)
-                            .on_hover_text(if *thr > 0.0 {
-                                format!("Порог ≥ {thr:.2} — только достаточно близкие вакансии")
-                            } else {
-                                "Без порога — откликаться на весь пул (по убыванию похожести)"
-                                    .to_string()
-                            })
+                            .on_hover_text(hint)
                             .clicked()
                             && !active
                         {
