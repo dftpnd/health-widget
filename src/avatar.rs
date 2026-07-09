@@ -1,4 +1,25 @@
+use resvg::tiny_skia;
+use resvg::usvg;
+
 pub struct Avatar;
+
+pub fn rasterize(svg: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg, &opts).map_err(|e| e.to_string())?;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or("pixmap")?;
+    pixmap.fill(tiny_skia::Color::from_rgba8(0x2b, 0x2b, 0x2b, 255));
+
+    let size = tree.size();
+    let sx = width as f32 / size.width();
+    let sy = height as f32 / size.height();
+    let scale = sx.min(sy);
+    let tx = (width as f32 - size.width() * scale) * 0.5;
+    let ty = (height as f32 - size.height() * scale) * 0.5;
+    let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
+
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Ok(pixmap.take())
+}
 
 fn clamp_u8(v: f32) -> u8 {
     v.round().clamp(0.0, 255.0) as u8
@@ -66,5 +87,21 @@ mod tests {
         assert_eq!(yuyv[2], 0);
         assert_eq!(yuyv[1], 128);
         assert_eq!(yuyv[3], 128);
+    }
+
+    #[test]
+    fn rasterize_fills_canvas_with_dark_background() {
+        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'></svg>"#;
+        let rgba = rasterize(svg, 8, 6).expect("rasterize");
+        assert_eq!(rgba.len(), 8 * 6 * 4);
+        assert_eq!(rgba[0], 0x2b);
+        assert_eq!(rgba[1], 0x2b);
+        assert_eq!(rgba[2], 0x2b);
+        assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn rasterize_rejects_garbage() {
+        assert!(rasterize(b"not an svg", 8, 6).is_err());
     }
 }
