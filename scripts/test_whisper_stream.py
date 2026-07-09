@@ -26,9 +26,31 @@ class TestHallucinations(unittest.TestCase):
     def test_high_no_speech_prob_dropped(self):
         self.assertTrue(is_hallucination("любой текст", no_speech_prob=0.9))
 
+    def test_sound_event_tags_dropped(self):
+        # Частые звуковые теги из субтитров, которые whisper вставляет на тонком аудио.
+        for t in ("Аплодисменты", "аплодисменты.", "АПЛОДИСМЕНТЫ", "Музыка", "Смех"):
+            self.assertTrue(is_hallucination(t), t)
+
+    def test_bracketed_tags_dropped(self):
+        # Любой сегмент целиком в скобках — не-речь, независимо от содержимого.
+        for t in ("[Аплодисменты]", "(музыка)", "[смех]", "[ Музыка ]", "(звонок телефона)"):
+            self.assertTrue(is_hallucination(t), t)
+
+    def test_youtube_outro_dropped(self):
+        self.assertTrue(is_hallucination("Спасибо за просмотр!"))
+        self.assertTrue(is_hallucination("Подписывайтесь на канал"))
+
+    def test_digits_kept(self):
+        # Главный кейс пользователя: диктует числа — их нельзя отсеивать.
+        self.assertFalse(is_hallucination("один два три четыре"))
+        self.assertFalse(is_hallucination("1, 2, 3, 4"))
+        self.assertFalse(is_hallucination("пять"))
+
     def test_real_speech_kept(self):
         self.assertFalse(is_hallucination("задеплоил на стейджинг"))
         self.assertFalse(is_hallucination("подниму кластер", no_speech_prob=0.2))
+        # «Спасибо» само по себе — обычная речь, не глушим.
+        self.assertFalse(is_hallucination("спасибо"))
 
 class TestHotwords(unittest.TestCase):
     def test_joins_terms(self):
