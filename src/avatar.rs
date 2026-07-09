@@ -1,8 +1,106 @@
 use resvg::tiny_skia;
 use resvg::usvg;
 use crate::config::MouthBox;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 pub struct Avatar;
+
+const V4L2_BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
+const V4L2_FIELD_NONE: u32 = 1;
+const V4L2_COLORSPACE_SRGB: u32 = 8;
+const V4L2_PIX_FMT_YUYV: u32 = 0x56595559;
+
+#[repr(C)]
+struct V4l2PixFormat {
+    width: u32,
+    height: u32,
+    pixelformat: u32,
+    field: u32,
+    bytesperline: u32,
+    sizeimage: u32,
+    colorspace: u32,
+    priv_: u32,
+    flags: u32,
+    enc: u32,
+    quantization: u32,
+    xfer_func: u32,
+}
+
+#[repr(C)]
+struct V4l2Format {
+    type_: u32,
+    raw: [u8; 200],
+}
+
+const fn iowr(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
+    ((3u64 << 30) | ((size as u64) << 16) | ((ty as u64) << 8) | nr as u64) as libc::c_ulong
+}
+
+const VIDIOC_S_FMT: libc::c_ulong = iowr(b'V', 5, std::mem::size_of::<V4l2Format>());
+
+pub struct Vcam {
+    fd: OwnedFd,
+    frame_len: usize,
+}
+
+impl Vcam {
+    pub fn open(path: &std::path::Path) -> std::io::Result<Vcam> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_RDWR)
+            .open(path)?;
+        Ok(Vcam { fd: OwnedFd::from(file), frame_len: 0 })
+    }
+
+    pub fn set_format(&mut self, width: u32, height: u32) -> std::io::Result<()> {
+        let pix = V4l2PixFormat {
+            width,
+            height,
+            pixelformat: V4L2_PIX_FMT_YUYV,
+            field: V4L2_FIELD_NONE,
+            bytesperline: width * 2,
+            sizeimage: width * height * 2,
+            colorspace: V4L2_COLORSPACE_SRGB,
+            priv_: 0,
+            flags: 0,
+            enc: 0,
+            quantization: 0,
+            xfer_func: 0,
+        };
+        let mut fmt = V4l2Format { type_: V4L2_BUF_TYPE_VIDEO_OUTPUT, raw: [0u8; 200] };
+        let pix_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&pix as *const V4l2PixFormat) as *const u8,
+                std::mem::size_of::<V4l2PixFormat>(),
+            )
+        };
+        fmt.raw[..pix_bytes.len()].copy_from_slice(pix_bytes);
+        let rc = unsafe {
+            libc::ioctl(self.fd.as_raw_fd(), VIDIOC_S_FMT, &mut fmt as *mut V4l2Format)
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.frame_len = (width * height * 2) as usize;
+        Ok(())
+    }
+
+    pub fn write_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+        let n = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
 pub fn rasterize(svg: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let opts = usvg::Options::default();
@@ -207,5 +305,11 @@ mod tests {
             }
         }
         assert!(off_center_hit);
+    }
+
+    #[test]
+    fn open_missing_device_errors() {
+        let r = Vcam::open(std::path::Path::new("/dev/does-not-exist-999"));
+        assert!(r.is_err());
     }
 }
