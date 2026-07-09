@@ -100,6 +100,60 @@ struct ActiveCall {
     name: String,
 }
 
+/// Аудио-каналы (микрофон + звук программы/вывода) и их осциллограф: выбранные источники,
+/// списки для селекторов и переиспользуемый буфер снимка сэмплов.
+struct AudioState {
+    /// Канал микрофона (слушатель + осциллограф), None — выключен.
+    mic: Option<audio::AudioMonitor>,
+    /// Канал звука программы/вывода (Zoom/Телемост/Discord…), None — выключен.
+    zoom: Option<audio::AudioMonitor>,
+    /// Выбранный микрофон (имя источника; None — по умолчанию).
+    mic_target: Option<String>,
+    /// Выбранная программа (node id; None — весь вывод = monitor по умолчанию).
+    prog_target: Option<String>,
+    /// Списки для селекторов: микрофоны и играющие программы.
+    mics: Vec<audio::Device>,
+    programs: Vec<audio::Device>,
+    /// Переиспользуемый буфер снимка сэмплов (без аллокаций на кадр).
+    scope: Vec<f32>,
+}
+
+/// Состояние автопилота (work-autopilot): процесс, желаемая фаза, профиль/строгость,
+/// статус старта и кэш счётчиков/групп из stats.json/scan.json.
+struct AutopilotState {
+    /// Процесс автопилота, None — не запущен. Один на профиль браузера.
+    proc: Option<pilot::Pilot>,
+    /// Желаемая фаза (кнопки взаимоисключающи): чат / отклики / скан / ничего.
+    want: Option<pilot::Phase>,
+    /// Профиль (аккаунт/резюме): "fullstack" | "back" | "bulat" — задаёт `--profile` и каталог данных.
+    profile: String,
+    /// Строгость откликов ("strict"|"medium"|"any") — порог релевантности, уходит как MIN_SIMILARITY.
+    strictness: String,
+    /// Короткое сообщение об ошибке старта (для показа под кнопками).
+    status: String,
+    /// Счётчики (отклики/чаты) из stats.json + его mtime (перечитываем только при изменении).
+    stats: Option<pilot_stats::PilotStats>,
+    stats_mtime: Option<std::time::SystemTime>,
+    /// Группы скана + число новых вакансий из scan.json + его mtime.
+    scan: Option<pilot_scan::ScanStatus>,
+    scan_mtime: Option<std::time::SystemTime>,
+    /// Общий тумблер TG-уведомлений (из data/notify.json).
+    notify_on: bool,
+}
+
+/// Снимок области экрана (кнопка «Скрин»): общий статус с грабером, запрос разметки и
+/// оверлей выбора двух точек.
+struct ShotState {
+    /// Статус последнего снимка: фоновый грабер пишет по завершении, UI читает каждый кадр.
+    status: Arc<std::sync::Mutex<screenshot::ShotStatus>>,
+    /// Запрос начать разметку области (кнопка «Скрин» или SIGUSR2/Tartarus; читает update()).
+    request: Arc<AtomicBool>,
+    /// Оверлей разметки сейчас открыт (ждём два клика).
+    active: bool,
+    /// Точки-клики оверлея в физических пикселях экрана (нужно ровно две).
+    points: Vec<[u32; 2]>,
+}
+
 struct App {
     cfg: Config,
     shared: Arc<Shared>,
@@ -115,43 +169,12 @@ struct App {
     active_call: Option<ActiveCall>,
     /// Черновик названия следующего кола (вводится до старта записи).
     call_name_input: String,
-    /// Канал микрофона (слушатель + осциллограф), None — выключен.
-    mic: Option<audio::AudioMonitor>,
-    /// Канал звука программы/вывода (Zoom/Телемост/Discord…), None — выключен.
-    zoom: Option<audio::AudioMonitor>,
-    /// Выбранный микрофон (имя источника; None — по умолчанию).
-    mic_target: Option<String>,
-    /// Выбранная программа (node id; None — весь вывод = monitor по умолчанию).
-    prog_target: Option<String>,
-    /// Списки для селекторов: микрофоны и играющие программы.
-    mics: Vec<audio::Device>,
-    programs: Vec<audio::Device>,
-    /// Переиспользуемый буфер снимка сэмплов (без аллокаций на кадр).
-    scope: Vec<f32>,
+    /// Аудио-каналы (микрофон/программа) + осциллограф. См. [`AudioState`].
+    audio: AudioState,
     /// Закреплено ли окно «поверх всех» (keep-above через KWin).
     pinned: bool,
-    /// Процесс автопилота (work-autopilot), None — не запущен. Один на профиль браузера.
-    pilot: Option<pilot::Pilot>,
-    /// Желаемая фаза автопилота (кнопки взаимоисключающи): чат / отклики / ничего.
-    want: Option<pilot::Phase>,
-    /// Выбранный профиль автопилота (аккаунт/резюме): "fullstack" | "back" | "bulat".
-    /// Определяет `--profile` при запуске и каталог данных для счётчиков/групп.
-    pilot_profile: String,
-    /// Строгость откликов ("strict" | "medium" | "any") — порог релевантности к резюме,
-    /// уходит автопилоту как MIN_SIMILARITY. Определяет, на что бот вообще откликается.
-    pilot_strictness: String,
-    /// Короткое сообщение об ошибке старта автопилота (для показа под кнопками).
-    pilot_status: String,
-    /// Счётчики автопилота (отклики/чаты) из stats.json, None — файла ещё нет.
-    pilot_stats: Option<pilot_stats::PilotStats>,
-    /// mtime прочитанного stats.json — чтобы перечитывать только при изменении.
-    pilot_stats_mtime: Option<std::time::SystemTime>,
-    /// Группы скана + число новых вакансий из scan.json, None — файла ещё нет.
-    pilot_scan: Option<pilot_scan::ScanStatus>,
-    /// mtime прочитанного scan.json — перечитываем только при изменении.
-    pilot_scan_mtime: Option<std::time::SystemTime>,
-    /// Общий тумблер TG-уведомлений автопилота (из data/notify.json).
-    pilot_notify_on: bool,
+    /// Автопилот: процесс, фаза, профиль, счётчики. См. [`AutopilotState`].
+    autopilot: AutopilotState,
     /// Состояние генерации ответа рекрутёру («Ответить HR»): фоновый поток пишет,
     /// UI читает каждый кадр и кладёт готовый ответ в буфер обмена.
     hr_reply: Arc<std::sync::Mutex<hr_reply::HrReplyState>>,
@@ -160,17 +183,8 @@ struct App {
     /// Состояние предыдущего кадра + момент его появления — для дебаунса записи.
     prev_state: state::State,
     stable_since: Instant,
-    /// Статус последнего снимка области экрана (кнопка «Скрин»). Фоновый поток
-    /// грабера пишет сюда по завершении, UI читает под кнопкой каждый кадр.
-    shot_status: Arc<std::sync::Mutex<screenshot::ShotStatus>>,
-    /// Запрос начать разметку области. Ставится кнопкой «Скрин» или SIGUSR2
-    /// (кнопка Tartarus); update() на главном потоке подхватывает и открывает
-    /// оверлей. Через флаг — потому что сигнал прилетает в другом потоке.
-    shot_request: Arc<AtomicBool>,
-    /// Оверлей разметки сейчас открыт (ждём два клика).
-    shot_active: bool,
-    /// Точки-клики оверлея в физических пикселях экрана (нужно ровно две).
-    shot_points: Vec<[u32; 2]>,
+    /// Снимок области экрана (кнопка «Скрин»). См. [`ShotState`].
+    shot: ShotState,
     /// Счётчики нажатий кнопок-маркеров транскрипции (RT-сигналы от Tartarus: физ. 10=микрофон,
     /// 15=телемост). Сигнальный поток инкрементит, UI сравнивает с *_seen и обрабатывает
     /// каждое новое нажатие как старт/стоп записи участка. Счётчик (а не булев тумблер) —
@@ -333,7 +347,7 @@ impl App {
 
         // Поток корректного завершения по SIGTERM/SIGINT: ставит флаг и будит UI. Саму
         // очистку (гашение автопилота → закрытие браузера → снятие lock профиля) делает
-        // update() на главном потоке, где живёт self.pilot. Без этого голый SIGTERM убил
+        // update() на главном потоке, где живёт self.autopilot.proc. Без этого голый SIGTERM убил
         // бы GUI мгновенно, без Drop, осиротив автопилот с залоченным профилем браузера.
         {
             let shared = shared.clone();
@@ -445,34 +459,40 @@ impl App {
             transcript_log,
             active_call: None,
             call_name_input: String::new(),
-            mic,
-            zoom,
-            mic_target: st.mic_target.clone(),
-            prog_target: None,
-            mics: audio::list_mics(),
-            programs: audio::list_programs(),
-            scope: Vec::with_capacity(2048),
+            audio: AudioState {
+                mic,
+                zoom,
+                mic_target: st.mic_target.clone(),
+                prog_target: None,
+                mics: audio::list_mics(),
+                programs: audio::list_programs(),
+                scope: Vec::with_capacity(2048),
+            },
             pinned: st.pinned,
-            // Автопилот НЕ восстанавливаем при старте (боевой режим шлёт реальные отклики):
-            // кнопки всегда стартуют неактивными, запуск — только по явному клику.
-            pilot: None,
-            want: None,
-            pilot_profile,
-            pilot_strictness,
-            pilot_status: String::new(),
-            pilot_stats: None,
-            pilot_stats_mtime: None,
-            pilot_scan: None,
-            pilot_scan_mtime: None,
-            pilot_notify_on,
+            autopilot: AutopilotState {
+                // Автопилот НЕ восстанавливаем при старте (боевой режим шлёт реальные отклики):
+                // кнопки всегда стартуют неактивными, запуск — только по явному клику.
+                proc: None,
+                want: None,
+                profile: pilot_profile,
+                strictness: pilot_strictness,
+                status: String::new(),
+                stats: None,
+                stats_mtime: None,
+                scan: None,
+                scan_mtime: None,
+                notify_on: pilot_notify_on,
+            },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
             prev_state: st.clone(),
             stable_since: Instant::now(),
-            shot_status,
-            shot_request,
-            shot_active: false,
-            shot_points: Vec::new(),
+            shot: ShotState {
+                status: shot_status,
+                request: shot_request,
+                active: false,
+                points: Vec::new(),
+            },
             mark_mic,
             mark_zoom,
             mark_mic_seen: 0,
@@ -492,7 +512,7 @@ impl App {
 
     /// Запустить zoom-канал: выбранная программа (node id) или, если не выбрана, весь вывод.
     fn start_program(&self) -> Option<audio::AudioMonitor> {
-        let target = self.prog_target.clone().or_else(audio::default_monitor);
+        let target = self.audio.prog_target.clone().or_else(audio::default_monitor);
         audio::AudioMonitor::start(target.as_deref(), CH_ZOOM, self.transcript_log.clone())
     }
 
@@ -518,10 +538,10 @@ impl App {
         let Some(call) = self.active_call.take() else {
             return;
         };
-        if let Some(mon) = &self.mic {
+        if let Some(mon) = &self.audio.mic {
             mon.stop_recording();
         }
-        if let Some(mon) = &self.zoom {
+        if let Some(mon) = &self.audio.zoom {
             mon.stop_recording();
         }
         if let Some(log) = &self.transcript_log {
@@ -540,8 +560,8 @@ impl App {
             return;
         };
         for (mon, channel, file) in [
-            (&self.mic, CH_MIC, "mic.wav"),
-            (&self.zoom, CH_ZOOM, "zoom.wav"),
+            (&self.audio.mic, CH_MIC, "mic.wav"),
+            (&self.audio.zoom, CH_ZOOM, "zoom.wav"),
         ] {
             if let Some(m) = mon {
                 if !m.is_recording() {
@@ -558,7 +578,7 @@ impl App {
     fn pilot_min_sim(&self) -> f32 {
         PILOT_STRICTNESS
             .iter()
-            .find(|(k, _, _)| *k == self.pilot_strictness)
+            .find(|(k, _, _)| *k == self.autopilot.strictness)
             .map(|(_, _, v)| *v)
             .unwrap_or(0.0)
     }
@@ -567,40 +587,40 @@ impl App {
     /// None → гасим. Иначе, если процесса нет или фаза изменилась → (пере)запуск.
     /// Один браузер-профиль/окно → всегда ровно один процесс, смена фазы = рестарт.
     fn reconcile_pilot(&mut self) {
-        let desired = match self.want.clone() {
+        let desired = match self.autopilot.want.clone() {
             None => {
-                self.pilot = None; // Drop мягко гасит процесс и закрывает браузер
+                self.autopilot.proc = None; // Drop мягко гасит процесс и закрывает браузер
                 return;
             }
             Some(p) => p,
         };
         // Ничего не делаем, только если совпали И фаза, И профиль (аккаунт): смена
         // любого требует перезапуска — это другой браузер/окно.
-        let same_phase = self.pilot.as_ref().map(|p| p.phase()) == Some(&desired);
+        let same_phase = self.autopilot.proc.as_ref().map(|p| p.phase()) == Some(&desired);
         let same_profile =
-            self.pilot.as_ref().map(|p| p.profile()) == Some(Some(self.pilot_profile.as_str()));
+            self.autopilot.proc.as_ref().map(|p| p.profile()) == Some(Some(self.autopilot.profile.as_str()));
         // Порог релевантности тоже фиксируется при старте — его смена требует рестарта.
-        let same_sim = self.pilot.as_ref().map(|p| p.min_sim()) == Some(self.pilot_min_sim());
+        let same_sim = self.autopilot.proc.as_ref().map(|p| p.min_sim()) == Some(self.pilot_min_sim());
         if same_phase && same_profile && same_sim {
             return; // уже крутится в нужной фазе, профиле и строгости
         }
         // Сперва гасим старую фазу (Drop → SIGTERM → браузер закрывается, профиль
         // освобождается), и только потом стартуем новую — иначе новый Chromium
         // поднимется на занятом профиле и уронит старый (TargetClosedError).
-        self.pilot = None;
-        self.pilot = pilot::Pilot::start(
+        self.autopilot.proc = None;
+        self.autopilot.proc = pilot::Pilot::start(
             &self.cfg.autopilot_dir,
             &self.cfg.autopilot_bin,
             desired,
-            Some(self.pilot_profile.as_str()),
+            Some(self.autopilot.profile.as_str()),
             Some(self.pilot_min_sim()),
         );
-        if self.pilot.is_none() {
+        if self.autopilot.proc.is_none() {
             // Не стартовал — сбрасываем кнопки и показываем причину.
-            self.want = None;
-            self.pilot_status = "не удалось запустить автопилот".to_string();
+            self.autopilot.want = None;
+            self.autopilot.status = "не удалось запустить автопилот".to_string();
         } else {
-            self.pilot_status.clear();
+            self.autopilot.status.clear();
         }
     }
 
@@ -624,12 +644,12 @@ impl App {
             y,
             width: Some(win_w),
             height: Some(size.y),
-            mic_on: self.mic.is_some(),
-            mic_target: self.mic_target.clone(),
-            zoom_on: self.zoom.is_some(),
+            mic_on: self.audio.mic.is_some(),
+            mic_target: self.audio.mic_target.clone(),
+            zoom_on: self.audio.zoom.is_some(),
             pinned: self.pinned,
-            pilot_profile: Some(self.pilot_profile.clone()),
-            pilot_strictness: Some(self.pilot_strictness.clone()),
+            pilot_profile: Some(self.autopilot.profile.clone()),
+            pilot_strictness: Some(self.autopilot.strictness.clone()),
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             metrics_collapsed: self.metrics_collapsed,
@@ -649,22 +669,22 @@ impl App {
             }
         }
         // Счётчики откликов профиля (stats-<profile>.json) — свои у каждого аккаунта.
-        let stats_path = profile_stats_path(&self.cfg.autopilot_dir, &self.pilot_profile);
+        let stats_path = profile_stats_path(&self.cfg.autopilot_dir, &self.autopilot.profile);
         let mtime = std::fs::metadata(&stats_path).and_then(|m| m.modified()).ok();
-        if mtime != self.pilot_stats_mtime {
-            self.pilot_stats = pilot_stats::load(&stats_path);
-            self.pilot_stats_mtime = mtime;
+        if mtime != self.autopilot.stats_mtime {
+            self.autopilot.stats = pilot_stats::load(&stats_path);
+            self.autopilot.stats_mtime = mtime;
         }
         // Статус скана (scan.json) — общий пул на все профили. По mtime: во время скана
         // число растёт; виджет подхватывает без опроса содержимого.
         let scan_path = self.cfg.autopilot_dir.join("data").join("scan.json");
         let scan_mtime = std::fs::metadata(&scan_path).and_then(|m| m.modified()).ok();
-        if scan_mtime != self.pilot_scan_mtime {
-            self.pilot_scan = pilot_scan::load(&scan_path);
-            self.pilot_scan_mtime = scan_mtime;
+        if scan_mtime != self.autopilot.scan_mtime {
+            self.autopilot.scan = pilot_scan::load(&scan_path);
+            self.autopilot.scan_mtime = scan_mtime;
         }
         // Тумблер уведомлений (дёшево — читаем на каждой перезагрузке метрик).
-        self.pilot_notify_on =
+        self.autopilot.notify_on =
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
     }
 
@@ -713,9 +733,9 @@ impl App {
                 if let Some(pos) = click {
                     // Логические координаты (как геометрия окон KWin) — их ждёт CaptureArea.
                     let px = [pos.x.round().max(0.0) as u32, pos.y.round().max(0.0) as u32];
-                    self.shot_points.push(px);
-                    if self.shot_points.len() >= 2 {
-                        let (a, b) = (self.shot_points[0], self.shot_points[1]);
+                    self.shot.points.push(px);
+                    if self.shot.points.len() >= 2 {
+                        let (a, b) = (self.shot.points[0], self.shot.points[1]);
                         done = Some(Some([
                             a[0].min(b[0]),
                             a[1].min(b[1]),
@@ -729,15 +749,15 @@ impl App {
         });
 
         if let Some(res) = done {
-            self.shot_active = false;
-            self.shot_points.clear();
+            self.shot.active = false;
+            self.shot.points.clear();
             ctx.request_repaint();
             match res {
                 Some([x, y, w, h]) => {
-                    *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Working;
-                    screenshot::grab(x as i32, y as i32, w, h, ctx.clone(), self.shot_status.clone());
+                    *self.shot.status.lock().unwrap() = screenshot::ShotStatus::Working;
+                    screenshot::grab(x as i32, y as i32, w, h, ctx.clone(), self.shot.status.clone());
                 }
-                None => *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Cancelled,
+                None => *self.shot.status.lock().unwrap() = screenshot::ShotStatus::Cancelled,
             }
         }
     }
@@ -817,10 +837,10 @@ impl App {
     /// Секция «Звук и транскрипция»: два канала (микрофон/программа) с тумблерами и селекторами.
     fn draw_sound(&mut self, ui: &mut egui::Ui) {
         // Два канала: микрофон и программа/вывод. У каждого — тумблер + селектор.
-        let mic_on = self.mic.is_some();
-        let zoom_on = self.zoom.is_some();
-        let mic_target = self.mic_target.clone();
-        let prog_target = self.prog_target.clone();
+        let mic_on = self.audio.mic.is_some();
+        let zoom_on = self.audio.zoom.is_some();
+        let mic_target = self.audio.mic_target.clone();
+        let prog_target = self.audio.prog_target.clone();
         let mut toggle_mic = false;
         let mut toggle_zoom = false;
         let mut mic_off = false;
@@ -842,7 +862,7 @@ impl App {
             }
             // Подпись селектора отражает состояние: выключен — «⊘ выключено».
             let cur = if mic_on {
-                device_label(&mic_target, &self.mics, "🎤 по умолчанию")
+                device_label(&mic_target, &self.audio.mics, "🎤 по умолчанию")
             } else {
                 "⊘ выключено".to_string()
             };
@@ -857,7 +877,7 @@ impl App {
                     if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
                         new_mic = Some(None);
                     }
-                    for d in &self.mics {
+                    for d in &self.audio.mics {
                         let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
                         if ui.selectable_label(sel, &d.label).clicked() {
                             new_mic = Some(Some(d.target.clone()));
@@ -879,7 +899,7 @@ impl App {
                 toggle_zoom = true;
             }
             let cur = if zoom_on {
-                device_label(&prog_target, &self.programs, "🔊 весь вывод")
+                device_label(&prog_target, &self.audio.programs, "🔊 весь вывод")
             } else {
                 "⊘ выключено".to_string()
             };
@@ -894,7 +914,7 @@ impl App {
                         if ui.selectable_label(zoom_on && prog_target.is_none(), "🔊 весь вывод").clicked() {
                             new_prog = Some(None);
                         }
-                        for d in &self.programs {
+                        for d in &self.audio.programs {
                             let sel = zoom_on && prog_target.as_deref() == Some(d.target.as_str());
                             if ui.selectable_label(sel, &d.label).clicked() {
                                 new_prog = Some(Some(d.target.clone()));
@@ -910,37 +930,37 @@ impl App {
 
         // Применяем изменения выбора/тумблеров.
         if refresh {
-            self.mics = audio::list_mics();
-            self.programs = audio::list_programs();
+            self.audio.mics = audio::list_mics();
+            self.audio.programs = audio::list_programs();
         }
         if refresh_mic {
-            self.mics = audio::list_mics();
+            self.audio.mics = audio::list_mics();
         }
         // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
         if let Some(sel) = new_mic {
-            self.mic_target = sel;
-            self.mic = audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
+            self.audio.mic_target = sel;
+            self.audio.mic = audio::AudioMonitor::start(self.audio.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
         }
         if let Some(sel) = new_prog {
-            self.prog_target = sel;
-            self.zoom = self.start_program();
+            self.audio.prog_target = sel;
+            self.audio.zoom = self.start_program();
         }
         // Пункт «⊘ выключено» — погасить канал.
         if mic_off {
-            self.mic = None;
+            self.audio.mic = None;
         }
         if zoom_off {
-            self.zoom = None;
+            self.audio.zoom = None;
         }
         if toggle_mic {
-            self.mic = if self.mic.is_some() {
+            self.audio.mic = if self.audio.mic.is_some() {
                 None
             } else {
-                audio::AudioMonitor::start(self.mic_target.as_deref(), CH_MIC, self.transcript_log.clone())
+                audio::AudioMonitor::start(self.audio.mic_target.as_deref(), CH_MIC, self.transcript_log.clone())
             };
         }
         if toggle_zoom {
-            self.zoom = if self.zoom.is_some() {
+            self.audio.zoom = if self.audio.zoom.is_some() {
                 None
             } else {
                 self.start_program()
@@ -962,7 +982,7 @@ impl App {
         let mut shoot = false;
         let shot_line = {
             use screenshot::ShotStatus::*;
-            match &*self.shot_status.lock().unwrap() {
+            match &*self.shot.status.lock().unwrap() {
                 Idle => None,
                 Marking => Some((
                     "⧗ кликни две точки…".to_string(),
@@ -1020,7 +1040,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            !self.shot_active,
+                            !self.shot.active,
                             egui::Button::new("📸 Область"),
                         )
                         .on_hover_text(
@@ -1047,7 +1067,7 @@ impl App {
             }
         }
         if shoot {
-            self.shot_request.store(true, Ordering::Relaxed);
+            self.shot.request.store(true, Ordering::Relaxed);
         }
         ui.add_space(2.0);
     }
@@ -1063,17 +1083,17 @@ impl App {
             let mut new_profile: Option<String> = None;
             let mut new_strictness: Option<String> = None;
             let mut toggle_pause = false;
-            let running = self.want.is_some();
-            let paused = self.pilot.as_ref().is_some_and(|p| p.is_paused());
+            let running = self.autopilot.want.is_some();
+            let paused = self.autopilot.proc.as_ref().is_some_and(|p| p.is_paused());
             // Краткий статус: пауза → явная метка, иначе последняя строка лога
             // автопилота либо сообщение об ошибке.
             let status = if paused {
                 "⏸ на паузе".to_string()
             } else {
-                self.pilot
+                self.autopilot.proc
                     .as_ref()
                     .and_then(|p| p.last_line())
-                    .unwrap_or_else(|| self.pilot_status.clone())
+                    .unwrap_or_else(|| self.autopilot.status.clone())
             };
             let mut ap_collapsed = self.autopilot_collapsed;
             section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
@@ -1085,7 +1105,7 @@ impl App {
                     );
                     let cur = PILOT_PROFILES
                         .iter()
-                        .find(|(k, _)| *k == self.pilot_profile)
+                        .find(|(k, _)| *k == self.autopilot.profile)
                         .map(|(_, l)| *l)
                         .unwrap_or("Fullstack");
                     egui::ComboBox::from_id_salt("pilot-profile")
@@ -1094,9 +1114,9 @@ impl App {
                         .show_ui(ui, |ui| {
                             for (key, label) in PILOT_PROFILES {
                                 if ui
-                                    .selectable_label(self.pilot_profile == *key, *label)
+                                    .selectable_label(self.autopilot.profile == *key, *label)
                                     .clicked()
-                                    && self.pilot_profile != *key
+                                    && self.autopilot.profile != *key
                                 {
                                     new_profile = Some((*key).to_string());
                                 }
@@ -1106,23 +1126,23 @@ impl App {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(self.want == Some(Phase::Chat), "💬 Чат")
+                        .selectable_label(self.autopilot.want == Some(Phase::Chat), "💬 Чат")
                         .on_hover_text("Автопилот: вести чаты с работодателями")
                         .clicked()
                     {
                         // Повторный клик по активной — выключить; иначе переключить.
-                        new_want = Some(if self.want == Some(Phase::Chat) {
+                        new_want = Some(if self.autopilot.want == Some(Phase::Chat) {
                             None
                         } else {
                             Some(Phase::Chat)
                         });
                     }
                     if ui
-                        .selectable_label(self.want == Some(Phase::Apply), "📨 Отклики")
+                        .selectable_label(self.autopilot.want == Some(Phase::Apply), "📨 Отклики")
                         .on_hover_text("Автопилот: разбирать очередь скана — откликаться")
                         .clicked()
                     {
-                        new_want = Some(if self.want == Some(Phase::Apply) {
+                        new_want = Some(if self.autopilot.want == Some(Phase::Apply) {
                             None
                         } else {
                             Some(Phase::Apply)
@@ -1146,7 +1166,7 @@ impl App {
                                 ("⏸ Пауза", "Заморозить автопилот на месте (браузер не закрывается)")
                             };
                             if ui
-                                .add_enabled(self.pilot.is_some(), egui::Button::new(label))
+                                .add_enabled(self.autopilot.proc.is_some(), egui::Button::new(label))
                                 .on_hover_text(hint)
                                 .clicked()
                             {
@@ -1157,7 +1177,7 @@ impl App {
                 });
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let on = self.pilot_notify_on;
+                    let on = self.autopilot.notify_on;
                     let label = if on {
                         "🔔 Уведомления: вкл"
                     } else {
@@ -1175,7 +1195,7 @@ impl App {
                         if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
                             eprintln!("notify.json write failed: {e}");
                         } else {
-                            self.pilot_notify_on = !on;
+                            self.autopilot.notify_on = !on;
                         }
                     }
                 });
@@ -1243,7 +1263,7 @@ impl App {
                              эмбеддингов). Ниже порога — не откликаемся.",
                         );
                     for (key, label, thr) in PILOT_STRICTNESS {
-                        let active = self.pilot_strictness == *key;
+                        let active = self.autopilot.strictness == *key;
                         if ui
                             .selectable_label(active, *label)
                             .on_hover_text(if *thr > 0.0 {
@@ -1265,7 +1285,7 @@ impl App {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            let applying = self.want == Some(Phase::Apply);
+                            let applying = self.autopilot.want == Some(Phase::Apply);
                             let (lbl, hint) = if applying {
                                 ("⏹ Стоп", "Остановить отклики")
                             } else {
@@ -1286,14 +1306,14 @@ impl App {
                 // (из scan.json). В скобках — число новых (ещё не отработанных)
                 // вакансий в очереди. Клик запускает скан группы, повторный —
                 // останавливает; скан гаснет и сам, дойдя до конца выдачи.
-                if let Some(scan) = &self.pilot_scan {
+                if let Some(scan) = &self.autopilot.scan {
                     if !scan.groups.is_empty() {
                         ui.add_space(2.0);
                         // «Все группы» — один процесс сканирует группы по очереди.
                         let total: i64 = scan.groups.iter().map(|g| g.pending).sum();
                         if ui
                             .selectable_label(
-                                self.want == Some(Phase::ScanAll),
+                                self.autopilot.want == Some(Phase::ScanAll),
                                 format!("🔎 Все группы ({total})"),
                             )
                             .on_hover_text(
@@ -1302,7 +1322,7 @@ impl App {
                             )
                             .clicked()
                         {
-                            new_want = Some(if self.want == Some(Phase::ScanAll) {
+                            new_want = Some(if self.autopilot.want == Some(Phase::ScanAll) {
                                 None
                             } else {
                                 Some(Phase::ScanAll)
@@ -1311,7 +1331,7 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             for g in &scan.groups {
                                 let active =
-                                    self.want == Some(Phase::Scan(g.name.clone()));
+                                    self.autopilot.want == Some(Phase::Scan(g.name.clone()));
                                 let label = format!("🔎 {} ({})", g.name, g.pending);
                                 if ui
                                     .selectable_label(active, label)
@@ -1335,8 +1355,8 @@ impl App {
                 // полное описание + дату публикации + вектор (для точного подбора
                 // под резюме). Разовая фаза-тумблер; пока идёт — спиннер загрузки.
                 // Число в скобках — остаток необогащённых (из scan.json).
-                if let Some(scan) = &self.pilot_scan {
-                    let enrich_active = self.want == Some(Phase::Enrich);
+                if let Some(scan) = &self.autopilot.scan {
+                    let enrich_active = self.autopilot.want == Some(Phase::Enrich);
                     if enrich_active || scan.unenriched > 0 {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
@@ -1382,7 +1402,7 @@ impl App {
                     ui.label(job);
                 }
                 // Счётчики: сколько откликов и обработанных чатов (из stats.json).
-                if let Some(s) = &self.pilot_stats {
+                if let Some(s) = &self.autopilot.stats {
                     let color = egui::Color32::from_rgb(150, 160, 175);
                     ui.label(
                         egui::RichText::new(format!(
@@ -1404,33 +1424,33 @@ impl App {
             });
             self.autopilot_collapsed = ap_collapsed;
             if let Some(p) = new_profile {
-                self.pilot_profile = p;
+                self.autopilot.profile = p;
                 // Счётчики откликов свои у каждого профиля — сбрасываем кэш, чтобы
                 // maybe_reload перечитал stats нового аккаунта. Пул (scan.json)
                 // общий, но mtime тоже сбросим — перечитается при следующем кадре.
-                self.pilot_scan_mtime = None;
-                self.pilot_stats = None;
-                self.pilot_stats_mtime = None;
+                self.autopilot.scan_mtime = None;
+                self.autopilot.stats = None;
+                self.autopilot.stats_mtime = None;
                 // Если автопилот запущен — перезапустить под новый аккаунт.
-                if self.want.is_some() {
+                if self.autopilot.want.is_some() {
                     self.reconcile_pilot();
                 }
             }
             if let Some(s) = new_strictness {
-                self.pilot_strictness = s;
+                self.autopilot.strictness = s;
                 // Порог читается автопилотом при старте. Если сейчас крутятся
                 // отклики — перезапустить с новым MIN_SIMILARITY; иначе применится
                 // при следующем запуске фазы откликов.
-                if self.want == Some(Phase::Apply) {
+                if self.autopilot.want == Some(Phase::Apply) {
                     self.reconcile_pilot();
                 }
             }
             if let Some(w) = new_want {
-                self.want = w;
+                self.autopilot.want = w;
                 self.reconcile_pilot();
             }
             if toggle_pause {
-                if let Some(p) = self.pilot.as_mut() {
+                if let Some(p) = self.autopilot.proc.as_mut() {
                     if p.is_paused() {
                         p.resume();
                     } else {
@@ -1484,7 +1504,7 @@ impl App {
         // нажатие как старт/стоп записи участка. На «стоп» — текст участка в буфер обмена;
         // сами диапазоны-маркеры хранятся в markers_* и рисуются в draw_transcript.
         let c_mic = self.mark_mic.load(Ordering::Relaxed);
-        let mic_finals = self.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+        let mic_finals = self.audio.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
         if let Some(txt) = apply_mark_presses(
             &mut self.markers_mic,
             &mut self.mark_mic_seen,
@@ -1494,7 +1514,7 @@ impl App {
             clip::set_async(txt);
         }
         let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
-        let zoom_finals = self.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+        let zoom_finals = self.audio.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
         if let Some(txt) = apply_mark_presses(
             &mut self.markers_zoom,
             &mut self.mark_zoom_seen,
@@ -1508,10 +1528,10 @@ impl App {
     /// Осциллограммы активных каналов с подписями, бейджами записи и лентой транскрипта.
     fn draw_scopes(&mut self, ui: &mut egui::Ui) {
         // Осциллограммы активных каналов (у каждого — своя подпись и цвет).
-        if self.mic.is_some() || self.zoom.is_some() {
+        if self.audio.mic.is_some() || self.audio.zoom.is_some() {
             section(ui, "📈 Осциллограммы", |ui| {
-                if let Some(mon) = &self.mic {
-                    mon.snapshot(&mut self.scope);
+                if let Some(mon) = &self.audio.mic {
+                    mon.snapshot(&mut self.audio.scope);
                     let color = egui::Color32::from_rgb(120, 210, 150);
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1519,11 +1539,11 @@ impl App {
                         );
                         marker_recording_badge(ui, &self.markers_mic);
                     });
-                    draw_scope(ui, &self.scope, color);
+                    draw_scope(ui, &self.audio.scope, color);
                     draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic);
                 }
-                if let Some(mon) = &self.zoom {
-                    mon.snapshot(&mut self.scope);
+                if let Some(mon) = &self.audio.zoom {
+                    mon.snapshot(&mut self.audio.scope);
                     let color = egui::Color32::from_rgb(130, 180, 250);
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -1532,7 +1552,7 @@ impl App {
                         );
                         marker_recording_badge(ui, &self.markers_zoom);
                     });
-                    draw_scope(ui, &self.scope, color);
+                    draw_scope(ui, &self.audio.scope, color);
                     draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom);
                 }
             });
@@ -1553,7 +1573,7 @@ impl eframe::App for App {
         // затем закрываем окно — событийный цикл выйдет, процесс завершится чисто.
         if self.shared.shutdown.load(Ordering::Relaxed) {
             self.end_call(); // финализируем WAV-дорожки и проставляем время конца кола
-            self.want = None;
+            self.autopilot.want = None;
             self.reconcile_pilot();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -1563,12 +1583,12 @@ impl eframe::App for App {
 
         // Снимок области: запрос от кнопки «Скрин» или SIGUSR2 (Tartarus) открывает
         // прозрачный оверлей разметки; пока он активен — рисуем его каждый кадр.
-        if self.shot_request.swap(false, Ordering::Relaxed) && !self.shot_active {
-            self.shot_active = true;
-            self.shot_points.clear();
-            *self.shot_status.lock().unwrap() = screenshot::ShotStatus::Marking;
+        if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
+            self.shot.active = true;
+            self.shot.points.clear();
+            *self.shot.status.lock().unwrap() = screenshot::ShotStatus::Marking;
         }
-        if self.shot_active {
+        if self.shot.active {
             self.show_shot_overlay(ctx);
         }
 
@@ -1595,15 +1615,15 @@ impl eframe::App for App {
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
         // (скан/обогащение) завершаются сами, дойдя до конца, — сообщаем об этом,
         // а не «остановлен».
-        if self.pilot.as_mut().is_some_and(|p| !p.alive()) {
-            let done_msg = match self.pilot.as_ref().map(|p| p.phase()) {
+        if self.autopilot.proc.as_mut().is_some_and(|p| !p.alive()) {
+            let done_msg = match self.autopilot.proc.as_ref().map(|p| p.phase()) {
                 Some(pilot::Phase::Scan(_)) | Some(pilot::Phase::ScanAll) => Some("скан завершён"),
                 Some(pilot::Phase::Enrich) => Some("обогащение завершено"),
                 _ => None,
             };
-            self.pilot = None;
-            self.want = None;
-            self.pilot_status = done_msg.unwrap_or("автопилот остановлен").to_string();
+            self.autopilot.proc = None;
+            self.autopilot.want = None;
+            self.autopilot.status = done_msg.unwrap_or("автопилот остановлен").to_string();
         }
 
         // Итоговая видимость = пользователь хочет И (не идёт шаринг ИЛИ авто-скрытие выключено).
@@ -1704,7 +1724,7 @@ impl eframe::App for App {
 
         // Осциллографу нужен плавный кадр (~30fps); иначе редкий тик (500мс) обслуживает и
         // авто-reload, и опрос автопилота (обновить статус, поймать его завершение).
-        let scope_active = self.mic.is_some() || self.zoom.is_some();
+        let scope_active = self.audio.mic.is_some() || self.audio.zoom.is_some();
         let interval = if want_visible && scope_active { 33 } else { 500 };
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
