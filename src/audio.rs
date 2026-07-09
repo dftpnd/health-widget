@@ -263,6 +263,10 @@ impl AudioMonitor {
             out.extend(g.iter().copied());
         }
     }
+
+    pub fn samples_handle(&self) -> Arc<Mutex<VecDeque<f32>>> {
+        self.samples.clone()
+    }
 }
 
 impl Drop for AudioMonitor {
