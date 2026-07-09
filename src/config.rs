@@ -49,8 +49,8 @@ impl Default for AvatarCfg {
             scope_color: [200, 0, 0],
             scope_gain: 6.0,
             scope_thickness: 5,
-            text_color: [170, 175, 190],
-            text_size: 34,
+            text_color: [140, 255, 0],
+            text_size: 24,
             text_font: "Noto Sans".to_string(),
             phrase_ttl: 30.0,
         }

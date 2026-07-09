@@ -471,6 +471,19 @@ fn render_text(opts: &usvg::Options, text: &str, size: u32) -> Option<(u32, u32,
     Some((w, h, pixmap.take()))
 }
 
+fn rotate90_cw(src: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
+    let (nw, nh) = (h, w);
+    let mut out = vec![0u8; (nw * nh) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let nx = h - 1 - y;
+            let ny = x;
+            out[(ny * nw + nx) as usize] = src[(y * w + x) as usize];
+        }
+    }
+    (nw, nh, out)
+}
+
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
 }
@@ -535,13 +548,18 @@ impl Phrase {
         fh: u32,
         rng: &mut Rng,
     ) -> Option<Phrase> {
-        let (w, h, rgba) = render_text(opts, text, size)?;
-        if w == 0 || h == 0 || w >= fw || h >= fh {
+        let (rw, rh, rgba) = render_text(opts, text, size)?;
+        if rw == 0 || rh == 0 {
             return None;
         }
-        let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+        let flat: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
+        let (w, h, alpha) = rotate90_cw(&flat, rw, rh);
+        if w >= fw {
+            return None;
+        }
         let x = rng.range(6, (fw - w) as i32 - 6).max(0) as u32;
-        let y = rng.range(6, (fh - h) as i32 - 6).max(0) as u32;
+        let ymax = fh as i32 - h as i32 - 6;
+        let y = if ymax > 6 { rng.range(6, ymax) } else { 0 } as u32;
         Some(Phrase { x, y, w, h, alpha, born: Instant::now() })
     }
 
@@ -551,10 +569,9 @@ impl Phrase {
         if fade <= 0.0 {
             return;
         }
-        let drift = (age / ttl * 26.0) as i32;
         let bg = [0x2bu8, 0x2b, 0x2b];
         for sy in 0..self.h {
-            let dy = self.y as i32 + sy as i32 - drift;
+            let dy = self.y as i32 + sy as i32;
             if dy < 0 || dy as u32 >= fh {
                 continue;
             }
