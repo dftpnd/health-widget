@@ -77,7 +77,7 @@ fn build_rgba(
     format: u32,
 ) -> Result<image::RgbaImage, String> {
     let mut img = image::RgbaImage::new(width, height);
-    let bgra = !matches!(format, 17 | 18 | 19); // не RGBA8888* → считаем ARGB32 (BGRA в памяти)
+    let bgra = !matches!(format, 17..=19); // не RGBA8888* → считаем ARGB32 (BGRA в памяти)
     for row in 0..height {
         let base = row as usize * stride as usize;
         for col in 0..width {
