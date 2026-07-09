@@ -3,7 +3,7 @@ use egui::Context;
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,9 +46,14 @@ const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
 #[derive(Clone)]
 pub struct Handles {
     pub shot_request: Arc<AtomicBool>,
-    pub mark_mic: Arc<AtomicU32>,
-    pub mark_zoom: Arc<AtomicU32>,
     pub cursor_warp_request: Arc<AtomicBool>,
+    pub clear_mic: Arc<AtomicBool>,
+    pub clear_zoom: Arc<AtomicBool>,
+    pub copy_mic: Arc<AtomicBool>,
+    pub copy_zoom: Arc<AtomicBool>,
+    pub clear_chat: Arc<AtomicBool>,
+    pub move_dx: Arc<AtomicI32>,
+    pub move_dy: Arc<AtomicI32>,
     pub ctx: Context,
 }
 
@@ -144,20 +149,32 @@ fn serve(mut devs: Vec<Device>, handles: &Handles) {
     }
 }
 
+fn dpad_delta(code: u16) -> Option<(i32, i32)> {
+    if code == KeyCode::KEY_UP.0 {
+        Some((1, 0))
+    } else if code == KeyCode::KEY_DOWN.0 {
+        Some((-1, 0))
+    } else if code == KeyCode::KEY_LEFT.0 {
+        Some((0, -1))
+    } else if code == KeyCode::KEY_RIGHT.0 {
+        Some((0, 1))
+    } else {
+        None
+    }
+}
+
 fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
+    if let Some((dx, dy)) = dpad_delta(code) {
+        if value != 0 {
+            h.move_dx.fetch_add(dx, Ordering::Relaxed);
+            h.move_dy.fetch_add(dy, Ordering::Relaxed);
+            h.ctx.request_repaint();
+        }
+        return;
+    }
     if value == 1 {
         if code == KeyCode::KEY_5.0 {
             h.shot_request.store(true, Ordering::Relaxed);
-            h.ctx.request_repaint();
-            return;
-        }
-        if code == KeyCode::KEY_R.0 {
-            h.mark_mic.fetch_add(1, Ordering::Relaxed);
-            h.ctx.request_repaint();
-            return;
-        }
-        if code == KeyCode::KEY_F.0 {
-            h.mark_zoom.fetch_add(1, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
@@ -166,10 +183,38 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
+        if code == KeyCode::KEY_2.0 {
+            h.clear_mic.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
+        if code == KeyCode::KEY_Q.0 {
+            h.clear_zoom.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
+        if code == KeyCode::KEY_3.0 {
+            h.copy_mic.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
+        if code == KeyCode::KEY_W.0 {
+            h.copy_zoom.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
+        if code == KeyCode::KEY_A.0 {
+            h.clear_chat.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
     } else if matches!(code, c if c == KeyCode::KEY_5.0
-        || c == KeyCode::KEY_R.0
-        || c == KeyCode::KEY_F.0
-        || c == KeyCode::KEY_SPACE.0)
+        || c == KeyCode::KEY_SPACE.0
+        || c == KeyCode::KEY_2.0
+        || c == KeyCode::KEY_Q.0
+        || c == KeyCode::KEY_3.0
+        || c == KeyCode::KEY_W.0
+        || c == KeyCode::KEY_A.0)
     {
         return;
     }

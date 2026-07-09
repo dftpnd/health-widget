@@ -29,6 +29,13 @@ pub fn set_position(x: i32, y: i32) -> bool {
     run_kwin_script(&body, "move")
 }
 
+pub fn move_by(dx: i32, dy: i32) -> bool {
+    let body = for_our_window(&format!(
+        "var g = w.frameGeometry; w.frameGeometry = {{ x: g.x + {dx}, y: g.y + {dy}, width: g.width, height: g.height }};"
+    ));
+    run_kwin_script(&body, "moveby")
+}
+
 pub fn get_position() -> Option<(i32, i32)> {
     let body = for_our_window(
         "var g = w.frameGeometry; print(\"HW-GEOM x=\" + Math.round(g.x) + \" y=\" + Math.round(g.y));",

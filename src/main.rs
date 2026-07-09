@@ -1,5 +1,5 @@
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,46 @@ struct ShotState {
     points: Vec<[u32; 2]>,
 }
 
+#[derive(Clone)]
+struct TranscriptKeys {
+    clear_mic: Arc<AtomicBool>,
+    clear_zoom: Arc<AtomicBool>,
+    copy_mic: Arc<AtomicBool>,
+    copy_zoom: Arc<AtomicBool>,
+    clear_chat: Arc<AtomicBool>,
+}
+
+impl TranscriptKeys {
+    fn new() -> Self {
+        Self {
+            clear_mic: Arc::new(AtomicBool::new(false)),
+            clear_zoom: Arc::new(AtomicBool::new(false)),
+            copy_mic: Arc::new(AtomicBool::new(false)),
+            copy_zoom: Arc::new(AtomicBool::new(false)),
+            clear_chat: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+const WINDOW_MOVE_STEP: i32 = 40;
+
+#[derive(Clone)]
+struct WindowMove {
+    dx: Arc<AtomicI32>,
+    dy: Arc<AtomicI32>,
+    busy: Arc<AtomicBool>,
+}
+
+impl WindowMove {
+    fn new() -> Self {
+        Self {
+            dx: Arc::new(AtomicI32::new(0)),
+            dy: Arc::new(AtomicI32::new(0)),
+            busy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 struct App {
     cfg: Config,
     shared: Arc<Shared>,
@@ -115,14 +155,10 @@ struct App {
     prev_state: state::State,
     stable_since: Instant,
     shot: ShotState,
-    mark_mic: Arc<AtomicU32>,
-    mark_zoom: Arc<AtomicU32>,
-    mark_mic_seen: u32,
-    mark_zoom_seen: u32,
     cursor_warp_request: Arc<AtomicBool>,
     prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
-    markers_mic: MarkerState,
-    markers_zoom: MarkerState,
+    transcript_keys: TranscriptKeys,
+    win_move: WindowMove,
     terminal: Option<terminal::Terminal>,
     terminal_open: bool,
     width_one_col: Option<f32>,
@@ -132,32 +168,7 @@ struct App {
     chat: chat::Chat,
     chat_collapsed: bool,
     deepseek: Option<deepseek::Slot>,
-}
-
-#[derive(Default)]
-struct MarkerState {
-    spans: Vec<(usize, usize)>,
-    active_start: Option<usize>,
-}
-
-impl MarkerState {
-    fn toggle(&mut self, len: usize) -> Option<(usize, usize)> {
-        match self.active_start.take() {
-            None => {
-                self.active_start = Some(len);
-                None
-            }
-            Some(start) => {
-                let end = len;
-                if start < end {
-                    self.spans.push((start, end));
-                    Some((start, end))
-                } else {
-                    None
-                }
-            }
-        }
-    }
+    help_open: bool,
 }
 
 impl App {
@@ -177,42 +188,26 @@ impl App {
             Arc::new(std::sync::Mutex::new(screenshot::ShotStatus::Idle));
         let shot_request = Arc::new(AtomicBool::new(false));
 
-        let mark_mic = Arc::new(AtomicU32::new(0));
-        let mark_zoom = Arc::new(AtomicU32::new(0));
         let cursor_warp_request = Arc::new(AtomicBool::new(false));
+        let transcript_keys = TranscriptKeys::new();
+        let win_move = WindowMove::new();
 
         {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
             let shot_request = shot_request.clone();
-            let mark_mic = mark_mic.clone();
-            let mark_zoom = mark_zoom.clone();
             let cursor_warp_request = cursor_warp_request.clone();
-            let rt_mic = libc::SIGRTMIN();
-            let rt_zoom = libc::SIGRTMIN() + 1;
             let rt_cursor_warp = libc::SIGRTMIN() + 2;
             std::thread::spawn(move || {
                 let mut signals = signal_hook::iterator::Signals::new([
                     signal_hook::consts::SIGUSR1,
                     signal_hook::consts::SIGUSR2,
-                    rt_mic,
-                    rt_zoom,
                     rt_cursor_warp,
                 ])
                 .expect("cannot register signal handler");
                 for sig in signals.forever() {
                     if sig == signal_hook::consts::SIGUSR2 {
                         shot_request.store(true, Ordering::Relaxed);
-                        ctx.request_repaint();
-                        continue;
-                    }
-                    if sig == rt_mic {
-                        mark_mic.fetch_add(1, Ordering::Relaxed);
-                        ctx.request_repaint();
-                        continue;
-                    }
-                    if sig == rt_zoom {
-                        mark_zoom.fetch_add(1, Ordering::Relaxed);
                         ctx.request_repaint();
                         continue;
                     }
@@ -230,9 +225,14 @@ impl App {
 
         tartarus::spawn(tartarus::Handles {
             shot_request: shot_request.clone(),
-            mark_mic: mark_mic.clone(),
-            mark_zoom: mark_zoom.clone(),
             cursor_warp_request: cursor_warp_request.clone(),
+            clear_mic: transcript_keys.clear_mic.clone(),
+            clear_zoom: transcript_keys.clear_zoom.clone(),
+            copy_mic: transcript_keys.copy_mic.clone(),
+            copy_zoom: transcript_keys.copy_zoom.clone(),
+            clear_chat: transcript_keys.clear_chat.clone(),
+            move_dx: win_move.dx.clone(),
+            move_dy: win_move.dy.clone(),
             ctx: cc.egui_ctx.clone(),
         });
 
@@ -367,14 +367,10 @@ impl App {
                 active: false,
                 points: Vec::new(),
             },
-            mark_mic,
-            mark_zoom,
-            mark_mic_seen: 0,
-            mark_zoom_seen: 0,
             cursor_warp_request,
             prev_cursor: Arc::new(std::sync::Mutex::new(None)),
-            markers_mic: MarkerState::default(),
-            markers_zoom: MarkerState::default(),
+            transcript_keys,
+            win_move,
             terminal: None,
             terminal_open: st.terminal_open,
             width_one_col: None,
@@ -384,6 +380,7 @@ impl App {
             chat: chat::Chat::default(),
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
+            help_open: false,
         }
     }
 
@@ -636,6 +633,13 @@ impl App {
                     toggle_pin = true;
                 }
                 if ui
+                    .selectable_label(self.help_open, "❓")
+                    .on_hover_text("Бинды клавиатуры")
+                    .clicked()
+                {
+                    self.help_open = !self.help_open;
+                }
+                if ui
                     .selectable_label(self.terminal_open, "🖥")
                     .on_hover_text("Терминал")
                     .clicked()
@@ -689,7 +693,57 @@ impl App {
         if do_restart {
             rebuild_and_restart();
         }
+        if self.help_open {
+            self.draw_keys_help(ctx);
+        }
         ui.add_space(2.0);
+    }
+
+    fn draw_keys_help(&mut self, ctx: &egui::Context) {
+        let binds: &[(&str, &str)] = &[
+            ("02", "🧹 Очистить транскрипт микрофона"),
+            ("03", "📤 Копировать микрофон + отправить в чат"),
+            ("05", "📷 Скриншот"),
+            ("07", "🧹 Очистить транскрипт зума"),
+            ("08", "📤 Копировать зум + отправить в чат"),
+            ("12", "🗑 Очистить чат"),
+            ("20", "🎯 Курсор в центр виджета"),
+            ("D-pad", "🕹 Двигать виджет по экрану"),
+        ];
+        let accent = egui::Color32::from_rgb(180, 200, 255);
+        let modal = egui::Modal::new(egui::Id::new("keys_help")).show(ctx, |ui| {
+            ui.set_max_width(340.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⌨ Бинды клавиатуры").size(15.0).strong().color(accent));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").clicked() {
+                        self.help_open = false;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::Grid::new("keys_help_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (key, action) in binds {
+                        ui.label(egui::RichText::new(*key).monospace().strong().color(accent));
+                        ui.label(egui::RichText::new(*action).size(12.0));
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Остальные клавиши шлют F13–F24 / Ctrl+F13–F21 как глобальные хоткеи.")
+                    .size(10.0)
+                    .italics()
+                    .color(egui::Color32::from_rgb(120, 126, 138)),
+            );
+        });
+        if modal.should_close() {
+            self.help_open = false;
+        }
     }
 
     fn draw_sound(&mut self, ui: &mut egui::Ui) {
@@ -1294,29 +1348,61 @@ impl App {
         }
     }
 
-    fn process_marker_presses(&mut self) {
-        let c_mic = self.mark_mic.load(Ordering::Relaxed);
-        let mic_finals = self.audio.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-        if let Some(txt) = apply_mark_presses(
-            &mut self.markers_mic,
-            &mut self.mark_mic_seen,
-            c_mic,
-            mic_finals.as_deref(),
-        ) {
-            telemetry::event("mark.copy", serde_json::json!({ "channel": CH_MIC, "len": txt.len() }));
-            clip::set_async(txt);
+    fn process_transcript_keys(&mut self, ctx: &egui::Context) {
+        if self.transcript_keys.clear_mic.swap(false, Ordering::Relaxed) {
+            if let Some(mon) = &self.audio.mic {
+                mon.clear_transcript();
+            }
         }
-        let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
-        let zoom_finals = self.audio.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-        if let Some(txt) = apply_mark_presses(
-            &mut self.markers_zoom,
-            &mut self.mark_zoom_seen,
-            c_zoom,
-            zoom_finals.as_deref(),
-        ) {
-            telemetry::event("mark.copy", serde_json::json!({ "channel": CH_ZOOM, "len": txt.len() }));
-            clip::set_async(txt);
+        if self.transcript_keys.clear_zoom.swap(false, Ordering::Relaxed) {
+            if let Some(mon) = &self.audio.zoom {
+                mon.clear_transcript();
+            }
         }
+        if self.transcript_keys.copy_mic.swap(false, Ordering::Relaxed) {
+            let txt = self.audio.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+            if let Some(txt) = txt {
+                if !txt.is_empty() {
+                    telemetry::event("keys.copy", serde_json::json!({ "channel": CH_MIC, "len": txt.len() }));
+                    clip::set_async(txt.clone());
+                    self.start_deepseek(ctx.clone(), txt);
+                }
+            }
+        }
+        if self.transcript_keys.copy_zoom.swap(false, Ordering::Relaxed) {
+            let txt = self.audio.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
+            if let Some(txt) = txt {
+                if !txt.is_empty() {
+                    telemetry::event("keys.copy", serde_json::json!({ "channel": CH_ZOOM, "len": txt.len() }));
+                    clip::set_async(txt.clone());
+                    self.start_deepseek(ctx.clone(), txt);
+                }
+            }
+        }
+        if self.transcript_keys.clear_chat.swap(false, Ordering::Relaxed) {
+            self.chat.clear();
+            self.deepseek = None;
+        }
+    }
+
+    fn process_window_move(&mut self, ctx: &egui::Context) {
+        let dx = self.win_move.dx.swap(0, Ordering::Relaxed);
+        let dy = self.win_move.dy.swap(0, Ordering::Relaxed);
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        if self.win_move.busy.swap(true, Ordering::Relaxed) {
+            self.win_move.dx.fetch_add(dx, Ordering::Relaxed);
+            self.win_move.dy.fetch_add(dy, Ordering::Relaxed);
+            return;
+        }
+        let busy = self.win_move.busy.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            winctl::move_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
+            busy.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
     }
 
     fn draw_scopes(&mut self, ui: &mut egui::Ui) {
@@ -1332,7 +1418,6 @@ impl App {
                         ui.label(
                             egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
                         );
-                        marker_recording_badge(ui, &self.markers_mic);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
                                 clear_mic = true;
@@ -1340,7 +1425,7 @@ impl App {
                         });
                     });
                     draw_scope(ui, &self.audio.scope, color);
-                    picked = draw_transcript(ui, mon.transcript(), color, "mic", &self.markers_mic)
+                    picked = draw_transcript(ui, mon.transcript(), color, "mic")
                         .or(picked.take());
                 }
                 if let Some(mon) = &self.audio.zoom {
@@ -1351,7 +1436,6 @@ impl App {
                         ui.label(
                             egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
                         );
-                        marker_recording_badge(ui, &self.markers_zoom);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
                                 clear_zoom = true;
@@ -1359,7 +1443,7 @@ impl App {
                         });
                     });
                     draw_scope(ui, &self.audio.scope, color);
-                    picked = draw_transcript(ui, mon.transcript(), color, "zoom", &self.markers_zoom)
+                    picked = draw_transcript(ui, mon.transcript(), color, "zoom")
                         .or(picked.take());
                 }
             });
@@ -1367,13 +1451,11 @@ impl App {
                 if let Some(mon) = &self.audio.mic {
                     mon.clear_transcript();
                 }
-                self.markers_mic = MarkerState::default();
             }
             if clear_zoom {
                 if let Some(mon) = &self.audio.zoom {
                     mon.clear_transcript();
                 }
-                self.markers_zoom = MarkerState::default();
             }
             if let Some(q) = picked {
                 self.start_deepseek(ui.ctx().clone(), q);
@@ -1543,7 +1625,9 @@ impl eframe::App for App {
 
                 self.draw_metrics(ui);
 
-                self.process_marker_presses();
+                self.process_transcript_keys(ctx);
+
+                self.process_window_move(ctx);
 
                 self.draw_scopes(ui);
 
@@ -1708,23 +1792,11 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     );
 }
 
-fn marker_recording_badge(ui: &mut egui::Ui, markers: &MarkerState) {
-    if markers.active_start.is_some() {
-        let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 3.0).sin() as f32;
-        ui.label(
-            egui::RichText::new("🔴 идёт запись маркера")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(235, 90, 90).gamma_multiply(pulse)),
-        );
-    }
-}
-
 fn draw_transcript(
     ui: &mut egui::Ui,
     data: Option<(String, String)>,
     color: egui::Color32,
     id_salt: &str,
-    markers: &MarkerState,
 ) -> Option<String> {
     let (finals, partial) = match data {
         Some(t) => t,
@@ -1750,13 +1822,8 @@ fn draw_transcript(
             let mut picked = None;
             if !finals.is_empty() {
                 let mut text = finals.clone();
-                let hl = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
-                let mut ranges: Vec<(usize, usize)> = markers.spans.clone();
-                if let Some(start) = markers.active_start {
-                    ranges.push((start, text.len()));
-                }
                 let mut layouter = |ui: &egui::Ui, s: &str, wrap: f32| {
-                    ui.fonts(|f| f.layout_job(transcript_job(s, &ranges, color, hl, wrap)))
+                    ui.fonts(|f| f.layout_job(transcript_job(s, color, wrap)))
                 };
                 let out = egui::TextEdit::multiline(&mut text)
                     .id_salt(id_salt)
@@ -1795,76 +1862,19 @@ fn draw_transcript(
         .inner
 }
 
-fn apply_mark_presses(
-    markers: &mut MarkerState,
-    seen: &mut u32,
-    count: u32,
-    finals: Option<&str>,
-) -> Option<String> {
-    let mut presses = count.wrapping_sub(*seen);
-    *seen = count;
-    if presses == 0 {
-        return None;
-    }
-    if presses > 8 {
-        presses = 1;
-    }
-    let text = finals.unwrap_or("");
-    let len = text.len();
-    let mut to_copy = None;
-    for _ in 0..presses {
-        if let Some((s, e)) = markers.toggle(len) {
-            if let Some(slice) = text.get(s..e) {
-                if !slice.is_empty() {
-                    to_copy = Some(slice.to_string());
-                }
-            }
-        }
-    }
-    to_copy
-}
-
-fn transcript_job(
-    text: &str,
-    ranges: &[(usize, usize)],
-    color: egui::Color32,
-    hl: egui::Color32,
-    wrap: f32,
-) -> egui::text::LayoutJob {
+fn transcript_job(text: &str, color: egui::Color32, wrap: f32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
-    let n = text.len();
-    let mut cuts = vec![0usize, n];
-    for &(s, e) in ranges {
-        for mut b in [s.min(n), e.min(n)] {
-            while b > 0 && !text.is_char_boundary(b) {
-                b -= 1;
-            }
-            cuts.push(b);
-        }
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-    let font = egui::FontId::proportional(20.0);
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
-    for w in cuts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if a >= b {
-            continue;
-        }
-        let inside = ranges.iter().any(|&(s, e)| a >= s && a < e);
-        let bg = if inside { hl } else { egui::Color32::TRANSPARENT };
-        job.append(
-            &text[a..b],
-            0.0,
-            TextFormat {
-                font_id: font.clone(),
-                color,
-                background: bg,
-                ..Default::default()
-            },
-        );
-    }
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: egui::FontId::proportional(20.0),
+            color,
+            ..Default::default()
+        },
+    );
     job
 }
 
@@ -2075,65 +2085,3 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[cfg(test)]
-mod marker_tests {
-    use super::{apply_mark_presses, MarkerState};
-
-    #[test]
-    fn start_then_stop_makes_span() {
-        let mut m = MarkerState::default();
-        assert_eq!(m.toggle(5), None);
-        assert_eq!(m.active_start, Some(5));
-        assert_eq!(m.toggle(12), Some((5, 12)));
-        assert_eq!(m.spans, vec![(5, 12)]);
-        assert_eq!(m.active_start, None);
-    }
-
-    #[test]
-    fn markers_accumulate() {
-        let mut m = MarkerState::default();
-        m.toggle(0);
-        m.toggle(3);
-        m.toggle(5);
-        m.toggle(9);
-        assert_eq!(m.spans, vec![(0, 3), (5, 9)]);
-    }
-
-    #[test]
-    fn empty_span_not_recorded() {
-        let mut m = MarkerState::default();
-        m.toggle(4);
-        assert_eq!(m.toggle(4), None);
-        assert!(m.spans.is_empty());
-    }
-
-    #[test]
-    fn presses_start_grow_stop_copies_grown_slice() {
-        let mut m = MarkerState::default();
-        let mut seen = 0u32;
-        let t1 = "привет";
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, Some(t1)), None);
-        assert_eq!(m.active_start, Some(12));
-        let t2 = "привет мир";
-        let got = apply_mark_presses(&mut m, &mut seen, 2, Some(t2));
-        assert_eq!(got.as_deref(), Some(" мир"));
-        assert_eq!(m.spans, vec![(12, 19)]);
-    }
-
-    #[test]
-    fn no_new_presses_returns_none() {
-        let mut m = MarkerState::default();
-        let mut seen = 5u32;
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 5, Some("abc")), None);
-        assert_eq!(seen, 5);
-    }
-
-    #[test]
-    fn press_on_disabled_channel_no_panic() {
-        let mut m = MarkerState::default();
-        let mut seen = 0u32;
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, None), None);
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 2, None), None);
-        assert!(m.spans.is_empty());
-    }
-}

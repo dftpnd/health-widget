@@ -36,6 +36,12 @@ impl Chat {
         self.pending = pending;
     }
 
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.pending = false;
+        self.input.clear();
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
         if self.messages.is_empty() && !self.pending {
             ui.label(
