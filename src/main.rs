@@ -1,17 +1,3 @@
-//! health-widget — приватный always-on-top виджет показателей здоровья (Wayland).
-//!
-//! Идея приватности по слоям (подробно — в README):
-//!  * KDE Plasma 6.6+: окно помечается свойством KWin `excludeFromCapture` (KWin-скрипт
-//!    health-widget-exclude) — виджет виден локально, но НЕ попадает в захват. Лучший слой;
-//!    при нём авто-скрытие не нужно (HEALTH_AUTO_HIDE=0). Настраивается вне этого бинаря.
-//!  * Виджет — ОТДЕЛЬНОЕ окно. Если ты шаришь одно окно/приложение, он в захват не попадает.
-//!  * Авто-скрытие: фоновый поток детектит активный захват кросс-десктопно (PipeWire, а на
-//!    GNOME — резервно org.gnome.Mutter.ScreenCast) и прячет виджет сам (best-effort).
-//!  * SIGUSR1 мгновенно прячет/показывает виджет (повесь на него системный ярлык).
-//!
-//! Клиент на Wayland сам «не захватывать это окно» выставить не может. На KDE 6.6+ это делает
-//! KWin (слой выше); на GNOME системного флага нет — там работает «шарь одно окно» +
-//! авто-скрытие + хоткей.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -41,116 +27,72 @@ use config::Config;
 use data::Metrics;
 use transcript_log::TranscriptLog;
 
-/// Метки каналов для сохранения транскрипции (кто говорит): микрофон — «я»,
-/// звук созвона — «телемост» (собеседники).
 const CH_MIC: &str = "🎤 я";
 const CH_ZOOM: &str = "🔊 телемост";
 
-/// Размер угловой ручки ресайза (в точках).
 const GRIP: f32 = 16.0;
-/// Внутренние поля рамки виджета (в точках) — совпадают с Frame::inner_margin.
 const MARGIN: f32 = 12.0;
 
-/// Профили автопилота: (имя для `--profile` = аккаунт/резюме, подпись в UI).
-/// Первый — базовый (legacy-пути автопилота, уже залогиненный браузер).
 const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
     ("back", "Backend"),
     ("bulat", "Булат"),
 ];
 
-/// Строгость откликов: (ключ в state.json, подпись, порог косинуса к резюме).
-/// Порог уходит автопилоту как MIN_SIMILARITY — вакансии ниже него не откликаются.
-/// Значения по шкале модели эмбеддингов (косинусы пула ~0.14…0.69, медиана ~0.46):
-/// «Строго» 0.55 ≈ топ‑22%, «Средне» 0.50 ≈ топ‑37%, «Любые» 0.0 — весь пул.
 const PILOT_STRICTNESS: &[(&str, &str, f32)] = &[
     ("strict", "Строго", 0.55),
     ("medium", "Средне", 0.50),
     ("any", "Любые", 0.0),
 ];
-/// Пресет строгости по умолчанию (старое состояние без поля).
 const DEFAULT_STRICTNESS: &str = "medium";
 
-/// Ширина скрываемой чат-колонки (точки).
 const TERMINAL_W: f32 = 340.0;
 
-/// Путь к per-profile сводке откликов. БД вакансий общая, но история/счётчики —
-/// свои у каждого профиля: автопилот пишет `data/stats-<profile>.json`.
 fn profile_stats_path(autopilot_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
     autopilot_dir
         .join("data")
         .join(format!("stats-{profile}.json"))
 }
 
-/// Общее состояние между потоками и UI.
 struct Shared {
-    /// Хочет ли пользователь видеть виджет (тумблер по SIGUSR1).
     user_visible: AtomicBool,
-    /// Идёт ли захват экрана (ставит фоновый детектор).
     sharing_active: AtomicBool,
-    /// Позиция окна по данным KWin (Wayland не отдаёт её клиенту; опрашивает фоновый поток).
     pos: std::sync::Mutex<Option<(i32, i32)>>,
-    /// Запрошено корректное завершение (ставит поток SIGTERM/SIGINT). Обрабатывает update().
     shutdown: AtomicBool,
 }
 
-/// Идущий кол: id записи в БД и его название (для подписи кнопки/статуса).
 struct ActiveCall {
     id: i64,
     name: String,
 }
 
-/// Аудио-каналы (микрофон + звук программы/вывода) и их осциллограф: выбранные источники,
-/// списки для селекторов и переиспользуемый буфер снимка сэмплов.
 struct AudioState {
-    /// Канал микрофона (слушатель + осциллограф), None — выключен.
     mic: Option<audio::AudioMonitor>,
-    /// Канал звука программы/вывода (Zoom/Телемост/Discord…), None — выключен.
     zoom: Option<audio::AudioMonitor>,
-    /// Выбранный микрофон (имя источника; None — по умолчанию).
     mic_target: Option<String>,
-    /// Выбранная программа (node id; None — весь вывод = monitor по умолчанию).
     prog_target: Option<String>,
-    /// Списки для селекторов: микрофоны и играющие программы.
     mics: Vec<audio::Device>,
     programs: Vec<audio::Device>,
-    /// Переиспользуемый буфер снимка сэмплов (без аллокаций на кадр).
     scope: Vec<f32>,
 }
 
-/// Состояние автопилота (work-autopilot): процесс, желаемая фаза, профиль/строгость,
-/// статус старта и кэш счётчиков/групп из stats.json/scan.json.
 struct AutopilotState {
-    /// Процесс автопилота, None — не запущен. Один на профиль браузера.
     proc: Option<pilot::Pilot>,
-    /// Желаемая фаза (кнопки взаимоисключающи): чат / отклики / скан / ничего.
     want: Option<pilot::Phase>,
-    /// Профиль (аккаунт/резюме): "fullstack" | "back" | "bulat" — задаёт `--profile` и каталог данных.
     profile: String,
-    /// Строгость откликов ("strict"|"medium"|"any") — порог релевантности, уходит как MIN_SIMILARITY.
     strictness: String,
-    /// Короткое сообщение об ошибке старта (для показа под кнопками).
     status: String,
-    /// Счётчики (отклики/чаты) из stats.json + его mtime (перечитываем только при изменении).
     stats: Option<pilot_stats::PilotStats>,
     stats_mtime: Option<std::time::SystemTime>,
-    /// Группы скана + число новых вакансий из scan.json + его mtime.
     scan: Option<pilot_scan::ScanStatus>,
     scan_mtime: Option<std::time::SystemTime>,
-    /// Общий тумблер TG-уведомлений (из data/notify.json).
     notify_on: bool,
 }
 
-/// Снимок области экрана (кнопка «Скрин»): общий статус с грабером, запрос разметки и
-/// оверлей выбора двух точек.
 struct ShotState {
-    /// Статус последнего снимка: фоновый грабер пишет по завершении, UI читает каждый кадр.
     status: Arc<std::sync::Mutex<screenshot::ShotStatus>>,
-    /// Запрос начать разметку области (кнопка «Скрин» или SIGUSR2/Tartarus; читает update()).
     request: Arc<AtomicBool>,
-    /// Оверлей разметки сейчас открыт (ждём два клика).
     active: bool,
-    /// Точки-клики оверлея в физических пикселях экрана (нужно ровно две).
     points: Vec<[u32; 2]>,
 }
 
@@ -158,80 +100,42 @@ struct App {
     cfg: Config,
     shared: Arc<Shared>,
     metrics: Metrics,
-    /// Кэш времени модификации json для авто-reload.
     last_mtime: Option<std::time::SystemTime>,
-    /// Текущее фактическое состояние видимости окна (чтобы не слать команду каждый кадр).
     currently_visible: bool,
-    /// Хранилище полной транскрипции (SQLite): каждый финальный сегмент с временем и
-    /// каналом. None — БД не открылась (тогда пишется только бегущий хвост в UI).
     transcript_log: Option<Arc<TranscriptLog>>,
-    /// Активный кол (запись звука+текста обоих каналов), None — сейчас не пишем.
     active_call: Option<ActiveCall>,
-    /// Черновик названия следующего кола (вводится до старта записи).
     call_name_input: String,
-    /// Аудио-каналы (микрофон/программа) + осциллограф. См. [`AudioState`].
     audio: AudioState,
-    /// Закреплено ли окно «поверх всех» (keep-above через KWin).
     pinned: bool,
-    /// Автопилот: процесс, фаза, профиль, счётчики. См. [`AutopilotState`].
     autopilot: AutopilotState,
-    /// Состояние генерации ответа рекрутёру («Ответить HR»): фоновый поток пишет,
-    /// UI читает каждый кадр и кладёт готовый ответ в буфер обмена.
     hr_reply: Arc<std::sync::Mutex<hr_reply::HrReplyState>>,
-    /// Последнее сохранённое на диск состояние (чтобы не перезаписывать без изменений).
     last_saved: state::State,
-    /// Состояние предыдущего кадра + момент его появления — для дебаунса записи.
     prev_state: state::State,
     stable_since: Instant,
-    /// Снимок области экрана (кнопка «Скрин»). См. [`ShotState`].
     shot: ShotState,
-    /// Счётчики нажатий кнопок-маркеров транскрипции (RT-сигналы от Tartarus: физ. 10=микрофон,
-    /// 15=телемост). Сигнальный поток инкрементит, UI сравнивает с *_seen и обрабатывает
-    /// каждое новое нажатие как старт/стоп записи участка. Счётчик (а не булев тумблер) —
-    /// чтобы не терять нажатия и не зависеть от порядка кадров.
     mark_mic: Arc<AtomicU32>,
     mark_zoom: Arc<AtomicU32>,
-    /// Сколько нажатий уже обработано UI-потоком (микрофон/телемост).
     mark_mic_seen: u32,
     mark_zoom_seen: u32,
-    /// Запрос-тумблер курсора (хоткей SIGRTMIN+2). Сигнальный/tartarus-поток ставит флаг,
-    /// update() читает его и уводит курсор в центр виджета либо возвращает обратно.
     cursor_warp_request: Arc<AtomicBool>,
-    /// Нормированная (0..1) позиция курсора до того, как хоткей увёл его в центр виджета.
-    /// Повторное нажатие возвращает курсор сюда. За Mutex — заполняется в фоне; None — некуда.
     prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
-    /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
-    /// Встроенный терминал колонки. None до первого открытия колонки (ленивый старт shell).
     terminal: Option<terminal::Terminal>,
-    /// Открыта ли колонка терминала (иначе окно — одна колонка, как раньше).
     terminal_open: bool,
-    /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии колонки.
     width_one_col: Option<f32>,
-    /// Текущая ширина колонки терминала (точки) — сохраняется в state, восстанавливается при старте.
     terminal_width: f32,
-    /// Свёрнута ли секция «Автопилот» (сохраняется между запусками).
     autopilot_collapsed: bool,
-    /// Свёрнута ли секция «Показатели» (сохраняется между запусками).
     metrics_collapsed: bool,
 }
 
-/// Состояние маркеров транскрипции одного канала. Кнопка стартует запись (запоминаем
-/// байтовый офсет конца текста), повторное нажатие — стоп: диапазон уходит в `spans`
-/// (подсветка остаётся навсегда), а текст участка копируется в буфер. Пока запись идёт,
-/// подсвечивается растущий диапазон `active_start..конец`. Несколько маркеров копятся.
 #[derive(Default)]
 struct MarkerState {
-    /// Завершённые маркеры — байтовые диапазоны [start, end) в накопленном тексте.
     spans: Vec<(usize, usize)>,
-    /// Старт текущей записи (байтовый офсет), None — сейчас не пишем.
     active_start: Option<usize>,
 }
 
 impl MarkerState {
-    /// Обработать одно нажатие кнопки при текущей длине текста `len` (в байтах).
-    /// Возвращает диапазон для копирования, если это был «стоп».
     fn toggle(&mut self, len: usize) -> Option<(usize, usize)> {
         match self.active_start.take() {
             None => {
@@ -253,10 +157,8 @@ impl MarkerState {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: Config, shared: Arc<Shared>, st: state::State) -> Self {
-        // Стартовая загрузка данных.
         let (metrics, last_mtime) = data::load(&cfg.json_path);
 
-        // Профиль автопилота из состояния (старое состояние без поля → базовый fullstack).
         let pilot_profile = st
             .pilot_profile
             .clone()
@@ -266,24 +168,14 @@ impl App {
             .clone()
             .unwrap_or_else(|| DEFAULT_STRICTNESS.to_string());
 
-        // Статус снимка экрана — общий для UI (кнопка «Скрин») и грабера.
         let shot_status: Arc<std::sync::Mutex<screenshot::ShotStatus>> =
             Arc::new(std::sync::Mutex::new(screenshot::ShotStatus::Idle));
-        // Запрос разметки области — ставят кнопка «Скрин» и SIGUSR2, читает update().
         let shot_request = Arc::new(AtomicBool::new(false));
 
-        // Счётчики нажатий кнопок-маркеров (RT-сигналы от Tartarus: 10=микрофон, 15=телемост).
         let mark_mic = Arc::new(AtomicU32::new(0));
         let mark_zoom = Arc::new(AtomicU32::new(0));
-        // Запрос-тумблер курсора — ставит SIGRTMIN+2 (кнопка Tartarus), читает update().
         let cursor_warp_request = Arc::new(AtomicBool::new(false));
 
-        // Поток обработки сигналов: SIGUSR1 — тумблер видимости; SIGUSR2 — начать
-        // разметку области под снимок (кнопка «Скрин»); SIGRTMIN+0/+1/+2 — выделение
-        // микрофона/телемоста и тумблер курсора. Раньше эти сигналы слал внешний сервис
-        // tartarus (`pkill --signal`); теперь клавиши Tartarus обрабатывает модуль
-        // `tartarus` прямо в процессе (см. tartarus::spawn ниже), а сигналы остаются
-        // рабочими для внешних ярлыков и совместимости.
         {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
@@ -291,8 +183,6 @@ impl App {
             let mark_mic = mark_mic.clone();
             let mark_zoom = mark_zoom.clone();
             let cursor_warp_request = cursor_warp_request.clone();
-            // SIGRTMIN зависит от glibc (обычно 34); вычисляем один раз, тем же значением
-            // Tartarus шлёт `pkill --signal 34/35/36`.
             let rt_mic = libc::SIGRTMIN();
             let rt_zoom = libc::SIGRTMIN() + 1;
             let rt_cursor_warp = libc::SIGRTMIN() + 2;
@@ -333,10 +223,6 @@ impl App {
             });
         }
 
-        // Логика бывшего внешнего сервиса `tartarus`, перенесённая в виджет: захват
-        // клавиатуры Tartarus Pro + ремап на F13–F24 + RGB. Клавиши-действия (5/R/F/
-        // Space) пишут в те же атомики, что и обработчик сигналов выше, поэтому и
-        // внутренний хват клавиатуры, и внешние сигналы работают одинаково.
         tartarus::spawn(tartarus::Handles {
             shot_request: shot_request.clone(),
             mark_mic: mark_mic.clone(),
@@ -345,10 +231,6 @@ impl App {
             ctx: cc.egui_ctx.clone(),
         });
 
-        // Поток корректного завершения по SIGTERM/SIGINT: ставит флаг и будит UI. Саму
-        // очистку (гашение автопилота → закрытие браузера → снятие lock профиля) делает
-        // update() на главном потоке, где живёт self.autopilot.proc. Без этого голый SIGTERM убил
-        // бы GUI мгновенно, без Drop, осиротив автопилот с залоченным профилем браузера.
         {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
@@ -365,7 +247,6 @@ impl App {
             });
         }
 
-        // Поток детекта screencast (если включено и busctl доступен).
         if cfg.auto_hide_on_share && detect::available() {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
@@ -380,8 +261,6 @@ impl App {
             });
         }
 
-        // Восстановление позиции/закрепления через KWin — с задержкой и повтором: на первом
-        // кадре окно ещё не размещено, и начальная раскладка KWin перебивает наш set_position.
         {
             let want_pin = st.pinned;
             let pos = st.x.zip(st.y).map(|(x, y)| (x as i32, y as i32));
@@ -401,7 +280,6 @@ impl App {
             }
         }
 
-        // Поток опроса позиции окна через KWin (Wayland не даёт её клиенту напрямую).
         {
             let shared = shared.clone();
             std::thread::spawn(move || loop {
@@ -414,8 +292,6 @@ impl App {
             });
         }
 
-        // Скан-статус (группы + счётчики) в фоне: шеллим `autopilot scan-status`, чтобы
-        // кнопки групп появились в блоке автопилота ещё до первого запуска скана.
         if cfg.autopilot_bin.exists() {
             let dir = cfg.autopilot_dir.clone();
             let bin = cfg.autopilot_bin.clone();
@@ -427,12 +303,8 @@ impl App {
             });
         }
 
-        // Хранилище полной транскрипции (общее на оба канала за сеанс). None — БД не
-        // открылась, тогда транскрипция работает как раньше (только бегущий хвост в UI).
         let transcript_log = TranscriptLog::open().map(Arc::new);
 
-        // Восстанавливаем ранее включённые каналы (микрофон — с сохранённым устройством;
-        // программа эфемерна, поэтому zoom-канал стартует с «весь вывод» = monitor по умолчанию).
         let mic = if st.mic_on {
             audio::AudioMonitor::start(st.mic_target.as_deref(), CH_MIC, transcript_log.clone())
         } else {
@@ -470,8 +342,6 @@ impl App {
             },
             pinned: st.pinned,
             autopilot: AutopilotState {
-                // Автопилот НЕ восстанавливаем при старте (боевой режим шлёт реальные отклики):
-                // кнопки всегда стартуют неактивными, запуск — только по явному клику.
                 proc: None,
                 want: None,
                 profile: pilot_profile,
@@ -510,17 +380,14 @@ impl App {
         }
     }
 
-    /// Запустить zoom-канал: выбранная программа (node id) или, если не выбрана, весь вывод.
     fn start_program(&self) -> Option<audio::AudioMonitor> {
         let target = self.audio.prog_target.clone().or_else(audio::default_monitor);
         audio::AudioMonitor::start(target.as_deref(), CH_ZOOM, self.transcript_log.clone())
     }
 
-    /// Начать кол: создать запись в БД (название + дата), включить запись дорожек активных
-    /// каналов и пометить транскрипцию этим колом.
     fn start_call(&mut self) {
         let Some(log) = self.transcript_log.clone() else {
-            return; // без БД кол не завести
+            return;
         };
         let name = match self.call_name_input.trim() {
             "" => "без названия".to_string(),
@@ -533,7 +400,6 @@ impl App {
         self.reconcile_call_recording();
     }
 
-    /// Завершить кол: остановить запись дорожек (WAV финализируется) и проставить время конца.
     fn end_call(&mut self) {
         let Some(call) = self.active_call.take() else {
             return;
@@ -549,9 +415,6 @@ impl App {
         }
     }
 
-    /// Привести запись дорожек в соответствие активному колу: каждый включённый канал,
-    /// который ещё не пишется, начинает писать свою дорожку (mic.wav / zoom.wav). Вызывается
-    /// при старте кола и после смены каналов — так канал, включённый по ходу кола, тоже пишется.
     fn reconcile_call_recording(&self) {
         let (Some(call), Some(log)) = (&self.active_call, &self.transcript_log) else {
             return;
@@ -574,7 +437,6 @@ impl App {
         }
     }
 
-    /// Порог релевантности (MIN_SIMILARITY) для текущего пресета строгости.
     fn pilot_min_sim(&self) -> f32 {
         PILOT_STRICTNESS
             .iter()
@@ -583,30 +445,21 @@ impl App {
             .unwrap_or(0.0)
     }
 
-    /// Привести процесс автопилота в соответствие с желаемой фазой (`want`).
-    /// None → гасим. Иначе, если процесса нет или фаза изменилась → (пере)запуск.
-    /// Один браузер-профиль/окно → всегда ровно один процесс, смена фазы = рестарт.
     fn reconcile_pilot(&mut self) {
         let desired = match self.autopilot.want.clone() {
             None => {
-                self.autopilot.proc = None; // Drop мягко гасит процесс и закрывает браузер
+                self.autopilot.proc = None;
                 return;
             }
             Some(p) => p,
         };
-        // Ничего не делаем, только если совпали И фаза, И профиль (аккаунт): смена
-        // любого требует перезапуска — это другой браузер/окно.
         let same_phase = self.autopilot.proc.as_ref().map(|p| p.phase()) == Some(&desired);
         let same_profile =
             self.autopilot.proc.as_ref().map(|p| p.profile()) == Some(Some(self.autopilot.profile.as_str()));
-        // Порог релевантности тоже фиксируется при старте — его смена требует рестарта.
         let same_sim = self.autopilot.proc.as_ref().map(|p| p.min_sim()) == Some(self.pilot_min_sim());
         if same_phase && same_profile && same_sim {
-            return; // уже крутится в нужной фазе, профиле и строгости
+            return;
         }
-        // Сперва гасим старую фазу (Drop → SIGTERM → браузер закрывается, профиль
-        // освобождается), и только потом стартуем новую — иначе новый Chromium
-        // поднимется на занятом профиле и уронит старый (TargetClosedError).
         self.autopilot.proc = None;
         self.autopilot.proc = pilot::Pilot::start(
             &self.cfg.autopilot_dir,
@@ -616,7 +469,6 @@ impl App {
             Some(self.pilot_min_sim()),
         );
         if self.autopilot.proc.is_none() {
-            // Не стартовал — сбрасываем кнопки и показываем причину.
             self.autopilot.want = None;
             self.autopilot.status = "не удалось запустить автопилот".to_string();
         } else {
@@ -624,17 +476,13 @@ impl App {
         }
     }
 
-    /// Собрать текущее состояние для сохранения (размер/позиция/источник/закрепление).
     fn current_state(&self, ctx: &egui::Context) -> state::State {
         let size = ctx.screen_rect().size();
-        // Сохраняем ширину «одной колонки»: если колонка терминала открыта, окно шире на неё —
-        // вычитаем её, чтобы при старте (колонка закрыта) окно вернулось к правильной ширине.
         let win_w = if self.terminal_open {
             (size.x - self.terminal_width).max(200.0)
         } else {
             size.x
         };
-        // Позицию берём из KWin (её опрашивает фоновый поток); нет данных — держим прежнюю.
         let (x, y) = match self.shared.pos.lock().ok().and_then(|g| *g) {
             Some((px, py)) => (Some(px as f32), Some(py as f32)),
             None => (self.last_saved.x, self.last_saved.y),
@@ -657,7 +505,6 @@ impl App {
         }
     }
 
-    /// Пере-читать json, если файл изменился.
     fn maybe_reload(&mut self) {
         if let Ok(meta) = std::fs::metadata(&self.cfg.json_path) {
             if let Ok(mtime) = meta.modified() {
@@ -668,29 +515,22 @@ impl App {
                 }
             }
         }
-        // Счётчики откликов профиля (stats-<profile>.json) — свои у каждого аккаунта.
         let stats_path = profile_stats_path(&self.cfg.autopilot_dir, &self.autopilot.profile);
         let mtime = std::fs::metadata(&stats_path).and_then(|m| m.modified()).ok();
         if mtime != self.autopilot.stats_mtime {
             self.autopilot.stats = pilot_stats::load(&stats_path);
             self.autopilot.stats_mtime = mtime;
         }
-        // Статус скана (scan.json) — общий пул на все профили. По mtime: во время скана
-        // число растёт; виджет подхватывает без опроса содержимого.
         let scan_path = self.cfg.autopilot_dir.join("data").join("scan.json");
         let scan_mtime = std::fs::metadata(&scan_path).and_then(|m| m.modified()).ok();
         if scan_mtime != self.autopilot.scan_mtime {
             self.autopilot.scan = pilot_scan::load(&scan_path);
             self.autopilot.scan_mtime = scan_mtime;
         }
-        // Тумблер уведомлений (дёшево — читаем на каждой перезагрузке метрик).
         self.autopilot.notify_on =
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
     }
 
-    /// Полноэкранный прозрачный оверлей разметки области под снимок. Ловит два
-    /// клика (в физических пикселях экрана), рисует крестики на отмеченном; по
-    /// второму клику закрывается и отдаёт прямоугольник граберу. Esc — отмена.
     fn show_shot_overlay(&mut self, ctx: &egui::Context) {
         let vb = egui::ViewportBuilder::default()
             .with_title("health-widget-shot")
@@ -701,7 +541,6 @@ impl App {
             .with_mouse_passthrough(false);
         let id = egui::ViewportId::from_hash_of("hw-shot-overlay");
 
-        // Итог кадра: None — ещё размечаем; Some(None) — отмена; Some(Some(rect)).
         let mut done: Option<Option<[u32; 4]>> = None;
 
         ctx.show_viewport_immediate(id, vb, |octx, _class| {
@@ -715,9 +554,6 @@ impl App {
                     .flatten()
             });
 
-            // Полностью прозрачный оверлей: экран выглядит как обычно (без вуали и
-            // меток), но окно ловит клики (mouse_passthrough=false). Пустой frame с
-            // прозрачной заливкой — на экране ничего не рисуем.
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::default()
@@ -725,13 +561,11 @@ impl App {
                         .fill(egui::Color32::TRANSPARENT),
                 )
                 .show(octx, |ui| {
-                    // Сенс на всю площадь — гарантируем, что окно принимает клики.
                     ui.allocate_response(ui.available_size(), egui::Sense::click());
                 });
 
             if done.is_none() {
                 if let Some(pos) = click {
-                    // Логические координаты (как геометрия окон KWin) — их ждёт CaptureArea.
                     let px = [pos.x.round().max(0.0) as u32, pos.y.round().max(0.0) as u32];
                     self.shot.points.push(px);
                     if self.shot.points.len() >= 2 {
@@ -761,9 +595,7 @@ impl App {
             }
         }
     }
-    /// Строка заголовка: название, тумблеры «поверх всех»/терминал, версия сборки.
     fn draw_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Строка заголовка: слева — название, справа — кнопка «поверх всех» (📌).
         let title = self.metrics.title.clone();
         let pinned = self.pinned;
         let mut toggle_pin = false;
@@ -793,7 +625,6 @@ impl App {
                 {
                     toggle_terminal = true;
                 }
-                // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
                 ui.label(
                     egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
@@ -834,9 +665,7 @@ impl App {
         ui.add_space(2.0);
     }
 
-    /// Секция «Звук и транскрипция»: два канала (микрофон/программа) с тумблерами и селекторами.
     fn draw_sound(&mut self, ui: &mut egui::Ui) {
-        // Два канала: микрофон и программа/вывод. У каждого — тумблер + селектор.
         let mic_on = self.audio.mic.is_some();
         let zoom_on = self.audio.zoom.is_some();
         let mic_target = self.audio.mic_target.clone();
@@ -851,7 +680,6 @@ impl App {
         let mut refresh_mic = false;
 
         section(ui, "🎧 Звук и транскрипция", |ui| {
-        // Строка 1 — микрофон: тумблер + выбор устройства.
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(mic_on, "🎤")
@@ -860,7 +688,6 @@ impl App {
             {
                 toggle_mic = true;
             }
-            // Подпись селектора отражает состояние: выключен — «⊘ выключено».
             let cur = if mic_on {
                 device_label(&mic_target, &self.audio.mics, "🎤 по умолчанию")
             } else {
@@ -870,7 +697,6 @@ impl App {
                 .width(150.0)
                 .selected_text(egui::RichText::new(cur).size(11.0))
                 .show_ui(ui, |ui| {
-                    // Первый пункт — отключить источник.
                     if ui.selectable_label(!mic_on, "⊘ выключено").clicked() {
                         mic_off = true;
                     }
@@ -889,7 +715,6 @@ impl App {
             }
         });
 
-        // Строка 2 — программа/вывод: тумблер + выбор программы + обновление списка.
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(zoom_on, "🔊")
@@ -926,9 +751,8 @@ impl App {
                 refresh = true;
             }
         });
-        }); // конец блока «Звук»
+        });
 
-        // Применяем изменения выбора/тумблеров.
         if refresh {
             self.audio.mics = audio::list_mics();
             self.audio.programs = audio::list_programs();
@@ -936,7 +760,6 @@ impl App {
         if refresh_mic {
             self.audio.mics = audio::list_mics();
         }
-        // Выбор устройства в списке = включить канал на нём (start и когда был выключен).
         if let Some(sel) = new_mic {
             self.audio.mic_target = sel;
             self.audio.mic = audio::AudioMonitor::start(self.audio.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
@@ -945,7 +768,6 @@ impl App {
             self.audio.prog_target = sel;
             self.audio.zoom = self.start_program();
         }
-        // Пункт «⊘ выключено» — погасить канал.
         if mic_off {
             self.audio.mic = None;
         }
@@ -969,11 +791,7 @@ impl App {
         ui.add_space(2.0);
     }
 
-    /// Строка «Кол» (запись звонка) + «Скрин» (снимок области) в две колонки.
     fn draw_call_and_screen(&mut self, ui: &mut egui::Ui) {
-        // Кол + Скрин в одной линии, по 50% ширины каждому. Слева — запись
-        // звонка (две дорожки WAV + транскрипт), справа — снимок области экрана
-        // через Spectacle. Каналы могли смениться выше — приводим запись к колу.
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
@@ -1072,11 +890,7 @@ impl App {
         ui.add_space(2.0);
     }
 
-    /// Секция «Автопилот»: фазы (чат/отклики/скан/обогащение), профиль, строгость, статус.
     fn draw_autopilot(&mut self, ui: &mut egui::Ui) {
-        // Автопилот: взаимоисключающие тумблеры фаз (чат / отклики / скан группы) +
-        // «Выключить»/«Пауза». Одно окно браузера → одна фаза за раз, любой выбор
-        // (пере)запускает процесс. Показываем только если бинарь установлен.
         if self.cfg.autopilot_bin.exists() {
             use pilot::Phase;
             let mut new_want: Option<Option<Phase>> = None;
@@ -1085,8 +899,6 @@ impl App {
             let mut toggle_pause = false;
             let running = self.autopilot.want.is_some();
             let paused = self.autopilot.proc.as_ref().is_some_and(|p| p.is_paused());
-            // Краткий статус: пауза → явная метка, иначе последняя строка лога
-            // автопилота либо сообщение об ошибке.
             let status = if paused {
                 "⏸ на паузе".to_string()
             } else {
@@ -1097,8 +909,6 @@ impl App {
             };
             let mut ap_collapsed = self.autopilot_collapsed;
             section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
-                // Профиль (аккаунт/резюме): под кем работает автопилот. Смена —
-                // перезапуск под другой аккаунт браузера (свой логин, свои счётчики).
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
                         "Профиль автопилота: аккаунт браузера, резюме и контакты",
@@ -1130,7 +940,6 @@ impl App {
                         .on_hover_text("Автопилот: вести чаты с работодателями")
                         .clicked()
                     {
-                        // Повторный клик по активной — выключить; иначе переключить.
                         new_want = Some(if self.autopilot.want == Some(Phase::Chat) {
                             None
                         } else {
@@ -1148,8 +957,6 @@ impl App {
                             Some(Phase::Apply)
                         });
                     }
-                    // Справа: «Выключить» (гасит фазу) и «Пауза» (заморозить/
-                    // продолжить на месте). В right_to_left первым идёт правый край.
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -1199,8 +1006,6 @@ impl App {
                         }
                     }
                 });
-                // «Ответить HR»: текст рекрутёра из буфера → LLM (профиль на выбор)
-                // → ответ обратно в буфер. Генерация в фоне, пока идёт — спиннер.
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let running = matches!(
@@ -1251,10 +1056,6 @@ impl App {
                         _ => {}
                     }
                 });
-                // Строгость откликов: порог релевантности вакансии к резюме.
-                // «Любые» — весь пул по очереди похожести; «Строго/Средне» —
-                // откликаться только на достаточно близкое. Уходит автопилоту как
-                // MIN_SIMILARITY; смена на ходу перезапускает фазу откликов.
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("🎯 Отклик на:").size(11.0))
@@ -1278,10 +1079,6 @@ impl App {
                             new_strictness = Some((*key).to_string());
                         }
                     }
-                    // Старт/стоп откликов прямо в ряду строгости: «выбрал порог →
-                    // нажал» одним жестом. Это та же фаза, что и «📨 Отклики» сверху
-                    // (обе подсвечиваются вместе). Запускает разбор пула по
-                    // соответствию резюме с выбранным порогом.
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -1302,14 +1099,9 @@ impl App {
                         },
                     );
                 });
-                // Скан по группам: своя кнопка-тумблер на каждую группу поиска
-                // (из scan.json). В скобках — число новых (ещё не отработанных)
-                // вакансий в очереди. Клик запускает скан группы, повторный —
-                // останавливает; скан гаснет и сам, дойдя до конца выдачи.
                 if let Some(scan) = &self.autopilot.scan {
                     if !scan.groups.is_empty() {
                         ui.add_space(2.0);
-                        // «Все группы» — один процесс сканирует группы по очереди.
                         let total: i64 = scan.groups.iter().map(|g| g.pending).sum();
                         if ui
                             .selectable_label(
@@ -1351,10 +1143,6 @@ impl App {
                         });
                     }
                 }
-                // Дообогащение пула: открыть необогащённые вакансии и сохранить
-                // полное описание + дату публикации + вектор (для точного подбора
-                // под резюме). Разовая фаза-тумблер; пока идёт — спиннер загрузки.
-                // Число в скобках — остаток необогащённых (из scan.json).
                 if let Some(scan) = &self.autopilot.scan {
                     let enrich_active = self.autopilot.want == Some(Phase::Enrich);
                     if enrich_active || scan.unenriched > 0 {
@@ -1379,8 +1167,6 @@ impl App {
                                     Some(Phase::Enrich)
                                 });
                             }
-                            // Индикатор загрузки, пока обогащение идёт (Spinner сам
-                            // просит перерисовку — статус-лог ниже тикает вживую).
                             if enrich_active {
                                 ui.add(egui::Spinner::new().size(14.0));
                             }
@@ -1401,7 +1187,6 @@ impl App {
                     );
                     ui.label(job);
                 }
-                // Счётчики: сколько откликов и обработанных чатов (из stats.json).
                 if let Some(s) = &self.autopilot.stats {
                     let color = egui::Color32::from_rgb(150, 160, 175);
                     ui.label(
@@ -1425,22 +1210,15 @@ impl App {
             self.autopilot_collapsed = ap_collapsed;
             if let Some(p) = new_profile {
                 self.autopilot.profile = p;
-                // Счётчики откликов свои у каждого профиля — сбрасываем кэш, чтобы
-                // maybe_reload перечитал stats нового аккаунта. Пул (scan.json)
-                // общий, но mtime тоже сбросим — перечитается при следующем кадре.
                 self.autopilot.scan_mtime = None;
                 self.autopilot.stats = None;
                 self.autopilot.stats_mtime = None;
-                // Если автопилот запущен — перезапустить под новый аккаунт.
                 if self.autopilot.want.is_some() {
                     self.reconcile_pilot();
                 }
             }
             if let Some(s) = new_strictness {
                 self.autopilot.strictness = s;
-                // Порог читается автопилотом при старте. Если сейчас крутятся
-                // отклики — перезапустить с новым MIN_SIMILARITY; иначе применится
-                // при следующем запуске фазы откликов.
                 if self.autopilot.want == Some(Phase::Apply) {
                     self.reconcile_pilot();
                 }
@@ -1461,7 +1239,6 @@ impl App {
         }
     }
 
-    /// Секция «Показатели»: список метрик из JSON либо сообщение об отсутствии данных.
     fn draw_metrics(&mut self, ui: &mut egui::Ui) {
         if !self.metrics.items.is_empty() || self.metrics.title.is_none() {
             let mut metrics_collapsed = self.metrics_collapsed;
@@ -1498,11 +1275,7 @@ impl App {
         }
     }
 
-    /// Обработать нажатия кнопок-маркеров транскрипции (старт/стоп участка → буфер).
     fn process_marker_presses(&mut self) {
-        // Кнопки-маркеры транскрипции (RT-сигналы Tartarus): обрабатываем каждое новое
-        // нажатие как старт/стоп записи участка. На «стоп» — текст участка в буфер обмена;
-        // сами диапазоны-маркеры хранятся в markers_* и рисуются в draw_transcript.
         let c_mic = self.mark_mic.load(Ordering::Relaxed);
         let mic_finals = self.audio.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
         if let Some(txt) = apply_mark_presses(
@@ -1525,9 +1298,7 @@ impl App {
         }
     }
 
-    /// Осциллограммы активных каналов с подписями, бейджами записи и лентой транскрипта.
     fn draw_scopes(&mut self, ui: &mut egui::Ui) {
-        // Осциллограммы активных каналов (у каждого — своя подпись и цвет).
         if self.audio.mic.is_some() || self.audio.zoom.is_some() {
             section(ui, "📈 Осциллограммы", |ui| {
                 if let Some(mon) = &self.audio.mic {
@@ -1563,16 +1334,12 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Полностью прозрачный фон окна — сам виджет рисует свою подложку.
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Корректное завершение по SIGTERM/SIGINT: сперва штатно гасим автопилот
-        // (reconcile_pilot с want=None → Drop у Pilot → закрытие браузера, снятие lock),
-        // затем закрываем окно — событийный цикл выйдет, процесс завершится чисто.
         if self.shared.shutdown.load(Ordering::Relaxed) {
-            self.end_call(); // финализируем WAV-дорожки и проставляем время конца кола
+            self.end_call();
             self.autopilot.want = None;
             self.reconcile_pilot();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1581,8 +1348,6 @@ impl eframe::App for App {
 
         self.maybe_reload();
 
-        // Снимок области: запрос от кнопки «Скрин» или SIGUSR2 (Tartarus) открывает
-        // прозрачный оверлей разметки; пока он активен — рисуем его каждый кадр.
         if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
             self.shot.active = true;
             self.shot.points.clear();
@@ -1592,18 +1357,13 @@ impl eframe::App for App {
             self.show_shot_overlay(ctx);
         }
 
-        // Хоткей SIGRTMIN+2 — тумблер КУРСОРА (в фоне — не блокируем UI; чтение позиции/центра
-        // идёт через KWin+journal и подтормаживает). Первое нажатие: запомнить позицию курсора и
-        // увести его в центр виджета; повтор: вернуть курсор туда, где он был.
         if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
             let cslot = self.prev_cursor.clone();
             std::thread::spawn(move || {
                 let mut slot = cslot.lock().unwrap();
                 if let Some((nx, ny)) = slot.take() {
-                    // Повтор: вернуть курсор.
                     winctl::warp_cursor_norm(nx, ny);
                 } else {
-                    // Первое нажатие: запомнить текущую позицию и увести в центр виджета.
                     *slot = winctl::cursor_pos_norm();
                     if let Some((nx, ny)) = winctl::widget_center_norm() {
                         winctl::warp_cursor_norm(nx, ny);
@@ -1612,9 +1372,6 @@ impl eframe::App for App {
             });
         }
 
-        // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
-        // (скан/обогащение) завершаются сами, дойдя до конца, — сообщаем об этом,
-        // а не «остановлен».
         if self.autopilot.proc.as_mut().is_some_and(|p| !p.alive()) {
             let done_msg = match self.autopilot.proc.as_ref().map(|p| p.phase()) {
                 Some(pilot::Phase::Scan(_)) | Some(pilot::Phase::ScanAll) => Some("скан завершён"),
@@ -1626,7 +1383,6 @@ impl eframe::App for App {
             self.autopilot.status = done_msg.unwrap_or("автопилот остановлен").to_string();
         }
 
-        // Итоговая видимость = пользователь хочет И (не идёт шаринг ИЛИ авто-скрытие выключено).
         let want_visible = self.shared.user_visible.load(Ordering::Relaxed)
             && !(self.cfg.auto_hide_on_share && self.shared.sharing_active.load(Ordering::Relaxed));
 
@@ -1653,19 +1409,14 @@ impl eframe::App for App {
                             .get_or_insert_with(|| terminal::Terminal::new(ctx));
                         term.ui(ui);
                     });
-                // Запоминаем фактическую ширину колонки (юзер мог перетянуть) для сохранения.
                 self.terminal_width = resp.response.rect.width();
             }
 
             let inner = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                 let panel = ui.max_rect();
-                // Угол ресайза (правый-нижний) — резервируем под ручку, чтобы drag-move его не крал.
                 let grip_rect =
                     egui::Rect::from_min_max(panel.max - egui::vec2(GRIP, GRIP), panel.max);
 
-                // Тащить окно за любое пустое место подложки (декораций нет). На Wayland
-                // клиент не может сам себя переместить — просим композитор начать интерактивный
-                // move. Лейблы (только hover) drag не мешают; угол ресайза — исключаем.
                 let drag =
                     ui.interact(panel, ui.id().with("drag-move"), egui::Sense::click_and_drag());
                 if drag.drag_started()
@@ -1692,15 +1443,11 @@ impl eframe::App for App {
 
                 self.draw_scopes(ui);
 
-                // Ручка ресайза в правом-нижнем углу: тянешь — композитор растягивает окно.
                 draw_resize_grip(ui, ctx, grip_rect);
 
-                // Желаемый размер контента (может превышать окно, если что-то не влезло).
                 ui.min_rect().size()
             });
 
-            // Авто-подгон: окно не меньше своего контента, чтобы ничего не обрезалось.
-            // Растём при нехватке места; вручную увеличенный размер сохраняем (не ужимаем).
             let content = inner.inner + egui::vec2(2.0 * MARGIN, 2.0 * MARGIN);
             let cur = ctx.screen_rect().size();
             let target = egui::vec2(content.x.max(cur.x), content.y.max(cur.y));
@@ -1709,8 +1456,6 @@ impl eframe::App for App {
             }
         }
 
-        // Сохранение состояния с дебаунсом: пишем на диск, только когда значения устоялись
-        // (≥700мс без изменений) и отличаются от записанного — не дёргаем ФС во время drag/resize.
         let now = Instant::now();
         let cur = self.current_state(ctx);
         if cur != self.prev_state {
@@ -1722,16 +1467,12 @@ impl eframe::App for App {
             self.last_saved = cur;
         }
 
-        // Осциллографу нужен плавный кадр (~30fps); иначе редкий тик (500мс) обслуживает и
-        // авто-reload, и опрос автопилота (обновить статус, поймать его завершение).
         let scope_active = self.audio.mic.is_some() || self.audio.zoom.is_some();
         let interval = if want_visible && scope_active { 33 } else { 500 };
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 }
 
-/// Блок виджета: рамка с бордером, заголовком-подписью и внутренними отступами.
-/// Раскладывает содержимое на всю ширину панели, чтобы рамки блоков были одинаковыми.
 fn section<R>(
     ui: &mut egui::Ui,
     title: &str,
@@ -1740,8 +1481,6 @@ fn section<R>(
     section_impl(ui, title, None, add_contents)
 }
 
-/// Как [`section`], но с иконкой сворачивания справа от заголовка. Клик по заголовку
-/// или иконке переключает `collapsed`; вызывающий хранит этот флаг (и может его сохранять).
 fn section_collapsible<R>(
     ui: &mut egui::Ui,
     title: &str,
@@ -1812,7 +1551,6 @@ fn section_impl<R>(
         .inner
 }
 
-/// Подпись селектора: описание выбранного устройства/потока либо дефолтная подпись.
 fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) -> String {
     match target {
         None => default.to_string(),
@@ -1824,7 +1562,6 @@ fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) 
     }
 }
 
-/// Нарисовать осциллограмму сэмплов в строку фиксированной высоты заданным цветом.
 fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
@@ -1847,16 +1584,12 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
         })
         .collect();
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
-    // Осевая линия для наглядности тишины.
     painter.line_segment(
         [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
         egui::Stroke::new(0.5, egui::Color32::from_rgb(40, 44, 52)),
     );
 }
 
-/// Мигающий индикатор активной записи маркера (кнопка Tartarus нажата один раз, ждём второго).
-/// Рисуется в строке заголовка канала, чтобы был виден независимо от прокрутки транскрипта.
-/// Пусто, если запись маркера сейчас не идёт.
 fn marker_recording_badge(ui: &mut egui::Ui, markers: &MarkerState) {
     if markers.active_start.is_some() {
         let pulse = 0.5 + 0.5 * (ui.input(|i| i.time) * 3.0).sin() as f32;
@@ -1868,12 +1601,6 @@ fn marker_recording_badge(ui: &mut egui::Ui, markers: &MarkerState) {
     }
 }
 
-/// Показать онлайн-транскрипцию под осциллографом канала: накопленный текст в
-/// прокручиваемой области (остаётся на месте, можно выделить и скопировать), текущую
-/// незавершённую гипотезу — приглушённо отдельной строкой. `data` = None — распознавание
-/// для канала не запущено (нет venv/модели) → ничего не рисуем. `id_salt` разводит
-/// состояние прокрутки/выделения двух каналов (микрофон/Zoom). `markers` — участки,
-/// отмеченные кнопкой с макро-клавиатуры (Tartarus): их фон подсвечивается цветом канала.
 fn draw_transcript(
     ui: &mut egui::Ui,
     data: Option<(String, String)>,
@@ -1886,7 +1613,6 @@ fn draw_transcript(
         None => return,
     };
     if finals.is_empty() && partial.is_empty() {
-        // Пока тишина/прогрев — тонкая подсказка, чтобы канал не выглядел «сломанным».
         ui.label(
             egui::RichText::new("… слушаю")
                 .size(11.0)
@@ -1896,8 +1622,6 @@ fn draw_transcript(
         return;
     }
     ui.add_space(2.0);
-    // Прокручиваемая область фиксированной высоты: держимся низа (следим за новым текстом),
-    // но стоит прокрутить вверх для выделения — остаёмся на месте, текст не «уезжает».
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
         .max_height(140.0)
@@ -1905,11 +1629,6 @@ fn draw_transcript(
         .stick_to_bottom(true)
         .show(ui, |ui| {
             if !finals.is_empty() {
-                // Выделяемый текст. По факту read-only: правки в scratch-копию не сохраняем
-                // (перезаписываем каждый кадр из finals). Как только выделение завершено
-                // (отпустили мышь) — выделенное сразу в буфер обмена, без Ctrl+C.
-                // Диапазоны-маркеры (кнопка Tartarus) подсвечиваются фоном через кастомный
-                // layouter: завершённые участки + активная запись, растущая до конца текста.
                 let mut text = finals.clone();
                 let hl = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
                 let mut ranges: Vec<(usize, usize)> = markers.spans.clone();
@@ -1942,7 +1661,6 @@ fn draw_transcript(
                     }
                 }
             }
-            // Текущая (незавершённая) гипотеза — приглушённо, отдельной строкой, не копируем.
             if !partial.is_empty() {
                 ui.label(
                     egui::RichText::new(&partial)
@@ -1954,9 +1672,6 @@ fn draw_transcript(
         });
 }
 
-/// Обработать накопившиеся нажатия кнопки-маркера канала (счётчик сигнального потока минус
-/// уже учтённые). Каждое нажатие — старт/стоп записи участка; на «стоп» возвращает текст
-/// участка для копирования в буфер. `finals` — накопленный текст канала (None — канал выключен).
 fn apply_mark_presses(
     markers: &mut MarkerState,
     seen: &mut u32,
@@ -1968,7 +1683,6 @@ fn apply_mark_presses(
     if presses == 0 {
         return None;
     }
-    // Предохранитель от рассинхрона/переполнения: не прокручиваем абсурдное число нажатий.
     if presses > 8 {
         presses = 1;
     }
@@ -1987,9 +1701,6 @@ fn apply_mark_presses(
     to_copy
 }
 
-/// Собрать `LayoutJob` для транскрипта: весь текст цветом `color` шрифтом 20, а байтовые
-/// диапазоны `ranges` (маркеры + активная запись) — с фоном `hl`. `wrap` — ширина переноса,
-/// которую даёт layouter egui. Границы диапазонов снапаются к границам символов (панико-безопасно).
 fn transcript_job(
     text: &str,
     ranges: &[(usize, usize)],
@@ -2034,9 +1745,6 @@ fn transcript_job(
     job
 }
 
-/// Нарисовать ручку ресайза в правом-нижнем углу панели и обработать перетаскивание.
-/// На Wayland клиент не задаёт свой размер сам — просим композитор начать интерактивный
-/// resize в направлении SouthEast.
 fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
     let resp = ui.interact(
         grip,
@@ -2052,7 +1760,6 @@ fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
         ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
     }
 
-    // Три диагональные риски — привычный вид «уголка ресайза».
     let color = if resp.hovered() {
         egui::Color32::from_rgb(180, 200, 255)
     } else {
@@ -2072,11 +1779,6 @@ fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
 }
 
 fn main() -> eframe::Result<()> {
-    // Диагностика: `health-widget --check-capture` печатает, видит ли детектор активный
-    // захват экрана прямо сейчас, и выходит (0 = захват идёт, 1 = нет). Удобно проверить
-    // авто-скрытие со своим инструментом созвона до боевого звонка (см. README «Проверка»).
-    // Диагностика прямого захвата через KWin (см. kwin_shot): печатает, авторизован
-    // ли бинарь и что вернул CaptureArea. Выходит.
     if std::env::args().nth(1).as_deref() == Some("--grab-test") {
         kwin_shot::grab_test();
         std::process::exit(0);
@@ -2092,8 +1794,6 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
-    // Выгрузка полной транскрипции: `--transcript` (всё) или `--transcript-today`
-    // (только сегодня) — печатает хронологически «[время] канал: текст» и выходит.
     if let Some(arg @ ("--transcript" | "--transcript-today")) =
         std::env::args().nth(1).as_deref()
     {
@@ -2109,7 +1809,6 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
-    // Список записанных колов с дорожками: `--calls`.
     if std::env::args().nth(1).as_deref() == Some("--calls") {
         match TranscriptLog::list_calls() {
             Some(text) if !text.is_empty() => print!("{text}"),
@@ -2122,8 +1821,6 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
-    // Экспорт кола: `--export <id> [папка]` — обе дорожки + transcript.txt в
-    // <папка>/<id>-<название>/. По умолчанию папка = ./tmp (временная папка проекта).
     if std::env::args().nth(1).as_deref() == Some("--export") {
         let args: Vec<String> = std::env::args().collect();
         let id: Option<i64> = args.get(2).and_then(|s| s.parse().ok());
@@ -2168,9 +1865,6 @@ fn main() -> eframe::Result<()> {
         pos: std::sync::Mutex::new(st.x.zip(st.y).map(|(x, y)| (x as i32, y as i32))),
     });
 
-    // Стартовая геометрия из сохранённого состояния (иначе — из конфига/дефолтов).
-    // Если чат был открыт — окно сразу шире на ширину чат-колонки (в state хранится ширина
-    // «одной колонки»), иначе SidePanel сожмёт основной контент.
     let base_w = st.width.unwrap_or(cfg.width);
     let start_w = if st.terminal_open {
         base_w + st.terminal_width.unwrap_or(TERMINAL_W)
@@ -2180,10 +1874,8 @@ fn main() -> eframe::Result<()> {
     let size = [start_w, st.height.unwrap_or(cfg.height)];
     let pos = [st.x.unwrap_or(cfg.x), st.y.unwrap_or(cfg.y)];
 
-    // Саморегистрация для права на снимок области (KWin CaptureArea) — best-effort.
     screenshot::ensure_registered();
 
-    // Поднять демон dotool (перемещение курсора по хоткею). Сам завершается, если уже запущен.
     winctl::ensure_dotoold();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -2219,9 +1911,9 @@ mod marker_tests {
     #[test]
     fn start_then_stop_makes_span() {
         let mut m = MarkerState::default();
-        assert_eq!(m.toggle(5), None); // старт
+        assert_eq!(m.toggle(5), None);
         assert_eq!(m.active_start, Some(5));
-        assert_eq!(m.toggle(12), Some((5, 12))); // стоп
+        assert_eq!(m.toggle(12), Some((5, 12)));
         assert_eq!(m.spans, vec![(5, 12)]);
         assert_eq!(m.active_start, None);
     }
@@ -2240,7 +1932,7 @@ mod marker_tests {
     fn empty_span_not_recorded() {
         let mut m = MarkerState::default();
         m.toggle(4);
-        assert_eq!(m.toggle(4), None); // стоп на той же позиции — участка нет
+        assert_eq!(m.toggle(4), None);
         assert!(m.spans.is_empty());
     }
 
@@ -2248,10 +1940,10 @@ mod marker_tests {
     fn presses_start_grow_stop_copies_grown_slice() {
         let mut m = MarkerState::default();
         let mut seen = 0u32;
-        let t1 = "привет"; // 12 байт
+        let t1 = "привет";
         assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, Some(t1)), None);
         assert_eq!(m.active_start, Some(12));
-        let t2 = "привет мир"; // 19 байт; участок [12,19) == " мир"
+        let t2 = "привет мир";
         let got = apply_mark_presses(&mut m, &mut seen, 2, Some(t2));
         assert_eq!(got.as_deref(), Some(" мир"));
         assert_eq!(m.spans, vec![(12, 19)]);
@@ -2269,8 +1961,8 @@ mod marker_tests {
     fn press_on_disabled_channel_no_panic() {
         let mut m = MarkerState::default();
         let mut seen = 0u32;
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, None), None); // старт
-        assert_eq!(apply_mark_presses(&mut m, &mut seen, 2, None), None); // стоп на пустом
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 1, None), None);
+        assert_eq!(apply_mark_presses(&mut m, &mut seen, 2, None), None);
         assert!(m.spans.is_empty());
     }
 }

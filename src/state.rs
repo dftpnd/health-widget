@@ -1,8 +1,3 @@
-//! Сохранение/восстановление состояния виджета между запусками.
-//!
-//! Пишем в `state.json` рядом с конфигом (config_dir/health-widget/). Храним размер, позицию,
-//! выбранный источник звука и флаг «поверх всех». Позиция на Wayland может быть недоступна
-//! клиенту (тогда x/y = null и не восстанавливается) — размер/источник/закрепление сохраняются.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,37 +8,24 @@ pub struct State {
     pub y: Option<f32>,
     pub width: Option<f32>,
     pub height: Option<f32>,
-    /// Включён ли канал микрофона (слушатель + осциллограф).
     #[serde(default)]
     pub mic_on: bool,
-    /// Выбранный микрофон (имя источника; None — по умолчанию).
     #[serde(default)]
     pub mic_target: Option<String>,
-    /// Включён ли канал звука программы/вывода (Zoom/Телемост/Discord…).
     #[serde(default)]
     pub zoom_on: bool,
-    /// Закреплено ли окно «поверх всех».
     #[serde(default)]
     pub pinned: bool,
-    /// Выбранный профиль автопилота (аккаунт/резюме): "fullstack" | "back" | "bulat".
-    /// None — старое состояние без поля → трактуется как "fullstack".
     #[serde(default)]
     pub pilot_profile: Option<String>,
-    /// Строгость откликов (порог релевантности к резюме): "strict" | "medium" | "any".
-    /// Прокидывается как MIN_SIMILARITY автопилоту. None — старое состояние → "medium".
     #[serde(default)]
     pub pilot_strictness: Option<String>,
-    /// Ширина колонки терминала (точки). None — старое состояние → дефолт TERMINAL_W.
-    /// Алиас `chat_width` — читаем состояние, записанное до переименования колонки.
     #[serde(default, alias = "chat_width")]
     pub terminal_width: Option<f32>,
-    /// Свёрнута ли секция «Автопилот».
     #[serde(default)]
     pub autopilot_collapsed: bool,
-    /// Свёрнута ли секция «Показатели».
     #[serde(default)]
     pub metrics_collapsed: bool,
-    /// Открыта ли колонка терминала. Алиас `chat_open` — совместимость со старым state.json.
     #[serde(default, alias = "chat_open")]
     pub terminal_open: bool,
 }

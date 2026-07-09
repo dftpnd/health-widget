@@ -1,14 +1,3 @@
-//! Онлайн-транскрипция аудио-канала через faster-whisper — тем же приёмом, что и остальной
-//! проект: не тянем библиотеку в бинарь, а шеллим Python-хелпер `whisper_stream.py` из
-//! отдельного venv (`venv-whisper`, Python 3.12), где стоит `faster-whisper`.
-//!
-//! Поток данных: канал (`audio.rs`) декодирует f32 PCM @44100. Мы ресемплим его в s16 @16000
-//! и пишем в stdin хелпера. Хелпер режет поток на фразы (VAD по энергии), гоняет модель на
-//! GPU и печатает построчный JSON `{"final": …}`; фоновый поток читает stdout и копит текст.
-//!
-//! Partial'ов нет (Whisper выдаёт текст фразами) — под осциллографом появляется законченная
-//! фраза с лагом ~1–3 c. Если venv/скрипт не найдены — `start()` возвращает None, и канал
-//! работает без текста.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -17,55 +6,36 @@ use std::sync::{Arc, Mutex};
 
 use crate::transcript_log::TranscriptLog;
 
-/// Частота, которую ждёт whisper-хелпер.
 const STT_RATE: f64 = 16000.0;
-/// Верхняя граница накопленного финального текста (символы). Держим весь текст сеанса,
-/// чтобы под осциллографом можно было прокрутить назад и выделить/скопировать; обрезаем
-/// с головы лишь как предохранитель от бесконечного роста памяти при долгой работе.
 const MAX_FINALS: usize = 50_000;
 
-/// Разделяемое между потоком-читателем и UI состояние транскрипции одного канала.
 #[derive(Default)]
 struct Transcript {
-    /// Накопленный распознанный текст (обрезается с головы до MAX_FINALS).
     finals: String,
-    /// Текущая незавершённая гипотеза.
     partial: String,
 }
 
-/// Транскрайбер канала: держит дочерний python-процесс и читающий поток.
-/// UI дёргает `text()`; аудио-поток кормит сэмплами через `Feeder`.
 pub struct Transcriber {
     state: Arc<Mutex<Transcript>>,
     child: Child,
 }
 
-/// Кормящая половина: живёт в аудио-потоке (`audio.rs`), пишет ресемплённый PCM в хелпер.
-/// Хранит состояние ресемплера между батчами, чтобы стык окон был бесшовным.
 pub struct Feeder {
     stdin: ChildStdin,
-    /// src_rate / STT_RATE — на сколько исходных сэмплов сдвигаемся за один выходной.
     ratio: f64,
-    /// Дробная позиция чтения внутри текущего батча (может стартовать с [-1,0) — см. `prev`).
     pos: f64,
-    /// Последний сэмпл прошлого батча — виртуальный индекс -1 для интерполяции через границу.
     prev: f32,
-    /// Переиспользуемый буфер выходных s16-байт (без аллокаций на батч).
     out: Vec<u8>,
-    /// Пайп сломан (хелпер умер) — перестаём писать.
     dead: bool,
 }
 
 impl Feeder {
-    /// Скормить батч исходных f32-сэмплов: ресемплим в s16 @16000 и пишем в stdin хелпера.
     pub fn feed(&mut self, s: &[f32]) {
         if self.dead || s.is_empty() {
             return;
         }
         self.out.clear();
         let len = s.len() as f64;
-        // Виртуальный массив: индекс -1 == prev, 0.. == s. Идём с шагом ratio, линейно
-        // интерполируя, пока следующая точка (i+1) ещё внутри батча.
         while self.pos < len - 1.0 {
             let i = self.pos.floor();
             let frac = (self.pos - i) as f32;
@@ -77,22 +47,16 @@ impl Feeder {
             self.out.extend_from_slice(&q.to_le_bytes());
             self.pos += self.ratio;
         }
-        // Сдвигаем начало координат на следующий батч: его индекс 0 == текущий индекс len.
         self.pos -= len;
         self.prev = s[s.len() - 1];
 
         if !self.out.is_empty() && self.stdin.write_all(&self.out).is_err() {
-            self.dead = true; // EPIPE — хелпер закрылся
+            self.dead = true;
         }
     }
 }
 
 impl Transcriber {
-    /// Запустить хелпер для канала с исходной частотой `src_rate`.
-    /// `channel` — метка канала для БД («я» / «телемост»), `log` — куда писать полный
-    /// текст (None — не сохранять). None-возврат — если транскрипция выключена или
-    /// окружение (python/скрипт/модель) не готово. При успехе возвращает читающую
-    /// половину (для UI) и кормящую (в аудио-поток).
     pub fn start(
         src_rate: u32,
         channel: &'static str,
@@ -118,7 +82,6 @@ impl Transcriber {
         let stdout = child.stdout.take()?;
         let state = Arc::new(Mutex::new(Transcript::default()));
 
-        // Поток-читатель: построчный JSON из хелпера → общее состояние.
         {
             let state = state.clone();
             std::thread::spawn(move || {
@@ -126,7 +89,7 @@ impl Transcriber {
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
-                        Err(_) => break, // stdout закрылся — хелпер умер
+                        Err(_) => break,
                     };
                     let v: serde_json::Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
@@ -142,8 +105,6 @@ impl Transcriber {
                         g.finals.push_str(t);
                         trim_head(&mut g.finals, MAX_FINALS);
                         g.partial.clear();
-                        // Полный сегмент — на диск (с временем и каналом). UI держит
-                        // только бегущий хвост; целиком история живёт в БД.
                         if let Some(log) = &log {
                             log.append(channel, t);
                         }
@@ -163,7 +124,6 @@ impl Transcriber {
         Some((Transcriber { state, child }, feeder))
     }
 
-    /// Текст для показа под осциллографом: (накопленный финальный, текущая гипотеза).
     pub fn text(&self) -> (String, String) {
         match self.state.lock() {
             Ok(g) => (g.finals.clone(), g.partial.clone()),
@@ -178,12 +138,10 @@ impl Drop for Transcriber {
     }
 }
 
-/// Каталог данных виджета (`~/.local/share/health-widget`) — сюда ставятся venv и модель.
 fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("health-widget"))
 }
 
-/// Python из whisper-venv (`WHISPER_PYTHON` переопределяет). None — если не существует.
 fn python_path() -> Option<PathBuf> {
     let p = match std::env::var_os("WHISPER_PYTHON") {
         Some(v) => PathBuf::from(v),
@@ -192,17 +150,13 @@ fn python_path() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Имя/путь модели whisper (`WHISPER_MODEL` переопределяет; дефолт large-v3).
 fn model_spec() -> String {
     std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "large-v3".to_string())
 }
 
-/// Скрипт-хелпер зашит в бинарь и распаковывается в data-dir при первом запуске,
-/// чтобы не зависеть от рабочего каталога/расположения репозитория.
 fn ensure_script() -> Option<PathBuf> {
     const SRC: &str = include_str!("../scripts/whisper_stream.py");
     let path = data_dir()?.join("whisper_stream.py");
-    // Перезаписываем, только если содержимое отличается (обновление бинаря).
     let need_write = std::fs::read_to_string(&path).map(|c| c != SRC).unwrap_or(true);
     if need_write {
         if let Some(parent) = path.parent() {
@@ -213,16 +167,13 @@ fn ensure_script() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Обрезать строку с головы до `max` символов по границе слова (для бегущей строки).
 fn trim_head(s: &mut String, max: usize) {
     let n = s.chars().count();
     if n <= max {
         return;
     }
     let skip = n - max;
-    // Индекс байта после skip символов…
     let mut cut = s.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
-    // …и дальше до ближайшего пробела, чтобы не рвать слово.
     if let Some(rel) = s[cut..].find(' ') {
         cut += rel + 1;
     }
@@ -242,7 +193,6 @@ mod tests {
 
     #[test]
     fn trims_head_to_word_boundary() {
-        // 13 символов, оставляем 5 → отрезаем «one two », не рвём слово.
         let mut s = "one two three".to_string();
         trim_head(&mut s, 5);
         assert_eq!(s, "three");
@@ -250,7 +200,6 @@ mod tests {
 
     #[test]
     fn unicode_boundary_no_panic() {
-        // Кириллица (по 2 байта): срез не должен падать на границе символа.
         let mut s = "аб вг де".to_string();
         trim_head(&mut s, 2);
         assert_eq!(s, "де");

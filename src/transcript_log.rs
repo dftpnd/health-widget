@@ -1,29 +1,16 @@
-//! Персистентное хранилище звонков («колов»): транскрипция + метаданные аудио-дорожек.
-//!
-//! Кол начинается по кнопке в виджете и группирует: строки транскрипции (обоих каналов) и
-//! две аудио-дорожки на диске (микрофон + звук созвона, НЕ склеенные). В БД лежат
-//! метаданные (название, дата, пути дорожек) и весь текст с таймингом; сам звук — WAV-файлы
-//! рядом (`calls/<id>/…`). Вне кола транскрипция всё равно пишется (call_id = NULL).
-//!
-//! Посмотреть: `health-widget --transcript` (весь текст), `--calls` (список колов с дорожками).
-//! БД — `~/.local/share/health-widget/transcripts.db`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
 
-/// Открытое хранилище одного сеанса виджета.
 pub struct TranscriptLog {
     conn: Mutex<Connection>,
-    /// Метка старта виджета — группирует сегменты одного запуска.
     session: String,
-    /// Активный кол (его id) — им помечаются строки транскрипции. None — вне кола.
     current_call: Mutex<Option<i64>>,
 }
 
 impl TranscriptLog {
-    /// Открыть/создать БД в data-dir. None — если не открылась.
     pub fn open() -> Option<Self> {
         let path = db_path()?;
         if let Some(dir) = path.parent() {
@@ -54,7 +41,6 @@ impl TranscriptLog {
              );",
         )
         .ok()?;
-        // Миграция старой БД (transcript без call_id — из прошлой версии).
         let has_call = conn
             .prepare("PRAGMA table_info(transcript)")
             .and_then(|mut s| {
@@ -75,13 +61,11 @@ impl TranscriptLog {
         })
     }
 
-    /// Дописать финальный сегмент канала (с привязкой к активному колу, если он есть).
     pub fn append(&self, channel: &str, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        // Читаем call_id ДО блокировки conn (не держим два лока разом).
         let call_id = self.current_call.lock().ok().and_then(|g| *g);
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.execute(
@@ -92,7 +76,6 @@ impl TranscriptLog {
         }
     }
 
-    /// Начать кол с названием `name` — вернуть его id и сделать активным. None — при ошибке.
     pub fn start_call(&self, name: &str) -> Option<i64> {
         let id = {
             let conn = self.conn.lock().ok()?;
@@ -105,7 +88,6 @@ impl TranscriptLog {
         Some(id)
     }
 
-    /// Завершить кол: проставить время окончания и снять активность.
     pub fn end_call(&self, id: i64) {
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.execute(
@@ -121,7 +103,6 @@ impl TranscriptLog {
         }
     }
 
-    /// Зафиксировать путь аудио-дорожки канала для кола.
     pub fn add_track(&self, call_id: i64, channel: &str, path: &str) {
         if let Ok(conn) = self.conn.lock() {
             let _ = conn.execute(
@@ -131,7 +112,6 @@ impl TranscriptLog {
         }
     }
 
-    /// Выгрузить транскрипцию хронологически (для CLI). `today_only` — только сегодня.
     pub fn dump(today_only: bool) -> Option<String> {
         let conn = Connection::open(db_path()?).ok()?;
         let sql = if today_only {
@@ -157,7 +137,6 @@ impl TranscriptLog {
         Some(out)
     }
 
-    /// Список колов с дорожками и числом строк транскрипции (для CLI).
     pub fn list_calls() -> Option<String> {
         let conn = Connection::open(db_path()?).ok()?;
         let mut stmt = conn
@@ -202,8 +181,6 @@ impl TranscriptLog {
         Some(out)
     }
 
-    /// Экспортировать кол в папку `dest`: обе WAV-дорожки + `transcript.txt` рядом.
-    /// Возвращает путь созданной подпапки `<dest>/<id>-<название>/`. Ошибку — строкой.
     pub fn export_call(id: i64, dest: &Path) -> Result<PathBuf, String> {
         let conn =
             Connection::open(db_path().ok_or("нет data-dir")?).map_err(|e| e.to_string())?;
@@ -218,7 +195,6 @@ impl TranscriptLog {
         let target = dest.join(format!("{id}-{}", sanitize(&name)));
         std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
 
-        // Копируем дорожки (файл мог быть удалён — тогда отмечаем, но не падаем).
         let mut tstmt = conn
             .prepare("SELECT channel, path FROM tracks WHERE call_id = ?1 ORDER BY channel")
             .map_err(|e| e.to_string())?;
@@ -236,7 +212,6 @@ impl TranscriptLog {
             }
         }
 
-        // Транскрипт кола рядом.
         let mut out = format!("Кол #{id}: {name}\n{started} → {ended}\n\n");
         let mut sstmt = conn
             .prepare(
@@ -264,7 +239,6 @@ impl TranscriptLog {
     }
 }
 
-/// Привести название кола к безопасному для имени папки виду (пробелы → «_», спецсимволы убираем).
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
@@ -279,12 +253,10 @@ fn sanitize(name: &str) -> String {
     }
 }
 
-/// Путь к БД транскрипции (аудио-дорожки — рядом, в `calls/<id>/`).
 fn db_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("health-widget").join("transcripts.db"))
 }
 
-/// Каталог аудио-дорожек кола: `~/.local/share/health-widget/calls/<id>/`.
 pub fn call_dir(call_id: i64) -> Option<PathBuf> {
     dirs::data_dir().map(|d| {
         d.join("health-widget")

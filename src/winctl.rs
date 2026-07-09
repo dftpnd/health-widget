@@ -1,30 +1,15 @@
-//! Управление окном через KWin.
-//!
-//! На Wayland клиент многого не может сам: ни встать «поверх всех» (eframe/winit `always_on_top`
-//! там no-op), ни узнать/задать свою позицию. Зато это умеет KWin — дёргаем его скриптами по
-//! D-Bus (матч окна по `resourceClass`, как в kwin-script/health-widget-exclude). Скрипты
-//! одноразовые: пишем .js во временный файл, грузим (`loadScript`), выполняем (`Script.run`),
-//! выгружаем. Всё через `qdbus6` — без новых зависимостей, в стиле `detect.rs`/`audio.rs`.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// resourceClass нашего окна (совпадает с kwin-script excludeFromCapture).
 const RESOURCE_CLASS: &str = "health-widget";
 
-/// Труба демона dotool: `dotoold` держит один живой `dotool` с постоянным uinput-устройством
-/// (первое событие не теряется), а мы пишем в трубу команды. На Wayland клиент сам курсор не
-/// двигает, а KWin `cursorPos` read-only — поэтому двигаем курсор через uinput (dotool).
-/// Координаты `mouseto` нормированы 0..1 по всему рабочему столу.
 const DOTOOL_PIPE: &str = "/tmp/dotool-pipe";
 
-/// Каталог с бинарями dotool/dotoold/dotoolc (ставятся туда при настройке).
 fn dotool_bin(name: &str) -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".local").join("bin").join(name))
 }
 
-/// Обёртка над окном по resourceClass: `for` по всем окнам с проверкой класса.
-/// `inner` — тело, где `w` — наше окно.
 fn for_our_window(inner: &str) -> String {
     format!(
         "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
@@ -33,12 +18,10 @@ fn for_our_window(inner: &str) -> String {
     )
 }
 
-/// Выставить/снять «поверх всех» (keepAbove). true — если скрипт выполнился.
 pub fn set_keep_above(on: bool) -> bool {
     run_kwin_script(&for_our_window(&format!("w.keepAbove = {on};")), "keepabove")
 }
 
-/// Переместить окно в (x, y), сохранив размер. true — если скрипт выполнился.
 pub fn set_position(x: i32, y: i32) -> bool {
     let body = for_our_window(&format!(
         "var g = w.frameGeometry; w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }};"
@@ -46,8 +29,6 @@ pub fn set_position(x: i32, y: i32) -> bool {
     run_kwin_script(&body, "move")
 }
 
-/// Прочитать текущую позицию окна из KWin. None — если не удалось.
-/// Значение печатается скриптом в лог KWin, откуда читаем через journalctl.
 pub fn get_position() -> Option<(i32, i32)> {
     let body = for_our_window(
         "var g = w.frameGeometry; print(\"HW-GEOM x=\" + Math.round(g.x) + \" y=\" + Math.round(g.y));",
@@ -55,7 +36,7 @@ pub fn get_position() -> Option<(i32, i32)> {
     if !run_kwin_script(&body, "geom") {
         return None;
     }
-    std::thread::sleep(Duration::from_millis(120)); // дать строке дойти до journal
+    std::thread::sleep(Duration::from_millis(120));
     let out = Command::new("journalctl")
         .args(["--user", "-n", "40", "--no-pager", "-o", "cat"])
         .output()
@@ -65,7 +46,6 @@ pub fn get_position() -> Option<(i32, i32)> {
     Some((parse_field(line, "x=")?, parse_field(line, "y=")?))
 }
 
-/// Достать целое после `key` в строке вида `... x=1918 y=741`.
 fn parse_field(line: &str, key: &str) -> Option<i32> {
     let rest = &line[line.find(key)? + key.len()..];
     let tok: String = rest
@@ -75,9 +55,6 @@ fn parse_field(line: &str, key: &str) -> Option<i32> {
     tok.parse().ok()
 }
 
-/// Поднять демон `dotoold`, если он ещё не запущен. Скрипт сам мгновенно завершается, если
-/// труба уже читается, поэтому безопасно звать при каждом старте виджета. PATH дополняем
-/// `~/.local/bin`, чтобы `dotoold` нашёл `dotool`. Best-effort, не блокируем UI.
 pub fn ensure_dotoold() {
     let Some(bin) = dirs::home_dir().map(|h| h.join(".local").join("bin")) else {
         return;
@@ -99,8 +76,6 @@ pub fn ensure_dotoold() {
         .spawn();
 }
 
-/// Прочитать из KWin две дробные величины после маркера (нормированные координаты). None —
-/// если скрипт/журнал не дали строку. Тем же journalctl-приёмом, что [`get_position`].
 fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {
     if !run_kwin_script(body, tag) {
         return None;
@@ -119,7 +94,6 @@ fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
-/// Нормированный (0..1 по рабочему столу) центр окна виджета. None — окно не найдено.
 pub fn widget_center_norm() -> Option<(f64, f64)> {
     let body = format!(
         "var s = workspace.virtualScreenSize;\n\
@@ -132,15 +106,12 @@ pub fn widget_center_norm() -> Option<(f64, f64)> {
     read_two_floats(&body, "wnorm", "HW-WNORM")
 }
 
-/// Нормированная (0..1 по рабочему столу) текущая позиция курсора. None — не удалось прочитать.
 pub fn cursor_pos_norm() -> Option<(f64, f64)> {
     let body = "var s = workspace.virtualScreenSize; \
                 print(\"HW-CNORM \" + (workspace.cursorPos.x / s.width) + \" \" + (workspace.cursorPos.y / s.height));";
     read_two_floats(body, "cnorm", "HW-CNORM")
 }
 
-/// Мгновенно переместить курсор в нормированную позицию (0..1) через `dotoolc` (пишет в трубу
-/// dotoold; сам выходит, если демона нет, — не виснет). Best-effort, в фоне.
 pub fn warp_cursor_norm(nx: f64, ny: f64) {
     let Some(dotoolc) = dotool_bin("dotoolc") else {
         return;
@@ -164,7 +135,6 @@ pub fn warp_cursor_norm(nx: f64, ny: f64) {
     });
 }
 
-/// Загрузить, выполнить и выгрузить одноразовый KWin-скрипт. `tag` — суффикс имени файла.
 fn run_kwin_script(body: &str, tag: &str) -> bool {
     let path = std::env::temp_dir().join(format!("health-widget-{tag}.js"));
     if std::fs::write(&path, body).is_err() {

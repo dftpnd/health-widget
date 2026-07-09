@@ -25,7 +25,6 @@ import time
 import threading
 from typing import Iterable
 
-
 def parse_hotwords(lines: Iterable[str], limit: int = 80) -> str:
     terms = []
     for line in lines:
@@ -36,7 +35,6 @@ def parse_hotwords(lines: Iterable[str], limit: int = 80) -> str:
         if len(terms) >= limit:
             break
     return ", ".join(terms)
-
 
 def parse_corrections(lines: Iterable[str]):
     pairs = []
@@ -52,15 +50,11 @@ def parse_corrections(lines: Iterable[str]):
         pairs.append((rx, right))
     return pairs
 
-
 def apply_corrections(text: str, pairs) -> str:
     for rx, right in pairs:
         text = rx.sub(lambda _m, r=right: r, text)
     return text
 
-
-# Известные галлюцинации whisper на тишине/шуме. Модель обучена на субтитрах YouTube и на
-# тихом/неясном аудио вставляет эти фразы, которых в речи не было. Сравниваем нормализованно.
 HALLUCINATIONS = {
     "продолжение следует",
     "продолжение в следующей серии",
@@ -68,14 +62,11 @@ HALLUCINATIONS = {
     "субтитры сделал dimatorzok",
     "субтитры создавал dimatorzok",
     "редактор субтитров а.семкин корректор а.егорова",
-    # Звуковые теги, которые whisper вставляет на тишине/тонком аудио (диктовка чисел,
-    # паузы между репликами): они приходят отдельным сегментом без реальной речи.
     "аплодисменты",
     "аплодисменты и смех",
     "музыка",
     "играет музыка",
     "смех",
-    # YouTube-концовки из обучающих субтитров.
     "спасибо за просмотр",
     "спасибо за внимание",
     "подписывайтесь на канал",
@@ -83,12 +74,10 @@ HALLUCINATIONS = {
     "ставьте лайки",
 }
 
-
 def _norm(text: str) -> str:
     """Нормализовать сегмент для сравнения с чёрным списком: lower, без внешней пунктуации
     и обрамляющих скобок (whisper пишет теги как «[Аплодисменты]»/«(музыка)»)."""
     return " ".join(text.strip().lower().strip(" .…!?,-—:;\"'[](){}«»").split())
-
 
 def is_hallucination(text: str, no_speech_prob: float = 0.0) -> bool:
     """True, если сегмент — фантомная вставка whisper (пустой, из чёрного списка, титры-кредиты
@@ -97,20 +86,15 @@ def is_hallucination(text: str, no_speech_prob: float = 0.0) -> bool:
     n = _norm(text)
     if not n:
         return True
-    # Сегмент целиком в скобках — звуковой тег, а не речь: «[музыка]», «(звонок телефона)»,
-    # «[смех]». Ловим структурно, не перечисляя все варианты.
     if len(raw) >= 2 and raw[0] in "[(" and raw[-1] in ")]":
         return True
     if n in HALLUCINATIONS:
         return True
-    # Титры-кредиты в разных вариациях: «субтитры/редактор субтитров … <имя/корректор>».
     if "субтитр" in n and ("dimatorzok" in n or "семкин" in n or "корректор" in n):
         return True
-    # Модель сама оценила сегмент как не-речь с высокой уверенностью.
     if no_speech_prob >= 0.85:
         return True
     return False
-
 
 def load_hotwords(path: str) -> str:
     try:
@@ -119,7 +103,6 @@ def load_hotwords(path: str) -> str:
     except OSError:
         return ""
 
-
 def load_corrections(path: str):
     try:
         with open(path, encoding="utf-8") as f:
@@ -127,19 +110,17 @@ def load_corrections(path: str):
     except OSError:
         return []
 
-
 SAMPLE_RATE = 16000
-FRAME = 320                 # 20 мс
+FRAME = 320
 FRAME_BYTES = FRAME * 2
-SILENCE_RMS = 500.0         # порог RMS int16: тишина/речь
-SILENCE_TAIL = 0.6          # сек тишины => конец фразы
-MIN_SPEECH = 0.3            # короче — считаем шумом, не транскрибируем
-MAX_SEGMENT = 15.0          # форс-флаш при непрерывной речи
+SILENCE_RMS = 500.0
+SILENCE_TAIL = 0.6
+MIN_SPEECH = 0.3
+MAX_SEGMENT = 15.0
 
 _buf = bytearray()
 _buf_lock = threading.Lock()
 _stdin_open = True
-
 
 def _drain_stdin():
     """Отдельный поток: непрерывно вычитываем stdin, чтобы Rust не упирался в
@@ -153,7 +134,6 @@ def _drain_stdin():
         with _buf_lock:
             _buf.extend(b)
 
-
 def _take(n: int) -> bytes:
     with _buf_lock:
         if not _buf:
@@ -162,7 +142,6 @@ def _take(n: int) -> bytes:
         out = bytes(_buf[:m])
         del _buf[:m]
         return out
-
 
 def _ensure_cuda_libpath():
     """CUDA-либы (cublas/cudnn) стоят pip-колёсами внутри venv и не на пути загрузчика.
@@ -180,7 +159,6 @@ def _ensure_cuda_libpath():
     prev = os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["LD_LIBRARY_PATH"] = ":".join(libs + ([prev] if prev else []))
     os.execv(sys.executable, [sys.executable] + sys.argv)
-
 
 def main() -> int:
     _ensure_cuda_libpath()
@@ -209,7 +187,6 @@ def main() -> int:
             condition_on_previous_text=False,
             hotwords=hotwords, initial_prompt=hotwords,
         )
-        # Отсеиваем фантомные вставки whisper (напр. «Продолжение следует» на тишине).
         parts = [
             s.text.strip()
             for s in segments
@@ -262,7 +239,6 @@ def main() -> int:
                 speaking = False
                 silence_run = 0.0
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -8,7 +8,6 @@ from whisper_stream import (
     is_hallucination,
 )
 
-
 class TestHallucinations(unittest.TestCase):
     def test_prodolzhenie_sleduet_dropped(self):
         self.assertTrue(is_hallucination("Продолжение следует..."))
@@ -27,12 +26,10 @@ class TestHallucinations(unittest.TestCase):
         self.assertTrue(is_hallucination("любой текст", no_speech_prob=0.9))
 
     def test_sound_event_tags_dropped(self):
-        # Частые звуковые теги из субтитров, которые whisper вставляет на тонком аудио.
         for t in ("Аплодисменты", "аплодисменты.", "АПЛОДИСМЕНТЫ", "Музыка", "Смех"):
             self.assertTrue(is_hallucination(t), t)
 
     def test_bracketed_tags_dropped(self):
-        # Любой сегмент целиком в скобках — не-речь, независимо от содержимого.
         for t in ("[Аплодисменты]", "(музыка)", "[смех]", "[ Музыка ]", "(звонок телефона)"):
             self.assertTrue(is_hallucination(t), t)
 
@@ -41,7 +38,6 @@ class TestHallucinations(unittest.TestCase):
         self.assertTrue(is_hallucination("Подписывайтесь на канал"))
 
     def test_digits_kept(self):
-        # Главный кейс пользователя: диктует числа — их нельзя отсеивать.
         self.assertFalse(is_hallucination("один два три четыре"))
         self.assertFalse(is_hallucination("1, 2, 3, 4"))
         self.assertFalse(is_hallucination("пять"))
@@ -49,7 +45,6 @@ class TestHallucinations(unittest.TestCase):
     def test_real_speech_kept(self):
         self.assertFalse(is_hallucination("задеплоил на стейджинг"))
         self.assertFalse(is_hallucination("подниму кластер", no_speech_prob=0.2))
-        # «Спасибо» само по себе — обычная речь, не глушим.
         self.assertFalse(is_hallucination("спасибо"))
 
 class TestHotwords(unittest.TestCase):
@@ -74,7 +69,6 @@ class TestCorrections(unittest.TestCase):
         self.assertEqual(apply_corrections("Дэплой прошёл", pairs), "deploy прошёл")
 
     def test_word_boundary(self):
-        # не трогаем часть более длинного слова
         pairs = parse_corrections(["код\tcode"])
         self.assertEqual(apply_corrections("кодовое слово", pairs), "кодовое слово")
 
@@ -88,12 +82,10 @@ class TestCorrections(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
 
     def test_replacement_with_backslash_is_literal(self):
-        # users hand-edit the TSV; a backslash in the replacement must stay literal
         pairs = parse_corrections(["сиошарп\tC\\#"])
         self.assertEqual(apply_corrections("это сиошарп", pairs), "это C\\#")
 
     def test_replacement_group_ref_not_interpreted(self):
-        # "\1" must not raise re.error nor be treated as a backreference
         pairs = parse_corrections(["ромб\t\\1"])
         self.assertEqual(apply_corrections("ромб тут", pairs), "\\1 тут")
 
