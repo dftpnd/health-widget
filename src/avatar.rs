@@ -1,9 +1,124 @@
 use resvg::tiny_skia;
 use resvg::usvg;
-use crate::config::MouthBox;
+use crate::config::{AvatarCfg, MouthBox};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-pub struct Avatar;
+pub enum AvatarError {
+    NoDevice(PathBuf),
+    Svg(String),
+    Format(String),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for AvatarError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AvatarError::NoDevice(p) => write!(f, "нет устройства {}", p.display()),
+            AvatarError::Svg(e) => write!(f, "SVG: {e}"),
+            AvatarError::Format(e) => write!(f, "формат: {e}"),
+            AvatarError::Io(e) => write!(f, " io: {e}"),
+        }
+    }
+}
+
+pub struct Avatar {
+    running: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    last: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>,
+}
+
+impl Avatar {
+    pub fn start(cfg: &AvatarCfg, samples: Arc<Mutex<VecDeque<f32>>>) -> Result<Avatar, AvatarError> {
+        if !cfg.device.exists() {
+            return Err(AvatarError::NoDevice(cfg.device.clone()));
+        }
+        let svg = std::fs::read(&cfg.svg_path).map_err(AvatarError::Io)?;
+        let base = rasterize(&svg, cfg.width, cfg.height).map_err(AvatarError::Svg)?;
+
+        let mut cam = Vcam::open(&cfg.device).map_err(AvatarError::Io)?;
+        cam.set_format(cfg.width, cfg.height).map_err(|e| AvatarError::Format(e.to_string()))?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let last: Arc<Mutex<Option<(u32, u32, Vec<u8>)>>> = Arc::new(Mutex::new(None));
+
+        let run = running.clone();
+        let last_w = last.clone();
+        let cfg = cfg.clone();
+        let frame_dt = Duration::from_secs_f32(1.0 / cfg.fps.max(1) as f32);
+
+        let handle = std::thread::spawn(move || {
+            let mut buf: Vec<f32> = Vec::with_capacity(4096);
+            let mut fail_streak = 0u32;
+            while run.load(Ordering::Relaxed) {
+                let tick = Instant::now();
+                buf.clear();
+                if let Ok(g) = samples.lock() {
+                    buf.extend(g.iter().copied());
+                }
+                let mut frame = base.clone();
+                draw_scope(
+                    &mut frame,
+                    cfg.width,
+                    cfg.height,
+                    &cfg.mouth,
+                    &buf,
+                    cfg.scope_color,
+                    cfg.scope_gain,
+                );
+                let yuyv = rgba_to_yuyv(&frame, cfg.width, cfg.height);
+                match cam.write_frame(&yuyv) {
+                    Ok(_) => fail_streak = 0,
+                    Err(_) => {
+                        fail_streak += 1;
+                        if fail_streak == 30 {
+                            crate::telemetry::error("avatar.write", "серия ошибок записи кадра");
+                        }
+                    }
+                }
+                if let Ok(mut g) = last_w.lock() {
+                    *g = Some((cfg.width, cfg.height, frame));
+                }
+                if let Some(rem) = frame_dt.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(rem);
+                }
+            }
+        });
+
+        crate::telemetry::event("avatar.start", serde_json::json!({ "device": cfg.device }));
+        Ok(Avatar { running, handle: Some(handle), last })
+    }
+
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn last_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.last.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+impl Drop for Avatar {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 const V4L2_BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
 const V4L2_FIELD_NONE: u32 = 1;
@@ -318,5 +433,15 @@ mod tests {
     #[test]
     fn v4l2_format_matches_kernel_abi_size() {
         assert_eq!(std::mem::size_of::<V4l2Format>(), 208);
+    }
+
+    #[test]
+    fn start_without_device_returns_no_device() {
+        let mut cfg = crate::config::AvatarCfg::default();
+        cfg.device = std::path::PathBuf::from("/dev/does-not-exist-999");
+        cfg.svg_path = std::path::PathBuf::from("/dev/does-not-exist-999.svg");
+        let samples = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let r = Avatar::start(&cfg, samples);
+        assert!(matches!(r, Err(AvatarError::NoDevice(_))));
     }
 }
