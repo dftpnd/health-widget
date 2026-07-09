@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod audio;
+mod clip;
 mod config;
 mod data;
 mod detect;
@@ -1490,7 +1491,7 @@ impl App {
             c_mic,
             mic_finals.as_deref(),
         ) {
-            clipboard_set(txt);
+            clip::set_async(txt);
         }
         let c_zoom = self.mark_zoom.load(Ordering::Relaxed);
         let zoom_finals = self.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
@@ -1500,7 +1501,7 @@ impl App {
             c_zoom,
             zoom_finals.as_deref(),
         ) {
-            clipboard_set(txt);
+            clip::set_async(txt);
         }
     }
 
@@ -1931,29 +1932,6 @@ fn draw_transcript(
                 );
             }
         });
-}
-
-/// Положить текст в системный буфер обмена через `wl-copy`. Почему не `egui`/`ctx.copy_text`:
-/// на Wayland eframe ставит буфер через smithay-clipboard, а тот работает только когда окно
-/// в фокусе (нужен input-serial). Копия по кнопке Tartarus прилетает, когда виджет НЕ в фокусе,
-/// поэтому egui-копия молча не проходит. `wl-copy` создаёт свой data-source и не зависит от
-/// фокуса. Пишем в отдельном потоке, чтобы не блокировать UI (wl-copy форкает демон-держатель).
-fn clipboard_set(text: String) {
-    std::thread::spawn(move || {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
-    });
 }
 
 /// Обработать накопившиеся нажатия кнопки-маркера канала (счётчик сигнального потока минус

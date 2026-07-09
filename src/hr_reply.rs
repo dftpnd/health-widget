@@ -86,19 +86,7 @@ fn run(dir: &Path, bin: &Path, profile: &str) -> Result<(), String> {
     if reply.is_empty() {
         return Err("пустой ответ LLM".into());
     }
-    // 3. Ответ обратно в буфер (wl-copy демонизируется и держит содержимое сам).
-    let mut wl = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("wl-copy не запустился: {e}"))?;
-    {
-        let mut si = wl
-            .stdin
-            .take()
-            .ok_or_else(|| "нет stdin у wl-copy".to_string())?;
-        si.write_all(reply.as_bytes())
-            .map_err(|e| format!("wl-copy stdin: {e}"))?;
-    }
-    wl.wait().map_err(|e| format!("wl-copy: {e}"))?;
+    // 3. Ответ обратно в буфер.
+    crate::clip::set(&reply)?;
     Ok(())
 }

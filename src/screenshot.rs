@@ -110,17 +110,7 @@ pub fn grab(x: i32, y: i32, w: u32, h: u32, ctx: egui::Context, status: Arc<Mute
                 // встроенный терминал колонки и скормить, напр., `claude ... < <путь>`.
                 // wl-copy демонизируется и держит содержимое сам — просто spawn со stdin.
                 let p = path.display().to_string();
-                if let Ok(mut child) = std::process::Command::new("wl-copy")
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    use std::io::Write;
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(p.as_bytes());
-                    }
-                }
+                let _ = crate::clip::set(&p);
                 finish(&status, &ctx, ShotStatus::Saved(path.display().to_string()))
             }
             Err(e) => finish(&status, &ctx, ShotStatus::Failed(format!("save: {e}"))),
