@@ -38,8 +38,19 @@ impl Avatar {
         if !cfg.device.exists() {
             return Err(AvatarError::NoDevice(cfg.device.clone()));
         }
-        let svg = std::fs::read(&cfg.svg_path).map_err(AvatarError::Io)?;
-        let base = rasterize(&svg, cfg.width, cfg.height).map_err(AvatarError::Svg)?;
+        let raw_svg = std::fs::read(&cfg.svg_path).map_err(AvatarError::Io)?;
+        let svg = strip_element_by_id(&raw_svg, "рот");
+        let (base, (scale, tx, ty)) =
+            rasterize(&svg, cfg.width, cfg.height, cfg.margin).map_err(AvatarError::Svg)?;
+
+        let m = &cfg.mouth;
+        let mouth = MouthBox {
+            x: (tx + m.x as f32 * scale).round().max(0.0) as u32,
+            y: (ty + m.y as f32 * scale).round().max(0.0) as u32,
+            w: (m.w as f32 * scale).round() as u32,
+            h: (m.h as f32 * scale).round() as u32,
+        };
+        let curve = (cfg.mouth_curve as f32 * scale).round() as i32;
 
         let mut cam = Vcam::open(&cfg.device).map_err(AvatarError::Io)?;
         cam.set_format(cfg.width, cfg.height).map_err(|e| AvatarError::Format(e.to_string()))?;
@@ -66,10 +77,12 @@ impl Avatar {
                     &mut frame,
                     cfg.width,
                     cfg.height,
-                    &cfg.mouth,
+                    &mouth,
                     &buf,
                     cfg.scope_color,
                     cfg.scope_gain,
+                    cfg.scope_thickness,
+                    curve,
                 );
                 let yuyv = rgba_to_yuyv(&frame, cfg.width, cfg.height);
                 match cam.write_frame(&yuyv) {
@@ -219,22 +232,43 @@ impl Vcam {
     }
 }
 
-pub fn rasterize(svg: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+pub fn strip_element_by_id(svg: &[u8], id: &str) -> Vec<u8> {
+    let s = String::from_utf8_lossy(svg);
+    let needle = format!("<path id=\"{id}\"");
+    if let Some(start) = s.find(&needle) {
+        if let Some(rel) = s[start..].find("/>") {
+            let end = start + rel + 2;
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..start]);
+            out.push_str(&s[end..]);
+            return out.into_bytes();
+        }
+    }
+    svg.to_vec()
+}
+
+pub fn fit_transform(svg_w: f32, svg_h: f32, width: u32, height: u32, margin: f32) -> (f32, f32, f32) {
+    let m = margin.clamp(0.0, 0.4);
+    let aw = width as f32 * (1.0 - 2.0 * m);
+    let ah = height as f32 * (1.0 - 2.0 * m);
+    let scale = (aw / svg_w).min(ah / svg_h);
+    let tx = (width as f32 - svg_w * scale) * 0.5;
+    let ty = (height as f32 - svg_h * scale) * 0.5;
+    (scale, tx, ty)
+}
+
+pub fn rasterize(svg: &[u8], width: u32, height: u32, margin: f32) -> Result<(Vec<u8>, (f32, f32, f32)), String> {
     let opts = usvg::Options::default();
     let tree = usvg::Tree::from_data(svg, &opts).map_err(|e| e.to_string())?;
     let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or("pixmap")?;
     pixmap.fill(tiny_skia::Color::from_rgba8(0x2b, 0x2b, 0x2b, 255));
 
     let size = tree.size();
-    let sx = width as f32 / size.width();
-    let sy = height as f32 / size.height();
-    let scale = sx.min(sy);
-    let tx = (width as f32 - size.width() * scale) * 0.5;
-    let ty = (height as f32 - size.height() * scale) * 0.5;
+    let (scale, tx, ty) = fit_transform(size.width(), size.height(), width, height, margin);
     let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
 
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    Ok(pixmap.take())
+    Ok((pixmap.take(), (scale, tx, ty)))
 }
 
 fn clamp_u8(v: f32) -> u8 {
@@ -327,11 +361,14 @@ pub fn draw_scope(
     samples: &[f32],
     color: [u8; 3],
     gain: f32,
+    thickness: u32,
+    curve: i32,
 ) {
     let _ = height;
     let cy = mouth.y as i32 + mouth.h as i32 / 2;
     let half = mouth.h as f32 * 0.5;
     let n = mouth.w.max(1) as usize;
+    let denom = (n.max(2) - 1) as f32;
     let sample_at = |col: usize| -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -340,13 +377,20 @@ pub fn draw_scope(
         samples[idx.min(samples.len() - 1)]
     };
     let y_of = |col: usize| -> i32 {
+        let t = col as f32 / denom;
+        let arc = curve as f32 * (1.0 - (2.0 * t - 1.0).powi(2));
         let v = (sample_at(col) * gain).clamp(-1.0, 1.0);
-        cy - (v * half) as i32
+        cy + arc as i32 - (v * half) as i32
     };
+    let t = thickness.max(1) as i32;
+    let lo = -(t / 2);
+    let hi = t - 1 + lo;
     let mut prev = (mouth.x as i32, y_of(0));
     for col in 1..n {
         let cur = (mouth.x as i32 + col as i32, y_of(col));
-        draw_line(rgba, width, prev, cur, color);
+        for off in lo..=hi {
+            draw_line(rgba, width, (prev.0, prev.1 + off), (cur.0, cur.1 + off), color);
+        }
         prev = cur;
     }
 }
@@ -379,7 +423,7 @@ mod tests {
     #[test]
     fn rasterize_fills_canvas_with_dark_background() {
         let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'></svg>"#;
-        let rgba = rasterize(svg, 8, 6).expect("rasterize");
+        let (rgba, _fit) = rasterize(svg, 8, 6, 0.0).expect("rasterize");
         assert_eq!(rgba.len(), 8 * 6 * 4);
         assert_eq!(rgba[0], 0x2b);
         assert_eq!(rgba[1], 0x2b);
@@ -389,7 +433,7 @@ mod tests {
 
     #[test]
     fn rasterize_rejects_garbage() {
-        assert!(rasterize(b"not an svg", 8, 6).is_err());
+        assert!(rasterize(b"not an svg", 8, 6, 0.0).is_err());
     }
 
     fn px(rgba: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
@@ -402,7 +446,7 @@ mod tests {
         let (w, h) = (40u32, 40u32);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         let mouth = MouthBox { x: 10, y: 10, w: 20, h: 20 };
-        draw_scope(&mut rgba, w, h, &mouth, &[0.0; 64], [200, 0, 0], 6.0);
+        draw_scope(&mut rgba, w, h, &mouth, &[0.0; 64], [200, 0, 0], 6.0, 1, 0);
         assert_eq!(px(&rgba, w, 20, 20), [200, 0, 0]);
         assert_eq!(px(&rgba, w, 2, 2), [0, 0, 0]);
     }
@@ -414,7 +458,7 @@ mod tests {
         let mouth = MouthBox { x: 10, y: 10, w: 20, h: 20 };
         let mut samples = vec![0.0f32; 20];
         samples[10] = 1.0;
-        draw_scope(&mut rgba, w, h, &mouth, &samples, [200, 0, 0], 6.0);
+        draw_scope(&mut rgba, w, h, &mouth, &samples, [200, 0, 0], 6.0, 1, 0);
         let mut off_center_hit = false;
         for y in 10..30 {
             if y != 20 && px(&rgba, w, 20, y) == [200, 0, 0] {

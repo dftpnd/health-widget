@@ -17,9 +17,12 @@ pub struct AvatarCfg {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub margin: f32,
     pub mouth: MouthBox,
+    pub mouth_curve: u32,
     pub scope_color: [u8; 3],
     pub scope_gain: f32,
+    pub scope_thickness: u32,
 }
 
 impl Default for AvatarCfg {
@@ -34,9 +37,12 @@ impl Default for AvatarCfg {
             width: 640,
             height: 480,
             fps: 30,
-            mouth: MouthBox { x: 150, y: 330, w: 340, h: 90 },
-            scope_color: [220, 30, 20],
+            margin: 0.08,
+            mouth: MouthBox { x: 42, y: 176, w: 276, h: 46 },
+            mouth_curve: 50,
+            scope_color: [200, 0, 0],
             scope_gain: 6.0,
+            scope_thickness: 9,
         }
     }
 }
@@ -128,6 +134,12 @@ impl Config {
         if let Some(v) = env_f32("HEALTH_AVATAR_GAIN") {
             c.avatar.scope_gain = v;
         }
+        if let Some(v) = env_f32("HEALTH_AVATAR_MARGIN") {
+            c.avatar.margin = v;
+        }
+        if let Some(v) = env_f32("HEALTH_AVATAR_CURVE") {
+            c.avatar.mouth_curve = v.max(0.0) as u32;
+        }
         c
     }
 }
@@ -156,9 +168,11 @@ mod tests {
         assert_eq!(c.width, 640);
         assert_eq!(c.height, 480);
         assert_eq!(c.fps, 30);
-        assert_eq!(c.scope_color, [220, 30, 20]);
+        assert_eq!(c.scope_color, [200, 0, 0]);
+        assert!(c.margin >= 0.0 && c.margin < 0.4);
+        assert!(c.scope_thickness >= 1);
         assert!(c.mouth.w > 0 && c.mouth.h > 0);
-        assert!(c.mouth.x + c.mouth.w <= c.width);
-        assert!(c.mouth.y + c.mouth.h <= c.height);
+        assert!(c.mouth.x + c.mouth.w <= 360);
+        assert!(c.mouth.y + c.mouth.h <= 265);
     }
 }
