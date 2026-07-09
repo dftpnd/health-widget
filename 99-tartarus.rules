@@ -1,0 +1,7 @@
+# Razer Tartarus Pro (1532:0244) — доступ активному пользователю сеанса.
+# Раньше это делал root-сервис tartarus; теперь всю логику ведёт сам виджет
+# (grab + remap F13–F24 + RGB), запускаясь от пользователя. uaccess вешает ACL
+# на устройство для юзера активного графического сеанса — без группы input и
+# без перелогина. Нужны evdev-ноды (grab + чтение) и hidraw (:1.2, RGB).
+SUBSYSTEM=="input",  ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0244", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0244", TAG+="uaccess"

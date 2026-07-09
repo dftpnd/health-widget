@@ -33,18 +33,19 @@ pub struct State {
     /// Прокидывается как MIN_SIMILARITY автопилоту. None — старое состояние → "medium".
     #[serde(default)]
     pub pilot_strictness: Option<String>,
-    /// Ширина чат-колонки (точки). None — старое состояние → дефолт CHAT_W.
-    #[serde(default)]
-    pub chat_width: Option<f32>,
+    /// Ширина колонки терминала (точки). None — старое состояние → дефолт TERMINAL_W.
+    /// Алиас `chat_width` — читаем состояние, записанное до переименования колонки.
+    #[serde(default, alias = "chat_width")]
+    pub terminal_width: Option<f32>,
     /// Свёрнута ли секция «Автопилот».
     #[serde(default)]
     pub autopilot_collapsed: bool,
     /// Свёрнута ли секция «Показатели».
     #[serde(default)]
     pub metrics_collapsed: bool,
-    /// Открыта ли чат-колонка.
-    #[serde(default)]
-    pub chat_open: bool,
+    /// Открыта ли колонка терминала. Алиас `chat_open` — совместимость со старым state.json.
+    #[serde(default, alias = "chat_open")]
+    pub terminal_open: bool,
 }
 
 fn path() -> PathBuf {

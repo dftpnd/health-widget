@@ -38,49 +38,6 @@ pub fn set_keep_above(on: bool) -> bool {
     run_kwin_script(&for_our_window(&format!("w.keepAbove = {on};")), "keepabove")
 }
 
-/// Активировать окно (дать ему клавиатурный фокус компоновщика) и разминимизировать.
-/// На Wayland клиент не может активировать себя сам — просит KWin. true — если скрипт выполнился.
-pub fn activate() -> bool {
-    run_kwin_script(
-        &for_our_window("w.minimized = false; workspace.activeWindow = w;"),
-        "activate",
-    )
-}
-
-/// Прочитать `internalId` активного окна (того, что сейчас в фокусе компоновщика). None —
-/// не удалось. Значение печатается скриптом в лог KWin, откуда читаем через journalctl —
-/// тем же приёмом, что и [`get_position`]. Нужно, чтобы запомнить окно ДО активации нашего
-/// и вернуть ему фокус повторным нажатием кнопки.
-pub fn get_active_window_id() -> Option<String> {
-    if !run_kwin_script(
-        "var a = workspace.activeWindow; if (a) print(\"HW-ACTIVE id=\" + a.internalId);",
-        "active",
-    ) {
-        return None;
-    }
-    std::thread::sleep(Duration::from_millis(120)); // дать строке дойти до journal
-    let out = Command::new("journalctl")
-        .args(["--user", "-n", "40", "--no-pager", "-o", "cat"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().rev().find(|l| l.contains("HW-ACTIVE id="))?;
-    let rest = &line[line.find("id=")? + 3..];
-    let id: String = rest.split_whitespace().next()?.to_string();
-    (!id.is_empty()).then_some(id)
-}
-
-/// Активировать окно по его `internalId` (цикл по всем окнам, не только нашим). Используется
-/// для возврата фокуса окну, которое было активным до фокуса на чат. true — если скрипт выполнился.
-pub fn activate_window_by_id(id: &str) -> bool {
-    let body = format!(
-        "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
-         for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
-         if (w && String(w.internalId) === \"{id}\") {{ w.minimized = false; workspace.activeWindow = w; }} }}\n"
-    );
-    run_kwin_script(&body, "activate-id")
-}
-
 /// Переместить окно в (x, y), сохранив размер. true — если скрипт выполнился.
 pub fn set_position(x: i32, y: i32) -> bool {
     let body = for_our_window(&format!(

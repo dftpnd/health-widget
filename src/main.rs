@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod audio;
-mod chat;
 mod config;
 mod data;
 mod detect;
@@ -31,6 +30,7 @@ mod kwin_shot;
 mod recorder;
 mod screenshot;
 mod state;
+mod tartarus;
 mod terminal;
 mod transcribe;
 mod transcript_log;
@@ -71,7 +71,7 @@ const PILOT_STRICTNESS: &[(&str, &str, f32)] = &[
 const DEFAULT_STRICTNESS: &str = "medium";
 
 /// Ширина скрываемой чат-колонки (точки).
-const CHAT_W: f32 = 340.0;
+const TERMINAL_W: f32 = 340.0;
 
 /// Путь к per-profile сводке откликов. БД вакансий общая, но история/счётчики —
 /// свои у каждого профиля: автопилот пишет `data/stats-<profile>.json`.
@@ -179,34 +179,23 @@ struct App {
     /// Сколько нажатий уже обработано UI-потоком (микрофон/телемост).
     mark_mic_seen: u32,
     mark_zoom_seen: u32,
-    /// Запрос перевести фокус на поле ввода чата (кнопка Tartarus → SIGRTMIN+2).
-    /// Сигнальный поток ставит флаг, update() открывает чат (если закрыт), показывает
-    /// виджет и запрашивает фокус поля на этом же кадре — через флаг, т.к. сигнал
-    /// прилетает в другом потоке.
-    focus_chat_request: Arc<AtomicBool>,
-    /// Фокус поля ввода нужно запросить при ближайшей отрисовке чата.
-    focus_chat_pending: bool,
-    /// internalId окна, которое было активным до того, как кнопка забрала фокус на чат.
-    /// Повторное нажатие кнопки возвращает фокус этому окну. Заполняется в фоне (KWin+journal),
-    /// поэтому за Mutex; None — возвращать некуда.
-    prev_active_window: Arc<std::sync::Mutex<Option<String>>>,
+    /// Запрос-тумблер курсора (хоткей SIGRTMIN+2). Сигнальный/tartarus-поток ставит флаг,
+    /// update() читает его и уводит курсор в центр виджета либо возвращает обратно.
+    cursor_warp_request: Arc<AtomicBool>,
     /// Нормированная (0..1) позиция курсора до того, как хоткей увёл его в центр виджета.
     /// Повторное нажатие возвращает курсор сюда. За Mutex — заполняется в фоне; None — некуда.
     prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     /// Маркеры участков транскрипции (микрофон/телемост): завершённые диапазоны + активная запись.
     markers_mic: MarkerState,
     markers_zoom: MarkerState,
-    /// Чат-ассистент (правая колонка). Оставлен в дереве под будущий рефакторинг; сейчас
-    /// колонка рендерит терминал, а не чат.
-    chat: chat::ChatState,
     /// Встроенный терминал колонки. None до первого открытия колонки (ленивый старт shell).
     terminal: Option<terminal::Terminal>,
-    /// Открыта ли чат-колонка (иначе окно — одна колонка, как раньше).
-    chat_open: bool,
-    /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии чата.
+    /// Открыта ли колонка терминала (иначе окно — одна колонка, как раньше).
+    terminal_open: bool,
+    /// Запомненная ширина окна в режиме одной колонки — чтобы точно вернуться при закрытии колонки.
     width_one_col: Option<f32>,
-    /// Текущая ширина чат-колонки (точки) — сохраняется в state, восстанавливается при старте.
-    chat_width: f32,
+    /// Текущая ширина колонки терминала (точки) — сохраняется в state, восстанавливается при старте.
+    terminal_width: f32,
     /// Свёрнута ли секция «Автопилот» (сохраняется между запусками).
     autopilot_collapsed: bool,
     /// Свёрнута ли секция «Показатели» (сохраняется между запусками).
@@ -271,31 +260,34 @@ impl App {
         // Счётчики нажатий кнопок-маркеров (RT-сигналы от Tartarus: 10=микрофон, 15=телемост).
         let mark_mic = Arc::new(AtomicU32::new(0));
         let mark_zoom = Arc::new(AtomicU32::new(0));
-        // Запрос фокуса поля ввода чата — ставит SIGRTMIN+2 (кнопка Tartarus), читает update().
-        let focus_chat_request = Arc::new(AtomicBool::new(false));
+        // Запрос-тумблер курсора — ставит SIGRTMIN+2 (кнопка Tartarus), читает update().
+        let cursor_warp_request = Arc::new(AtomicBool::new(false));
 
         // Поток обработки сигналов: SIGUSR1 — тумблер видимости; SIGUSR2 — начать
-        // разметку области под снимок (кнопка «Скрин»); SIGRTMIN+0/+1 — тумблеры выделения
-        // транскрипции микрофона/телемоста (кнопки Tartarus через remap → pkill --signal).
+        // разметку области под снимок (кнопка «Скрин»); SIGRTMIN+0/+1/+2 — выделение
+        // микрофона/телемоста и тумблер курсора. Раньше эти сигналы слал внешний сервис
+        // tartarus (`pkill --signal`); теперь клавиши Tartarus обрабатывает модуль
+        // `tartarus` прямо в процессе (см. tartarus::spawn ниже), а сигналы остаются
+        // рабочими для внешних ярлыков и совместимости.
         {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
             let shot_request = shot_request.clone();
             let mark_mic = mark_mic.clone();
             let mark_zoom = mark_zoom.clone();
-            let focus_chat_request = focus_chat_request.clone();
+            let cursor_warp_request = cursor_warp_request.clone();
             // SIGRTMIN зависит от glibc (обычно 34); вычисляем один раз, тем же значением
             // Tartarus шлёт `pkill --signal 34/35/36`.
             let rt_mic = libc::SIGRTMIN();
             let rt_zoom = libc::SIGRTMIN() + 1;
-            let rt_focus_chat = libc::SIGRTMIN() + 2;
+            let rt_cursor_warp = libc::SIGRTMIN() + 2;
             std::thread::spawn(move || {
                 let mut signals = signal_hook::iterator::Signals::new([
                     signal_hook::consts::SIGUSR1,
                     signal_hook::consts::SIGUSR2,
                     rt_mic,
                     rt_zoom,
-                    rt_focus_chat,
+                    rt_cursor_warp,
                 ])
                 .expect("cannot register signal handler");
                 for sig in signals.forever() {
@@ -314,8 +306,8 @@ impl App {
                         ctx.request_repaint();
                         continue;
                     }
-                    if sig == rt_focus_chat {
-                        focus_chat_request.store(true, Ordering::Relaxed);
+                    if sig == rt_cursor_warp {
+                        cursor_warp_request.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
                         continue;
                     }
@@ -325,6 +317,18 @@ impl App {
                 }
             });
         }
+
+        // Логика бывшего внешнего сервиса `tartarus`, перенесённая в виджет: захват
+        // клавиатуры Tartarus Pro + ремап на F13–F24 + RGB. Клавиши-действия (5/R/F/
+        // Space) пишут в те же атомики, что и обработчик сигналов выше, поэтому и
+        // внутренний хват клавиатуры, и внешние сигналы работают одинаково.
+        tartarus::spawn(tartarus::Handles {
+            shot_request: shot_request.clone(),
+            mark_mic: mark_mic.clone(),
+            mark_zoom: mark_zoom.clone(),
+            cursor_warp_request: cursor_warp_request.clone(),
+            ctx: cc.egui_ctx.clone(),
+        });
 
         // Поток корректного завершения по SIGTERM/SIGINT: ставит флаг и будит UI. Саму
         // очистку (гашение автопилота → закрытие браузера → снятие lock профиля) делает
@@ -472,17 +476,14 @@ impl App {
             mark_zoom,
             mark_mic_seen: 0,
             mark_zoom_seen: 0,
-            focus_chat_request,
-            focus_chat_pending: false,
-            prev_active_window: Arc::new(std::sync::Mutex::new(None)),
+            cursor_warp_request,
             prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             markers_mic: MarkerState::default(),
             markers_zoom: MarkerState::default(),
-            chat: chat::ChatState::default(),
             terminal: None,
-            chat_open: st.chat_open,
+            terminal_open: st.terminal_open,
             width_one_col: None,
-            chat_width: st.chat_width.unwrap_or(CHAT_W),
+            terminal_width: st.terminal_width.unwrap_or(TERMINAL_W),
             autopilot_collapsed: st.autopilot_collapsed,
             metrics_collapsed: st.metrics_collapsed,
         }
@@ -605,10 +606,10 @@ impl App {
     /// Собрать текущее состояние для сохранения (размер/позиция/источник/закрепление).
     fn current_state(&self, ctx: &egui::Context) -> state::State {
         let size = ctx.screen_rect().size();
-        // Сохраняем ширину «одной колонки»: если чат открыт, окно шире на чат-колонку —
-        // вычитаем её, чтобы при старте (чат закрыт) окно вернулось к правильной ширине.
-        let win_w = if self.chat_open {
-            (size.x - self.chat_width).max(200.0)
+        // Сохраняем ширину «одной колонки»: если колонка терминала открыта, окно шире на неё —
+        // вычитаем её, чтобы при старте (колонка закрыта) окно вернулось к правильной ширине.
+        let win_w = if self.terminal_open {
+            (size.x - self.terminal_width).max(200.0)
         } else {
             size.x
         };
@@ -628,10 +629,10 @@ impl App {
             pinned: self.pinned,
             pilot_profile: Some(self.pilot_profile.clone()),
             pilot_strictness: Some(self.pilot_strictness.clone()),
-            chat_width: Some(self.chat_width),
+            terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             metrics_collapsed: self.metrics_collapsed,
-            chat_open: self.chat_open,
+            terminal_open: self.terminal_open,
         }
     }
 
@@ -739,142 +740,6 @@ impl App {
             }
         }
     }
-
-    /// Нарисовать содержимое чат-колонки: шапка + лента сообщений + ввод.
-    #[allow(dead_code)] // чат оставлен в дереве под будущий рефакторинг; колонка рендерит терминал
-    fn draw_chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.chat.drain_inbox();
-
-        // Приём картинки перетаскиванием в область чата → OCR в attachment (до отрисовки чипа).
-        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        for path in dropped {
-            match chat::ocr_file(&path) {
-                Ok(t) => self.chat.attachment = Some(t),
-                Err(e) => self.chat.messages.push(chat::ChatMessage {
-                    role: chat::Role::Error,
-                    text: e,
-                }),
-            }
-        }
-
-        // Шапка сверху.
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("💬 Чат")
-                    .size(13.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(180, 200, 255)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("очистить").clicked() {
-                    self.chat.clear();
-                }
-            });
-        });
-        ui.separator();
-
-        // Ввод прикреплён к НИЗУ панели через bottom-панель, иначе прокручиваемая лента
-        // (auto_shrink=false) забирает всю высоту и выталкивает поле ввода за край окна.
-        let mut do_send = false;
-        egui::TopBottomPanel::bottom("chat_input")
-            .resizable(false)
-            .frame(egui::Frame::default())
-            .show_inside(ui, |ui| {
-                ui.separator();
-                // Чип с прикреплённым OCR-текстом (видно, что уйдёт вместе с сообщением).
-                if let Some(att) = self.chat.attachment.clone() {
-                    ui.horizontal(|ui| {
-                        let short: String = att.chars().take(40).collect();
-                        let ell = if att.chars().count() > 40 { "…" } else { "" };
-                        ui.label(
-                            egui::RichText::new(format!("📷 {short}{ell}"))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 180, 150)),
-                        );
-                        if ui.small_button("✕").on_hover_text("убрать картинку").clicked() {
-                            self.chat.attachment = None;
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("📎").on_hover_text("вставить картинку из буфера (OCR)").clicked() {
-                        match chat::ocr_clipboard() {
-                            Ok(t) => self.chat.attachment = Some(t),
-                            Err(e) => self.chat.messages.push(chat::ChatMessage {
-                                role: chat::Role::Error,
-                                text: e,
-                            }),
-                        }
-                    }
-                    let send_clicked =
-                        ui.button("▶").on_hover_text("отправить (Enter)").clicked();
-                    // Enter без Shift при фокусе поля = отправка. Клавишу гасим ДО TextEdit,
-                    // чтобы он не вставлял перевод строки и чтобы отправка надёжно срабатывала
-                    // (multiline иначе «съедает» Enter — key_pressed после него не виден).
-                    // Shift+Enter не гасим → это обычный перенос строки внутри поля.
-                    let field_id = egui::Id::new("chat_input_field");
-                    let enter = ui.memory(|m| m.has_focus(field_id))
-                        && ui.input_mut(|i| {
-                            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                        });
-                    let field = ui.add(
-                        egui::TextEdit::multiline(&mut self.chat.input)
-                            .id(field_id)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("сообщение…"),
-                    );
-                    // Кнопка Tartarus (SIGRTMIN+2) попросила фокус — отдаём его полю ровно раз.
-                    if self.focus_chat_pending {
-                        field.request_focus();
-                        self.focus_chat_pending = false;
-                    }
-                    do_send = send_clicked || enter;
-                });
-            });
-
-        // Лента сообщений заполняет оставшееся место над полем ввода.
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default())
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("chat_log")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for msg in &self.chat.messages {
-                            let (who, color) = match msg.role {
-                                chat::Role::User => ("ты", egui::Color32::from_rgb(150, 210, 170)),
-                                chat::Role::Assistant => {
-                                    ("ассистент", egui::Color32::from_rgb(180, 200, 255))
-                                }
-                                chat::Role::Error => ("ошибка", egui::Color32::from_rgb(230, 120, 120)),
-                            };
-                            ui.label(egui::RichText::new(who).size(10.0).color(color));
-                            ui.label(egui::RichText::new(&msg.text).size(14.0));
-                            ui.add_space(4.0);
-                        }
-                        if self.chat.is_sending() {
-                            ui.label(
-                                egui::RichText::new("…думает")
-                                    .italics()
-                                    .size(12.0)
-                                    .color(egui::Color32::from_rgb(140, 146, 158)),
-                            );
-                        }
-                    });
-            });
-
-        if do_send && !self.chat.is_sending() {
-            self.chat.send(ctx, self.cfg.autopilot_dir.clone());
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -908,52 +773,24 @@ impl eframe::App for App {
             self.show_shot_overlay(ctx);
         }
 
-        // Кнопка Tartarus (SIGRTMIN+2) — тумблер фокуса ТЕРМИНАЛА. Работает на уровне окна:
-        // на Wayland клиент не активирует себя сам, фокус даёт/забирает KWin. Наше окно уже в
-        // фокусе → повторное нажатие: вернуть фокус окну, которое было активным до нас. Иначе →
-        // запомнить текущее активное окно, показать виджет, открыть колонку с терминалом и
-        // активировать наше окно; терминал сам забирает клавиатуру (TerminalView::set_focus).
-        if self.focus_chat_request.swap(false, Ordering::Relaxed) {
-            if ctx.input(|i| i.focused) {
-                // Повторное нажатие: вернуть фокус предыдущему окну И курсор туда, где он был
-                // (в фоне — не блокируем UI).
-                let slot = self.prev_active_window.clone();
-                let cslot = self.prev_cursor.clone();
-                std::thread::spawn(move || {
-                    if let Some(id) = slot.lock().unwrap().take() {
-                        winctl::activate_window_by_id(&id);
-                    }
-                    if let Some((nx, ny)) = cslot.lock().unwrap().take() {
-                        winctl::warp_cursor_norm(nx, ny);
-                    }
-                });
-            } else {
-                // Первое нажатие: показать виджет, открыть терминал-колонку (с ресайзом окна
-                // как у тумблера 🖥, если была закрыта).
-                self.shared.user_visible.store(true, Ordering::Relaxed);
-                if !self.chat_open {
-                    self.chat_open = true;
-                    let cur = ctx.screen_rect();
-                    self.width_one_col = Some(cur.width());
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        cur.width() + self.chat_width,
-                        cur.height(),
-                    )));
-                }
-                // В фоне: запомнить активное сейчас окно и позицию курсора (это НЕ мы — мы не в
-                // фокусе), переместить курсор в центр виджета, затем активировать наше окно.
-                // Как только окно активно, терминал получает клавиатуру (просит фокус каждый кадр).
-                let slot = self.prev_active_window.clone();
-                let cslot = self.prev_cursor.clone();
-                std::thread::spawn(move || {
-                    *slot.lock().unwrap() = winctl::get_active_window_id();
-                    *cslot.lock().unwrap() = winctl::cursor_pos_norm();
+        // Хоткей SIGRTMIN+2 — тумблер КУРСОРА (в фоне — не блокируем UI; чтение позиции/центра
+        // идёт через KWin+journal и подтормаживает). Первое нажатие: запомнить позицию курсора и
+        // увести его в центр виджета; повтор: вернуть курсор туда, где он был.
+        if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
+            let cslot = self.prev_cursor.clone();
+            std::thread::spawn(move || {
+                let mut slot = cslot.lock().unwrap();
+                if let Some((nx, ny)) = slot.take() {
+                    // Повтор: вернуть курсор.
+                    winctl::warp_cursor_norm(nx, ny);
+                } else {
+                    // Первое нажатие: запомнить текущую позицию и увести в центр виджета.
+                    *slot = winctl::cursor_pos_norm();
                     if let Some((nx, ny)) = winctl::widget_center_norm() {
                         winctl::warp_cursor_norm(nx, ny);
                     }
-                    winctl::activate();
-                });
-            }
+                }
+            });
         }
 
         // Автопилот мог сам завершиться/упасть — тогда гасим кнопки. Разовые фазы
@@ -986,10 +823,10 @@ impl eframe::App for App {
                 .inner_margin(egui::Margin::same(MARGIN as i8))
                 .corner_radius(10);
 
-            if self.chat_open {
-                let resp = egui::SidePanel::right("chat_panel")
+            if self.terminal_open {
+                let resp = egui::SidePanel::right("terminal_panel")
                     .resizable(true)
-                    .default_width(self.chat_width)
+                    .default_width(self.terminal_width)
                     .frame(frame)
                     .show(ctx, |ui| {
                         let term = self
@@ -998,7 +835,7 @@ impl eframe::App for App {
                         term.ui(ui);
                     });
                 // Запоминаем фактическую ширину колонки (юзер мог перетянуть) для сохранения.
-                self.chat_width = resp.response.rect.width();
+                self.terminal_width = resp.response.rect.width();
             }
 
             let inner = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -1026,7 +863,7 @@ impl eframe::App for App {
                 let title = self.metrics.title.clone();
                 let pinned = self.pinned;
                 let mut toggle_pin = false;
-                let mut toggle_chat = false;
+                let mut toggle_terminal = false;
                 ui.horizontal(|ui| {
                     if let Some(t) = &title {
                         ui.label(
@@ -1046,11 +883,11 @@ impl eframe::App for App {
                             toggle_pin = true;
                         }
                         if ui
-                            .selectable_label(self.chat_open, "🖥")
+                            .selectable_label(self.terminal_open, "🖥")
                             .on_hover_text("Терминал")
                             .clicked()
                         {
-                            toggle_chat = true;
+                            toggle_terminal = true;
                         }
                         // Версия сборки — чтобы сразу видеть, свежий ли это бинарь.
                         ui.label(
@@ -1070,20 +907,20 @@ impl eframe::App for App {
                     self.pinned = !self.pinned;
                     winctl::set_keep_above(self.pinned);
                 }
-                if toggle_chat {
-                    self.chat_open = !self.chat_open;
+                if toggle_terminal {
+                    self.terminal_open = !self.terminal_open;
                     let cur = ctx.screen_rect();
-                    if self.chat_open {
+                    if self.terminal_open {
                         self.width_one_col = Some(cur.width());
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            cur.width() + self.chat_width,
+                            cur.width() + self.terminal_width,
                             cur.height(),
                         )));
                     } else {
                         let target = self
                             .width_one_col
                             .take()
-                            .unwrap_or((cur.width() - self.chat_width).max(200.0));
+                            .unwrap_or((cur.width() - self.terminal_width).max(200.0));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                             target,
                             cur.height(),
@@ -2302,8 +2139,8 @@ fn main() -> eframe::Result<()> {
     // Если чат был открыт — окно сразу шире на ширину чат-колонки (в state хранится ширина
     // «одной колонки»), иначе SidePanel сожмёт основной контент.
     let base_w = st.width.unwrap_or(cfg.width);
-    let start_w = if st.chat_open {
-        base_w + st.chat_width.unwrap_or(CHAT_W)
+    let start_w = if st.terminal_open {
+        base_w + st.terminal_width.unwrap_or(TERMINAL_W)
     } else {
         base_w
     };
