@@ -18,6 +18,7 @@ pub struct AvatarCfg {
     pub height: u32,
     pub fps: u32,
     pub margin: f32,
+    pub flip_h: bool,
     pub mouth: MouthBox,
     pub mouth_curve: u32,
     pub scope_color: [u8; 3],
@@ -37,7 +38,8 @@ impl Default for AvatarCfg {
             width: 640,
             height: 480,
             fps: 30,
-            margin: 0.08,
+            margin: 0.15,
+            flip_h: true,
             mouth: MouthBox { x: 113, y: 198, w: 135, h: 46 },
             mouth_curve: 6,
             scope_color: [200, 0, 0],
@@ -139,6 +141,9 @@ impl Config {
         }
         if let Some(v) = env_f32("HEALTH_AVATAR_CURVE") {
             c.avatar.mouth_curve = v.max(0.0) as u32;
+        }
+        if let Some(v) = env_bool("HEALTH_AVATAR_FLIP") {
+            c.avatar.flip_h = v;
         }
         c
     }

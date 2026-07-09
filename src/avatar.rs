@@ -84,7 +84,12 @@ impl Avatar {
                     cfg.scope_thickness,
                     curve,
                 );
-                let yuyv = rgba_to_yuyv(&frame, cfg.width, cfg.height);
+                let out = if cfg.flip_h {
+                    std::borrow::Cow::Owned(flip_h_rgba(&frame, cfg.width, cfg.height))
+                } else {
+                    std::borrow::Cow::Borrowed(&frame)
+                };
+                let yuyv = rgba_to_yuyv(&out, cfg.width, cfg.height);
                 match cam.write_frame(&yuyv) {
                     Ok(_) => fail_streak = 0,
                     Err(_) => {
@@ -285,6 +290,21 @@ fn chroma_u(r: f32, g: f32, b: f32) -> f32 {
 
 fn chroma_v(r: f32, g: f32, b: f32) -> f32 {
     128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
+}
+
+pub fn flip_h_rgba(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0u8; src.len()];
+    for row in 0..h {
+        let base = row * w * 4;
+        for col in 0..w {
+            let s = base + col * 4;
+            let d = base + (w - 1 - col) * 4;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    out
 }
 
 pub fn rgba_to_yuyv(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
