@@ -3,7 +3,7 @@
         "Id": "health-widget-exclude",
         "Name": "Health Widget – Exclude From Capture",
         "Description": "Помечает окно health-widget как исключённое из захвата экрана (KDE Plasma 6.6+)",
-        "Version": "1.0",
+        "Version": "1.1",
         "License": "MIT",
         "EnabledByDefault": true
     },

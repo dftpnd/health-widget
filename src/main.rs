@@ -185,7 +185,6 @@ struct App {
     clipboard_preview: Arc<std::sync::Mutex<String>>,
     clip_open: bool,
     clip_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
-    clip_open_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -288,7 +287,6 @@ impl App {
         let clip_pos = Arc::new(std::sync::Mutex::new(
             st.clip_x.zip(st.clip_y).map(|(x, y)| (x as i32, y as i32)),
         ));
-        let clip_open_flag = Arc::new(AtomicBool::new(st.clip_open));
 
         {
             let want_pin = st.pinned;
@@ -320,19 +318,15 @@ impl App {
         {
             let shared = shared.clone();
             let clip_pos = clip_pos.clone();
-            let clip_open_flag = clip_open_flag.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(4));
-                if let Some(p) = winctl::get_position() {
+            winctl::follow_geometry(move |ev| match ev {
+                winctl::GeomEvent::Main(x, y) => {
                     if let Ok(mut g) = shared.pos.lock() {
-                        *g = Some(p);
+                        *g = Some((x, y));
                     }
                 }
-                if clip_open_flag.load(Ordering::Relaxed) {
-                    if let Some(p) = winctl::get_clip_position() {
-                        if let Ok(mut g) = clip_pos.lock() {
-                            *g = Some(p);
-                        }
+                winctl::GeomEvent::Clip(x, y) => {
+                    if let Ok(mut g) = clip_pos.lock() {
+                        *g = Some((x, y));
                     }
                 }
             });
@@ -453,7 +447,6 @@ impl App {
             clipboard_preview,
             clip_open: st.clip_open,
             clip_pos,
-            clip_open_flag,
         }
     }
 
@@ -1029,7 +1022,6 @@ impl App {
 
     fn toggle_clip_window(&mut self) {
         self.clip_open = !self.clip_open;
-        self.clip_open_flag.store(self.clip_open, Ordering::Relaxed);
         if !self.clip_open {
             return;
         }
@@ -1206,7 +1198,6 @@ impl App {
 
         if close {
             self.clip_open = false;
-            self.clip_open_flag.store(false, Ordering::Relaxed);
         }
     }
 

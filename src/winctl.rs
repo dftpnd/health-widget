@@ -33,16 +33,11 @@ fn for_clip_window(inner: &str) -> String {
 pub fn set_clip_position(x: i32, y: i32) -> bool {
     let body = for_clip_window(&format!(
         "w.keepAbove = true; var g = w.frameGeometry; \
-         w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }};"
+         w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }}; \
+         var g2 = w.frameGeometry; \
+         print(\"HWC-GEOM \" + Math.round(g2.x) + \" \" + Math.round(g2.y));"
     ));
     run_kwin_script(&body, "clipmove")
-}
-
-pub fn get_clip_position() -> Option<(i32, i32)> {
-    let body = for_clip_window(
-        "var g = w.frameGeometry; print(\"HWC-GEOM \" + Math.round(g.x) + \" \" + Math.round(g.y));",
-    );
-    read_two_floats(&body, "clipgeom", "HWC-GEOM").map(|(x, y)| (x as i32, y as i32))
 }
 
 pub fn set_keep_above(on: bool) -> bool {
@@ -51,33 +46,68 @@ pub fn set_keep_above(on: bool) -> bool {
 
 pub fn set_position(x: i32, y: i32) -> bool {
     let body = for_our_window(&format!(
-        "var g = w.frameGeometry; w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }};"
+        "var g = w.frameGeometry; w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }}; \
+         var g2 = w.frameGeometry; \
+         print(\"HW-GEOM x=\" + Math.round(g2.x) + \" y=\" + Math.round(g2.y));"
     ));
     run_kwin_script(&body, "move")
 }
 
 pub fn move_by(dx: i32, dy: i32) -> bool {
     let body = for_our_window(&format!(
-        "var g = w.frameGeometry; w.frameGeometry = {{ x: g.x + {dx}, y: g.y + {dy}, width: g.width, height: g.height }};"
+        "var g = w.frameGeometry; w.frameGeometry = {{ x: g.x + {dx}, y: g.y + {dy}, width: g.width, height: g.height }}; \
+         var g2 = w.frameGeometry; \
+         print(\"HW-GEOM x=\" + Math.round(g2.x) + \" y=\" + Math.round(g2.y));"
     ));
     run_kwin_script(&body, "moveby")
 }
 
-pub fn get_position() -> Option<(i32, i32)> {
-    let body = for_our_window(
-        "var g = w.frameGeometry; print(\"HW-GEOM x=\" + Math.round(g.x) + \" y=\" + Math.round(g.y));",
-    );
-    if !run_kwin_script(&body, "geom") {
-        return None;
+pub fn parse_geom_line(line: &str) -> Option<GeomEvent> {
+    if let Some(i) = line.find("HWC-GEOM ") {
+        let mut it = line[i + "HWC-GEOM ".len()..].split_whitespace();
+        let x: i32 = it.next()?.parse().ok()?;
+        let y: i32 = it.next()?.parse().ok()?;
+        return Some(GeomEvent::Clip(x, y));
     }
-    std::thread::sleep(Duration::from_millis(120));
-    let out = Command::new("journalctl")
-        .args(["--user", "-n", "40", "--no-pager", "-o", "cat"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().rev().find(|l| l.contains("HW-GEOM"))?;
-    Some((parse_field(line, "x=")?, parse_field(line, "y=")?))
+    if let Some(i) = line.find("HW-GEOM ") {
+        let rest = &line[i..];
+        return Some(GeomEvent::Main(parse_field(rest, "x=")?, parse_field(rest, "y=")?));
+    }
+    None
+}
+
+#[derive(Debug, PartialEq)]
+pub enum GeomEvent {
+    Main(i32, i32),
+    Clip(i32, i32),
+}
+
+pub fn follow_geometry(mut on_event: impl FnMut(GeomEvent) + Send + 'static) {
+    std::thread::spawn(move || loop {
+        let child = Command::new("journalctl")
+            .args(["--user", "-f", "-n", "80", "-o", "cat"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        };
+        if let Some(out) = child.stdout.take() {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(out);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if let Some(ev) = parse_geom_line(&line) {
+                    on_event(ev);
+                }
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_secs(2));
+    });
 }
 
 fn parse_field(line: &str, key: &str) -> Option<i32> {
@@ -253,7 +283,28 @@ fn qdbus(args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_field;
+    use super::{parse_field, parse_geom_line, GeomEvent};
+
+    #[test]
+    fn geom_line_main_window() {
+        assert_eq!(
+            parse_geom_line("js: HW-GEOM x=1512 y=139"),
+            Some(GeomEvent::Main(1512, 139))
+        );
+    }
+
+    #[test]
+    fn geom_line_clip_window() {
+        assert_eq!(
+            parse_geom_line("js: HWC-GEOM 1918 -7"),
+            Some(GeomEvent::Clip(1918, -7))
+        );
+    }
+
+    #[test]
+    fn geom_line_other_is_none() {
+        assert_eq!(parse_geom_line("obычная строка журнала"), None);
+    }
 
     #[test]
     fn reads_positive_int_after_key() {
