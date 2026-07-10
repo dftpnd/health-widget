@@ -12,6 +12,7 @@ mod data;
 mod deepseek;
 mod detect;
 mod hr_reply;
+mod instance;
 mod pilot;
 mod pilot_scan;
 mod pilot_stats;
@@ -2415,6 +2416,10 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
+    telemetry::init();
+    instance::acquire_or_replace();
+    instance::wait_whisper_gone();
+
     let cfg = Config::load();
     let st = state::load();
 
@@ -2455,8 +2460,6 @@ fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
-
-    telemetry::init();
 
     let cfg_for_app = cfg.clone();
     eframe::run_native(

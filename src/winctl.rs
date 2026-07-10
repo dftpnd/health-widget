@@ -102,12 +102,17 @@ pub fn ensure_dotoold() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let _ = Command::new(&dotoold)
+    if let Ok(mut child) = Command::new(&dotoold)
         .env("PATH", path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {

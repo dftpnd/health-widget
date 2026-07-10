@@ -69,6 +69,16 @@ impl Transcriber {
         if std::env::var("HEALTH_TRANSCRIBE").as_deref() == Ok("0") {
             return None;
         }
+        if let Some(free) = free_vram_mib() {
+            let need = min_free_mib();
+            if free < need {
+                crate::telemetry::error(
+                    "stt.low_vram",
+                    &format!("{channel}: свободно {free} MiB < порога {need} MiB"),
+                );
+                return None;
+            }
+        }
         let python = python_path()?;
         let model = model_spec();
         let script = ensure_script()?;
@@ -163,6 +173,7 @@ impl Drop for Transcriber {
     fn drop(&mut self) {
         crate::telemetry::event("stt.stop", serde_json::json!({ "channel": self.channel }));
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -182,9 +193,35 @@ fn model_spec() -> String {
     std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "large-v3".to_string())
 }
 
+pub fn script_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("whisper_stream.py"))
+}
+
+fn free_vram_mib() -> Option<u64> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_free_mib(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_free_mib(s: &str) -> Option<u64> {
+    s.lines().filter_map(|l| l.trim().parse().ok()).min()
+}
+
+fn min_free_mib() -> u64 {
+    std::env::var("HEALTH_STT_MIN_FREE_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000)
+}
+
 fn ensure_script() -> Option<PathBuf> {
     const SRC: &str = include_str!("../scripts/whisper_stream.py");
-    let path = data_dir()?.join("whisper_stream.py");
+    let path = script_path()?;
     let need_write = std::fs::read_to_string(&path).map(|c| c != SRC).unwrap_or(true);
     if need_write {
         if let Some(parent) = path.parent() {
@@ -210,7 +247,23 @@ fn trim_head(s: &mut String, max: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_head;
+    use super::{parse_free_mib, trim_head};
+
+    #[test]
+    fn parse_single_gpu() {
+        assert_eq!(parse_free_mib("11650\n"), Some(11650));
+    }
+
+    #[test]
+    fn parse_multi_gpu_takes_min() {
+        assert_eq!(parse_free_mib("11650\n 512 \n"), Some(512));
+    }
+
+    #[test]
+    fn parse_garbage_is_none() {
+        assert_eq!(parse_free_mib("N/A\n"), None);
+        assert_eq!(parse_free_mib(""), None);
+    }
 
     #[test]
     fn short_string_unchanged() {
