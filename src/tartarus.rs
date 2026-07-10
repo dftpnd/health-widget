@@ -52,6 +52,7 @@ pub struct Handles {
     pub copy_mic: Arc<AtomicBool>,
     pub copy_zoom: Arc<AtomicBool>,
     pub clear_chat: Arc<AtomicBool>,
+    pub paste_code: Arc<AtomicBool>,
     pub move_dx: Arc<AtomicI32>,
     pub move_dy: Arc<AtomicI32>,
     pub ctx: Context,
@@ -208,13 +209,19 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
+        if code == KeyCode::KEY_R.0 {
+            h.paste_code.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
     } else if matches!(code, c if c == KeyCode::KEY_5.0
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0
         || c == KeyCode::KEY_3.0
         || c == KeyCode::KEY_W.0
-        || c == KeyCode::KEY_A.0)
+        || c == KeyCode::KEY_A.0
+        || c == KeyCode::KEY_R.0)
     {
         return;
     }

@@ -30,6 +30,12 @@ pub struct State {
     pub chat_collapsed: bool,
     #[serde(default, alias = "chat_open")]
     pub terminal_open: bool,
+    #[serde(default)]
+    pub clip_open: bool,
+    #[serde(default)]
+    pub clip_x: Option<f32>,
+    #[serde(default)]
+    pub clip_y: Option<f32>,
 }
 
 fn path() -> PathBuf {

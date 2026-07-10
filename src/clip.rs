@@ -2,6 +2,13 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+pub fn get() -> Option<String> {
+    let out = Command::new("wl-paste").arg("-n").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub fn set(text: &str) -> Result<(), String> {
     let mut child = Command::new("wl-copy")
         .stdin(Stdio::piped())

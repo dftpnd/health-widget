@@ -167,6 +167,7 @@ struct App {
     stable_since: Instant,
     shot: ShotState,
     cursor_warp_request: Arc<AtomicBool>,
+    paste_code: Arc<AtomicBool>,
     prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     transcript_keys: TranscriptKeys,
     win_move: WindowMove,
@@ -180,6 +181,10 @@ struct App {
     chat_collapsed: bool,
     deepseek: Option<deepseek::Slot>,
     help_open: bool,
+    clipboard_preview: Arc<std::sync::Mutex<String>>,
+    clip_open: bool,
+    clip_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    clip_open_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -200,6 +205,7 @@ impl App {
         let shot_request = Arc::new(AtomicBool::new(false));
 
         let cursor_warp_request = Arc::new(AtomicBool::new(false));
+        let paste_code = Arc::new(AtomicBool::new(false));
         let transcript_keys = TranscriptKeys::new();
         let win_move = WindowMove::new();
 
@@ -242,6 +248,7 @@ impl App {
             copy_mic: transcript_keys.copy_mic.clone(),
             copy_zoom: transcript_keys.copy_zoom.clone(),
             clear_chat: transcript_keys.clear_chat.clone(),
+            paste_code: paste_code.clone(),
             move_dx: win_move.dx.clone(),
             move_dy: win_move.dy.clone(),
             ctx: cc.egui_ctx.clone(),
@@ -277,10 +284,20 @@ impl App {
             });
         }
 
+        let clip_pos = Arc::new(std::sync::Mutex::new(
+            st.clip_x.zip(st.clip_y).map(|(x, y)| (x as i32, y as i32)),
+        ));
+        let clip_open_flag = Arc::new(AtomicBool::new(st.clip_open));
+
         {
             let want_pin = st.pinned;
             let pos = st.x.zip(st.y).map(|(x, y)| (x as i32, y as i32));
-            if want_pin || pos.is_some() {
+            let clip = st
+                .clip_open
+                .then(|| st.clip_x.zip(st.clip_y))
+                .flatten()
+                .map(|(x, y)| (x as i32, y as i32));
+            if want_pin || pos.is_some() || clip.is_some() {
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(800));
                     for _ in 0..2 {
@@ -290,6 +307,9 @@ impl App {
                         if let Some((x, y)) = pos {
                             winctl::set_position(x, y);
                         }
+                        if let Some((x, y)) = clip {
+                            winctl::set_clip_position(x, y);
+                        }
                         std::thread::sleep(Duration::from_millis(600));
                     }
                 });
@@ -298,12 +318,47 @@ impl App {
 
         {
             let shared = shared.clone();
+            let clip_pos = clip_pos.clone();
+            let clip_open_flag = clip_open_flag.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(4));
                 if let Some(p) = winctl::get_position() {
                     if let Ok(mut g) = shared.pos.lock() {
                         *g = Some(p);
                     }
+                }
+                if clip_open_flag.load(Ordering::Relaxed) {
+                    if let Some(p) = winctl::get_clip_position() {
+                        if let Ok(mut g) = clip_pos.lock() {
+                            *g = Some(p);
+                        }
+                    }
+                }
+            });
+        }
+
+        let clipboard_preview = Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let clipboard_preview = clipboard_preview.clone();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let cur = clip::get().unwrap_or_default();
+                let cur_len = cur.len();
+                let changed = clipboard_preview
+                    .lock()
+                    .map(|mut g| {
+                        if *g == cur {
+                            false
+                        } else {
+                            *g = cur;
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    eprintln!("clip poll: {} байт", cur_len);
+                    ctx.request_repaint();
                 }
             });
         }
@@ -380,6 +435,7 @@ impl App {
                 points: Vec::new(),
             },
             cursor_warp_request,
+            paste_code,
             prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             transcript_keys,
             win_move,
@@ -393,6 +449,10 @@ impl App {
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
             help_open: false,
+            clipboard_preview,
+            clip_open: st.clip_open,
+            clip_pos,
+            clip_open_flag,
         }
     }
 
@@ -544,6 +604,10 @@ impl App {
             Some((px, py)) => (Some(px as f32), Some(py as f32)),
             None => (self.last_saved.x, self.last_saved.y),
         };
+        let (clip_x, clip_y) = match self.clip_pos.lock().ok().and_then(|g| *g) {
+            Some((px, py)) => (Some(px as f32), Some(py as f32)),
+            None => (self.last_saved.clip_x, self.last_saved.clip_y),
+        };
         state::State {
             x,
             y,
@@ -560,6 +624,9 @@ impl App {
             metrics_collapsed: self.metrics_collapsed,
             chat_collapsed: self.chat_collapsed,
             terminal_open: self.terminal_open,
+            clip_open: self.clip_open,
+            clip_x,
+            clip_y,
         }
     }
 
@@ -698,6 +765,17 @@ impl App {
                 {
                     do_restart = true;
                 }
+                if ui
+                    .button("⌨")
+                    .on_hover_text(
+                        "Напечатать код из буфера в позиции курсора (бинд 10).\n\
+                         Для набора в другом окне жми клавишу 10 на кейпаде, \
+                         а не эту кнопку — клик забирает фокус на виджет.",
+                    )
+                    .clicked()
+                {
+                    type_clipboard_code();
+                }
                 ui.label(
                     egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
@@ -751,6 +829,7 @@ impl App {
             ("05", "📷 Скриншот"),
             ("07", "🧹 Очистить транскрипт зума"),
             ("08", "📤 Копировать зум + отправить в чат"),
+            ("10", "⌨ Печатать код из буфера в позиции курсора"),
             ("12", "🗑 Очистить чат"),
             ("20", "🎯 Курсор в центр виджета"),
             ("D-pad", "🕹 Двигать виджет по экрану"),
@@ -945,6 +1024,189 @@ impl App {
                 ctx.request_repaint_after(Duration::from_millis(66));
             }
         });
+    }
+
+    fn toggle_clip_window(&mut self) {
+        self.clip_open = !self.clip_open;
+        self.clip_open_flag.store(self.clip_open, Ordering::Relaxed);
+        if !self.clip_open {
+            return;
+        }
+        let pos = self
+            .clip_pos
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .or_else(|| {
+                self.last_saved
+                    .clip_x
+                    .zip(self.last_saved.clip_y)
+                    .map(|(x, y)| (x as i32, y as i32))
+            });
+        if let Some((x, y)) = pos {
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    std::thread::sleep(Duration::from_millis(400));
+                    winctl::set_clip_position(x, y);
+                }
+            });
+        }
+    }
+
+    fn draw_clipboard(&mut self, ui: &mut egui::Ui) {
+        section(ui, "📋 Буфер", |ui| {
+            let label = if self.clip_open {
+                "📋 Скрыть панель"
+            } else {
+                "📋 Показать панель"
+            };
+            if ui
+                .button(label)
+                .on_hover_text("Плавающая панель с содержимым буфера обмена")
+                .clicked()
+            {
+                self.toggle_clip_window();
+            }
+            self.clip_preview_ui(ui);
+        });
+    }
+
+    fn clip_text(&self) -> Option<String> {
+        let text = self
+            .clipboard_preview
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let binary = text.contains('\u{FFFD}')
+            || text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'));
+        (!text.is_empty() && !binary).then_some(text)
+    }
+
+    fn clip_counters(text: &str) -> String {
+        let chars = text.chars().count();
+        let lines = text.lines().count().max(1);
+        format!("{chars} симв · {lines} стр")
+    }
+
+    fn clip_preview_ui(&self, ui: &mut egui::Ui) {
+        let Some(text) = self.clip_text() else {
+            self.clip_empty_ui(ui);
+            return;
+        };
+        let preview: String = text
+            .trim()
+            .chars()
+            .take(160)
+            .map(|c| if c == '\n' { '⏎' } else { c })
+            .collect();
+        ui.add(
+            egui::Label::new(egui::RichText::new(preview).size(11.0).monospace())
+                .truncate(),
+        );
+        ui.weak(Self::clip_counters(&text));
+    }
+
+    fn clip_full_ui(&self, ui: &mut egui::Ui) {
+        let Some(text) = self.clip_text() else {
+            self.clip_empty_ui(ui);
+            return;
+        };
+        let shown: String = text.chars().take(4000).collect();
+        let clipped = shown.len() < text.len();
+        egui::ScrollArea::vertical()
+            .max_height(380.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(shown).size(11.0).monospace(),
+                    )
+                    .wrap(),
+                );
+            });
+        let mut counters = Self::clip_counters(&text);
+        if clipped {
+            counters.push_str(" · показаны первые 4000");
+        }
+        ui.weak(counters);
+    }
+
+    fn clip_empty_ui(&self, ui: &mut egui::Ui) {
+        let text = self
+            .clipboard_preview
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if text.is_empty() {
+            ui.weak("пусто");
+        } else {
+            ui.weak(format!("не текст ({} байт)", text.len()));
+        }
+    }
+
+    fn show_clip_window(&mut self, ctx: &egui::Context) {
+        let vb = egui::ViewportBuilder::default()
+            .with_title(winctl::CLIP_CAPTION)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_inner_size([380.0, 72.0]);
+        let id = egui::ViewportId::from_hash_of("hw-clip-panel");
+        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let mut close = false;
+
+        ctx.show_viewport_immediate(id, vb, |cctx, _class| {
+            if cctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+            let frame = egui::Frame::default()
+                .fill(bg)
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(10);
+            let inner = egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
+                let drag = ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("clip-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started() {
+                    cctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("📋 Буфер")
+                            .size(10.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("✕").clicked() {
+                                close = true;
+                            }
+                        },
+                    );
+                });
+                self.clip_full_ui(ui);
+                ui.min_rect().size()
+            });
+
+            let content = inner.inner + egui::vec2(16.0, 16.0);
+            let cur = cctx.screen_rect().size();
+            let target = egui::vec2(380.0, content.y.clamp(64.0, 460.0));
+            if (target.y - cur.y).abs() > 0.5 || (target.x - cur.x).abs() > 0.5 {
+                cctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+            }
+        });
+
+        if close {
+            self.clip_open = false;
+            self.clip_open_flag.store(false, Ordering::Relaxed);
+        }
     }
 
     fn draw_call(&mut self, ui: &mut egui::Ui, min_height: f32) {
@@ -1579,6 +1841,10 @@ impl eframe::App for App {
             self.show_shot_overlay(ctx);
         }
 
+        if self.clip_open {
+            self.show_clip_window(ctx);
+        }
+
         if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
             telemetry::event("hotkey.cursor_warp", serde_json::json!({}));
             let cslot = self.prev_cursor.clone();
@@ -1593,6 +1859,10 @@ impl eframe::App for App {
                     }
                 }
             });
+        }
+
+        if self.paste_code.swap(false, Ordering::Relaxed) {
+            type_clipboard_code();
         }
 
         if self.autopilot.proc.as_mut().is_some_and(|p| !p.alive()) {
@@ -1664,7 +1934,10 @@ impl eframe::App for App {
                 });
                 ui.add_space(2.0);
 
-                self.draw_avatar(ui, ctx);
+                ui.columns(2, |cols| {
+                    self.draw_avatar(&mut cols[0], ctx);
+                    self.draw_clipboard(&mut cols[1]);
+                });
 
                 self.draw_autopilot(ui);
 
@@ -1968,9 +2241,12 @@ fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
 }
 
 fn rebuild_and_restart() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(mut exe) = std::env::current_exe() else {
         return;
     };
+    if let Some(clean) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        exe = std::path::PathBuf::from(clean);
+    }
     let pid = std::process::id();
     let manifest = exe
         .parent()
@@ -1996,6 +2272,55 @@ fn rebuild_and_restart() {
         .arg(script)
         .spawn();
     std::process::exit(0);
+}
+
+fn notify(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "health-widget", "-i", "dialog-warning", "⌨ Печать кода", body])
+        .spawn();
+}
+
+fn looks_like_code(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains('\n') || t.contains('\t') {
+        return true;
+    }
+    if t.contains("  ") {
+        return true;
+    }
+    const PUNCT: &[char] = &['{', '}', '(', ')', '[', ']', ';', '=', '<', '>', '#', '/', '\\', '|', '&', '*', '@', '$', '`'];
+    if t.contains(PUNCT) {
+        return true;
+    }
+    const TOKENS: &[&str] = &[
+        "fn ", "def ", "class ", "const ", "let ", "var ", "func ", "import ", "return ",
+        "public ", "private ", "void ", "int ", "::", "->", "=>", "//", "/*",
+    ];
+    TOKENS.iter().any(|k| t.contains(k))
+}
+
+fn type_clipboard_code() {
+    telemetry::event("hotkey.paste_code", serde_json::json!({}));
+    std::thread::spawn(|| {
+        let Some(text) = clip::get() else {
+            notify("Не удалось прочитать буфер обмена");
+            return;
+        };
+        if text.trim().is_empty() {
+            notify("Буфер обмена пуст");
+            return;
+        }
+        if !looks_like_code(&text) {
+            notify("В буфере не похоже на код — печать отменена");
+            return;
+        }
+        if let Err(e) = winctl::type_text(text) {
+            notify(&format!("Печать не удалась: {e}"));
+        }
+    });
 }
 
 fn main() -> eframe::Result<()> {

@@ -1,4 +1,4 @@
-# IT-термины (топ-частотные) — в hotwords/initial_prompt whisper. Один термин на строку.
+# IT-термины (топ-частотные) — в hotwords whisper. Один термин на строку.
 Kubernetes
 Docker
 deploy
@@ -28,3 +28,4 @@ webhook
 payload
 middleware
 runtime
+highload

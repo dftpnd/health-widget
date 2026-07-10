@@ -125,15 +125,15 @@ pub fn list_programs() -> Vec<Device> {
         res.push(Device { target, label });
     }
 
-    let mut seen: Vec<String> = Vec::new();
-    res.retain(|d| {
-        if seen.contains(&d.label) {
-            false
-        } else {
-            seen.push(d.label.clone());
-            true
+    let all_labels: Vec<String> = res.iter().map(|d| d.label.clone()).collect();
+    let mut used: Vec<String> = Vec::new();
+    for d in res.iter_mut() {
+        if all_labels.iter().filter(|l| **l == d.label).count() > 1 {
+            let n = used.iter().filter(|l| **l == d.label).count() + 1;
+            used.push(d.label.clone());
+            d.label = format!("{} #{n}", d.label);
         }
-    });
+    }
     res
 }
 
@@ -277,5 +277,6 @@ impl Drop for AudioMonitor {
     fn drop(&mut self) {
         crate::telemetry::event("audio.stop", serde_json::json!({ "channel": self.channel }));
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }

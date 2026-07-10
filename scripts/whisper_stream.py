@@ -7,7 +7,9 @@
     {"final": "Запусти Kubernetes"}
 
 Endpointing по энергии (пауза => конец фразы), инференс на GPU (CUDA), два рычага под
-IT-термины: hotwords/initial_prompt при распознавании + словарь пост-коррекции.
+IT-термины: hotwords при распознавании + словарь пост-коррекции.
+Короткие сегменты декодируются дважды (второй раз со сдвигом входа): на шуме декод
+нестабилен и такие сегменты отбрасываются, на речи — совпадает.
 Никакой сети в рантайме (модель кэшируется локально при установке).
 
 Аргументы:
@@ -22,6 +24,7 @@ import re
 import sys
 import json
 import time
+import difflib
 import threading
 from typing import Iterable
 
@@ -100,7 +103,7 @@ def is_hallucination(text: str, no_speech_prob: float = 0.0,
         return True
     if "субтитр" in n and ("dimatorzok" in n or "семкин" in n or "корректор" in n):
         return True
-    if no_speech_prob >= 0.85:
+    if no_speech_prob >= 0.85 and avg_logprob <= -0.6:
         return True
     if avg_logprob <= -1.0:
         return True
@@ -129,6 +132,23 @@ SILENCE_RMS = 500.0
 SILENCE_TAIL = 0.6
 MIN_SPEECH = 0.3
 MAX_SEGMENT = 15.0
+STABILITY_MAX_SECONDS = 3.0
+STABILITY_MIN_SIMILARITY = 0.7
+PERTURB_PAD_SECONDS = 0.15
+PERTURB_GAIN = 0.9
+
+def _match_form(text: str) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
+
+def texts_agree(a: str, b: str) -> bool:
+    na, nb = _match_form(a), _match_form(b)
+    if not na and not nb:
+        return True
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= STABILITY_MIN_SIMILARITY
 
 _buf = bytearray()
 _buf_lock = threading.Lock()
@@ -192,12 +212,11 @@ def main() -> int:
     threading.Thread(target=_drain_stdin, daemon=True).start()
     model = WhisperModel(model_name, device=device, compute_type=compute)
 
-    def emit(raw: bytes):
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    def transcribe_text(audio) -> str:
         segments, _ = model.transcribe(
             audio, language="ru", beam_size=5, vad_filter=True,
             condition_on_previous_text=False,
-            hotwords=hotwords, initial_prompt=hotwords,
+            hotwords=hotwords,
         )
         parts = [
             s.text.strip()
@@ -209,7 +228,20 @@ def main() -> int:
                 getattr(s, "compression_ratio", 0.0),
             )
         ]
-        text = " ".join(p for p in parts if p).strip()
+        return " ".join(p for p in parts if p).strip()
+
+    def perturb(audio):
+        pad = np.zeros(int(PERTURB_PAD_SECONDS * SAMPLE_RATE), dtype=np.float32)
+        return np.concatenate([pad, audio * PERTURB_GAIN])
+
+    def emit(raw: bytes):
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        text = transcribe_text(audio)
+        if not text:
+            return
+        if len(audio) <= STABILITY_MAX_SECONDS * SAMPLE_RATE:
+            if not texts_agree(text, transcribe_text(perturb(audio))):
+                return
         text = apply_corrections(text, corrections)
         if text:
             sys.stdout.write(json.dumps({"final": text}, ensure_ascii=False) + "\n")

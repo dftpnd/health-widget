@@ -4,6 +4,8 @@ use std::time::Duration;
 
 const RESOURCE_CLASS: &str = "health-widget";
 
+pub const CLIP_CAPTION: &str = "hw-clip";
+
 const DOTOOL_PIPE: &str = "/tmp/dotool-pipe";
 
 fn dotool_bin(name: &str) -> Option<std::path::PathBuf> {
@@ -14,8 +16,33 @@ fn for_our_window(inner: &str) -> String {
     format!(
         "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
          for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
-         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\") {{ {inner} }} }}\n"
+         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
+         && String(w.caption) !== \"{CLIP_CAPTION}\") {{ {inner} }} }}\n"
     )
+}
+
+fn for_clip_window(inner: &str) -> String {
+    format!(
+        "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
+         for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
+         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
+         && String(w.caption) === \"{CLIP_CAPTION}\") {{ {inner} }} }}\n"
+    )
+}
+
+pub fn set_clip_position(x: i32, y: i32) -> bool {
+    let body = for_clip_window(&format!(
+        "w.keepAbove = true; var g = w.frameGeometry; \
+         w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }};"
+    ));
+    run_kwin_script(&body, "clipmove")
+}
+
+pub fn get_clip_position() -> Option<(i32, i32)> {
+    let body = for_clip_window(
+        "var g = w.frameGeometry; print(\"HWC-GEOM \" + Math.round(g.x) + \" \" + Math.round(g.y));",
+    );
+    read_two_floats(&body, "clipgeom", "HWC-GEOM").map(|(x, y)| (x as i32, y as i32))
 }
 
 pub fn set_keep_above(on: bool) -> bool {
@@ -106,7 +133,8 @@ pub fn widget_center_norm() -> Option<(f64, f64)> {
         "var s = workspace.virtualScreenSize;\n\
          var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
          for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
-         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\") {{\n\
+         if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
+         && String(w.caption) !== \"{CLIP_CAPTION}\") {{\n\
          var g = w.frameGeometry;\n\
          print(\"HW-WNORM \" + ((g.x + g.width / 2) / s.width) + \" \" + ((g.y + g.height / 2) / s.height)); }} }}\n"
     );
@@ -140,6 +168,43 @@ pub fn warp_cursor_norm(nx: f64, ny: f64) {
             let _ = child.wait();
         }
     });
+}
+
+pub fn type_text(text: String) -> Result<(), String> {
+    let dotoolc = dotool_bin("dotoolc").ok_or_else(|| "нет dotoolc".to_string())?;
+    let mut script = String::new();
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            script.push_str("key enter\n");
+        }
+        if !line.is_empty() {
+            script.push_str("type ");
+            script.push_str(line);
+            script.push('\n');
+        }
+    }
+    let mut child = Command::new(&dotoolc)
+        .env("DOTOOL_PIPE", DOTOOL_PIPE)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("dotoolc не запустился: {e}"))?;
+    {
+        use std::io::Write;
+        let mut si = child
+            .stdin
+            .take()
+            .ok_or_else(|| "нет stdin у dotoolc".to_string())?;
+        si.write_all(script.as_bytes())
+            .map_err(|e| format!("dotoolc stdin: {e}"))?;
+    }
+    let status = child.wait().map_err(|e| format!("dotoolc: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("dotoolc завершился с ошибкой".to_string())
+    }
 }
 
 fn run_kwin_script(body: &str, tag: &str) -> bool {
