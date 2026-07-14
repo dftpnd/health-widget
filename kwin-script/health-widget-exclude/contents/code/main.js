@@ -11,6 +11,10 @@ function announce(w) {
     var g = w.frameGeometry;
     if (String(w.caption) === "hw-clip") {
         print("HWC-GEOM " + Math.round(g.x) + " " + Math.round(g.y));
+    } else if (String(w.caption) === "hw-chat") {
+        print("HWCH-GEOM " + Math.round(g.x) + " " + Math.round(g.y));
+    } else if (String(w.caption) === "hw-web") {
+        print("HWWEB-GEOM " + Math.round(g.x) + " " + Math.round(g.y));
     } else {
         print("HW-GEOM x=" + Math.round(g.x) + " y=" + Math.round(g.y));
     }

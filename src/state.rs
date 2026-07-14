@@ -28,7 +28,7 @@ pub struct State {
     pub metrics_collapsed: bool,
     #[serde(default)]
     pub chat_collapsed: bool,
-    #[serde(default, alias = "chat_open")]
+    #[serde(default)]
     pub terminal_open: bool,
     #[serde(default)]
     pub clip_open: bool,
@@ -36,6 +36,20 @@ pub struct State {
     pub clip_x: Option<f32>,
     #[serde(default)]
     pub clip_y: Option<f32>,
+    #[serde(default)]
+    pub chat_open: bool,
+    #[serde(default)]
+    pub chat_x: Option<f32>,
+    #[serde(default)]
+    pub chat_y: Option<f32>,
+    #[serde(default)]
+    pub chat_w: Option<f32>,
+    #[serde(default)]
+    pub chat_h: Option<f32>,
+    #[serde(default)]
+    pub web_x: Option<f32>,
+    #[serde(default)]
+    pub web_y: Option<f32>,
 }
 
 fn path() -> PathBuf {

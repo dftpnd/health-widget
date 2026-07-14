@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Веб-микрофон</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body, #root { height: 100%; }
+      body {
+        background: #121216;
+        color: #cdd2dc;
+        font-family: system-ui, sans-serif;
+      }
+      .app {
+        max-width: 720px;
+        margin: 0 auto;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        padding: 16px;
+        gap: 12px;
+      }
+      .top {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .title { font-size: 15px; color: #788296; font-weight: 600; }
+      .status { font-size: 13px; color: #8c929e; }
+      .err { font-size: 13px; color: #e67878; }
+      .talk {
+        font-size: 20px;
+        padding: 14px 28px;
+        border-radius: 12px;
+        border: 1px solid #3a3f4e;
+        background: #1d1d24;
+        color: #cdd2dc;
+        cursor: pointer;
+      }
+      .talk.on {
+        background: #7a2a2a;
+        border-color: #a04040;
+      }
+      .feed {
+        flex: 1;
+        overflow-y: auto;
+        border: 1px solid #2a2f3c;
+        border-radius: 12px;
+        padding: 14px;
+        font-size: 21px;
+        line-height: 1.45;
+      }
+      .hint { color: #5a6070; font-style: italic; font-size: 15px; }
+      .partial { color: #828894; font-style: italic; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

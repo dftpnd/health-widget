@@ -13,17 +13,27 @@ use crate::transcript_log::TranscriptLog;
 const CAP: usize = 2048;
 const RATE: &str = "44100";
 const RATE_HZ: u32 = 44100;
+const SIGNAL_FLOOR: f32 = 1e-4;
 
-pub fn default_monitor() -> Option<String> {
-    let out = Command::new("pactl").args(["get-default-sink"]).output().ok()?;
-    if !out.status.success() {
-        return None;
+fn record_args(target: Option<&str>, capture_sink: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["--rate", RATE, "--channels", "1", "--format", "f32"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if capture_sink {
+        args.push("-P".to_string());
+        args.push("{ stream.capture.sink = true }".to_string());
     }
-    let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sink.is_empty() {
-        return None;
+    if let Some(t) = target {
+        args.push("--target".to_string());
+        args.push(t.to_string());
     }
-    Some(format!("{sink}.monitor"))
+    args.push("-".to_string());
+    args
+}
+
+fn has_signal(batch: &[f32]) -> bool {
+    batch.iter().any(|v| v.abs() > SIGNAL_FLOOR)
 }
 
 pub struct Device {
@@ -143,6 +153,7 @@ pub struct AudioMonitor {
     transcriber: Option<Transcriber>,
     recorder: Arc<Mutex<Option<WavRecorder>>>,
     channel: &'static str,
+    last_signal: Arc<Mutex<std::time::Instant>>,
 }
 
 impl AudioMonitor {
@@ -151,13 +162,25 @@ impl AudioMonitor {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Option<Self> {
+        Self::start_with(target, false, channel, log)
+    }
+
+    pub fn start_sink_monitor(
+        channel: &'static str,
+        log: Option<Arc<TranscriptLog>>,
+    ) -> Option<Self> {
+        Self::start_with(None, true, channel, log)
+    }
+
+    fn start_with(
+        target: Option<&str>,
+        capture_sink: bool,
+        channel: &'static str,
+        log: Option<Arc<TranscriptLog>>,
+    ) -> Option<Self> {
         let mut cmd = Command::new("pw-record");
-        cmd.args(["--rate", RATE, "--channels", "1", "--format", "f32"]);
-        if let Some(t) = target {
-            cmd.args(["--target", t]);
-        }
+        cmd.args(record_args(target, capture_sink));
         let mut child = match cmd
-            .arg("-")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -175,6 +198,9 @@ impl AudioMonitor {
 
         let recorder: Arc<Mutex<Option<WavRecorder>>> = Arc::new(Mutex::new(None));
         let rec = recorder.clone();
+
+        let last_signal = Arc::new(Mutex::new(std::time::Instant::now()));
+        let sig = last_signal.clone();
 
         let (transcriber, mut feeder) = match Transcriber::start(RATE_HZ, channel, log) {
             Some((t, f)) => (Some(t), Some(f)),
@@ -200,6 +226,11 @@ impl AudioMonitor {
                             batch.push(f32::from_le_bytes([acc[i], acc[i + 1], acc[i + 2], acc[i + 3]]));
                             i += 4;
                         }
+                        if has_signal(&batch) {
+                            if let Ok(mut t) = sig.lock() {
+                                *t = std::time::Instant::now();
+                            }
+                        }
                         if let Ok(mut g) = buf.lock() {
                             for &v in &batch {
                                 if g.len() >= CAP {
@@ -224,9 +255,16 @@ impl AudioMonitor {
 
         crate::telemetry::event(
             "audio.start",
-            serde_json::json!({ "channel": channel, "target": target }),
+            serde_json::json!({ "channel": channel, "target": target, "sink_monitor": capture_sink }),
         );
-        Some(Self { samples, child, transcriber, recorder, channel })
+        Some(Self { samples, child, transcriber, recorder, channel, last_signal })
+    }
+
+    pub fn silent_for(&self) -> std::time::Duration {
+        self.last_signal
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
     }
 
     pub fn transcript(&self) -> Option<(String, String)> {
@@ -278,5 +316,45 @@ impl Drop for AudioMonitor {
         crate::telemetry::event("audio.stop", serde_json::json!({ "channel": self.channel }));
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_args_program_target() {
+        let a = record_args(Some("244"), false);
+        assert_eq!(
+            a,
+            ["--rate", "44100", "--channels", "1", "--format", "f32", "--target", "244", "-"]
+        );
+    }
+
+    #[test]
+    fn record_args_default_sink_monitor() {
+        let a = record_args(None, true);
+        assert_eq!(
+            a,
+            [
+                "--rate",
+                "44100",
+                "--channels",
+                "1",
+                "--format",
+                "f32",
+                "-P",
+                "{ stream.capture.sink = true }",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
+    fn signal_detection_ignores_digital_silence() {
+        assert!(!has_signal(&[0.0; 512]));
+        assert!(!has_signal(&[5e-5, -5e-5]));
+        assert!(has_signal(&[0.0, 0.002, 0.0]));
     }
 }

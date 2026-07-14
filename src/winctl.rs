@@ -6,6 +6,10 @@ const RESOURCE_CLASS: &str = "health-widget";
 
 pub const CLIP_CAPTION: &str = "hw-clip";
 
+pub const CHAT_CAPTION: &str = "hw-chat";
+
+pub const WEB_CAPTION: &str = "hw-web";
+
 const DOTOOL_PIPE: &str = "/tmp/dotool-pipe";
 
 fn dotool_bin(name: &str) -> Option<std::path::PathBuf> {
@@ -17,27 +21,44 @@ fn for_our_window(inner: &str) -> String {
         "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
          for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
          if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
-         && String(w.caption) !== \"{CLIP_CAPTION}\") {{ {inner} }} }}\n"
+         && String(w.caption) !== \"{CLIP_CAPTION}\" \
+         && String(w.caption) !== \"{CHAT_CAPTION}\" \
+         && String(w.caption) !== \"{WEB_CAPTION}\") {{ {inner} }} }}\n"
     )
 }
 
-fn for_clip_window(inner: &str) -> String {
+fn for_captioned_window(caption: &str, inner: &str) -> String {
     format!(
         "var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
          for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
          if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
-         && String(w.caption) === \"{CLIP_CAPTION}\") {{ {inner} }} }}\n"
+         && String(w.caption) === \"{caption}\") {{ {inner} }} }}\n"
     )
 }
 
+fn move_captioned_window(caption: &str, marker: &str, tag: &str, x: i32, y: i32) -> bool {
+    let body = for_captioned_window(
+        caption,
+        &format!(
+            "w.keepAbove = true; var g = w.frameGeometry; \
+             w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }}; \
+             var g2 = w.frameGeometry; \
+             print(\"{marker} \" + Math.round(g2.x) + \" \" + Math.round(g2.y));"
+        ),
+    );
+    run_kwin_script(&body, tag)
+}
+
 pub fn set_clip_position(x: i32, y: i32) -> bool {
-    let body = for_clip_window(&format!(
-        "w.keepAbove = true; var g = w.frameGeometry; \
-         w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }}; \
-         var g2 = w.frameGeometry; \
-         print(\"HWC-GEOM \" + Math.round(g2.x) + \" \" + Math.round(g2.y));"
-    ));
-    run_kwin_script(&body, "clipmove")
+    move_captioned_window(CLIP_CAPTION, "HWC-GEOM", "clipmove", x, y)
+}
+
+pub fn set_chat_position(x: i32, y: i32) -> bool {
+    move_captioned_window(CHAT_CAPTION, "HWCH-GEOM", "chatmove", x, y)
+}
+
+pub fn set_web_position(x: i32, y: i32) -> bool {
+    move_captioned_window(WEB_CAPTION, "HWWEB-GEOM", "webmove", x, y)
 }
 
 pub fn set_keep_above(on: bool) -> bool {
@@ -63,10 +84,13 @@ pub fn move_by(dx: i32, dy: i32) -> bool {
 }
 
 pub fn parse_geom_line(line: &str) -> Option<GeomEvent> {
-    if let Some(i) = line.find("HWC-GEOM ") {
-        let mut it = line[i + "HWC-GEOM ".len()..].split_whitespace();
-        let x: i32 = it.next()?.parse().ok()?;
-        let y: i32 = it.next()?.parse().ok()?;
+    if let Some((x, y)) = parse_pair_after(line, "HWWEB-GEOM ") {
+        return Some(GeomEvent::Web(x, y));
+    }
+    if let Some((x, y)) = parse_pair_after(line, "HWCH-GEOM ") {
+        return Some(GeomEvent::Chat(x, y));
+    }
+    if let Some((x, y)) = parse_pair_after(line, "HWC-GEOM ") {
         return Some(GeomEvent::Clip(x, y));
     }
     if let Some(i) = line.find("HW-GEOM ") {
@@ -76,10 +100,20 @@ pub fn parse_geom_line(line: &str) -> Option<GeomEvent> {
     None
 }
 
+fn parse_pair_after(line: &str, marker: &str) -> Option<(i32, i32)> {
+    let i = line.find(marker)?;
+    let mut it = line[i + marker.len()..].split_whitespace();
+    let x: i32 = it.next()?.parse().ok()?;
+    let y: i32 = it.next()?.parse().ok()?;
+    Some((x, y))
+}
+
 #[derive(Debug, PartialEq)]
 pub enum GeomEvent {
     Main(i32, i32),
     Clip(i32, i32),
+    Chat(i32, i32),
+    Web(i32, i32),
 }
 
 pub fn follow_geometry(mut on_event: impl FnMut(GeomEvent) + Send + 'static) {
@@ -169,7 +203,9 @@ pub fn widget_center_norm() -> Option<(f64, f64)> {
          var l = workspace.windowList ? workspace.windowList() : workspace.clientList();\n\
          for (var i = 0; i < l.length; i++) {{ var w = l[i];\n\
          if (w && w.resourceClass && String(w.resourceClass) === \"{RESOURCE_CLASS}\" \
-         && String(w.caption) !== \"{CLIP_CAPTION}\") {{\n\
+         && String(w.caption) !== \"{CLIP_CAPTION}\" \
+         && String(w.caption) !== \"{CHAT_CAPTION}\" \
+         && String(w.caption) !== \"{WEB_CAPTION}\") {{\n\
          var g = w.frameGeometry;\n\
          print(\"HW-WNORM \" + ((g.x + g.width / 2) / s.width) + \" \" + ((g.y + g.height / 2) / s.height)); }} }}\n"
     );
@@ -298,6 +334,22 @@ mod tests {
         assert_eq!(
             parse_geom_line("js: HWC-GEOM 1918 -7"),
             Some(GeomEvent::Clip(1918, -7))
+        );
+    }
+
+    #[test]
+    fn geom_line_chat_window() {
+        assert_eq!(
+            parse_geom_line("js: HWCH-GEOM 640 480"),
+            Some(GeomEvent::Chat(640, 480))
+        );
+    }
+
+    #[test]
+    fn geom_line_web_window() {
+        assert_eq!(
+            parse_geom_line("js: HWWEB-GEOM 100 200"),
+            Some(GeomEvent::Web(100, 200))
         );
     }
 

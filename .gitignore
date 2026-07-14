@@ -7,3 +7,5 @@ __pycache__/
 # Экспорт колов (--export по умолчанию сюда)
 tmp/
 widget.log
+web/node_modules/
+web/dist/

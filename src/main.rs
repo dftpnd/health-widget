@@ -26,6 +26,7 @@ mod telemetry;
 mod terminal;
 mod transcribe;
 mod transcript_log;
+mod webmic;
 mod winctl;
 
 use config::Config;
@@ -34,9 +35,12 @@ use transcript_log::TranscriptLog;
 
 const CH_MIC: &str = "🎤 я";
 const CH_ZOOM: &str = "🔊 телемост";
+const CH_WEB: &str = "🌐 веб";
 
 const GRIP: f32 = 16.0;
 const MARGIN: f32 = 12.0;
+const CHAT_WIN_W: f32 = 440.0;
+const CHAT_WIN_H: f32 = 520.0;
 
 const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
@@ -185,6 +189,13 @@ struct App {
     clipboard_preview: Arc<std::sync::Mutex<String>>,
     clip_open: bool,
     clip_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    chat_open: bool,
+    chat_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    chat_spawn_size: egui::Vec2,
+    chat_size: egui::Vec2,
+    webmic: Option<webmic::WebMic>,
+    webmic_error: Option<String>,
+    web_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
 }
 
 impl App {
@@ -287,6 +298,12 @@ impl App {
         let clip_pos = Arc::new(std::sync::Mutex::new(
             st.clip_x.zip(st.clip_y).map(|(x, y)| (x as i32, y as i32)),
         ));
+        let chat_pos = Arc::new(std::sync::Mutex::new(
+            st.chat_x.zip(st.chat_y).map(|(x, y)| (x as i32, y as i32)),
+        ));
+        let web_pos = Arc::new(std::sync::Mutex::new(
+            st.web_x.zip(st.web_y).map(|(x, y)| (x as i32, y as i32)),
+        ));
 
         {
             let want_pin = st.pinned;
@@ -296,7 +313,12 @@ impl App {
                 .then(|| st.clip_x.zip(st.clip_y))
                 .flatten()
                 .map(|(x, y)| (x as i32, y as i32));
-            if want_pin || pos.is_some() || clip.is_some() {
+            let chat = st
+                .chat_open
+                .then(|| st.chat_x.zip(st.chat_y))
+                .flatten()
+                .map(|(x, y)| (x as i32, y as i32));
+            if want_pin || pos.is_some() || clip.is_some() || chat.is_some() {
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(800));
                     for _ in 0..2 {
@@ -309,6 +331,9 @@ impl App {
                         if let Some((x, y)) = clip {
                             winctl::set_clip_position(x, y);
                         }
+                        if let Some((x, y)) = chat {
+                            winctl::set_chat_position(x, y);
+                        }
                         std::thread::sleep(Duration::from_millis(600));
                     }
                 });
@@ -318,6 +343,8 @@ impl App {
         {
             let shared = shared.clone();
             let clip_pos = clip_pos.clone();
+            let chat_pos = chat_pos.clone();
+            let web_pos = web_pos.clone();
             winctl::follow_geometry(move |ev| match ev {
                 winctl::GeomEvent::Main(x, y) => {
                     if let Ok(mut g) = shared.pos.lock() {
@@ -326,6 +353,16 @@ impl App {
                 }
                 winctl::GeomEvent::Clip(x, y) => {
                     if let Ok(mut g) = clip_pos.lock() {
+                        *g = Some((x, y));
+                    }
+                }
+                winctl::GeomEvent::Chat(x, y) => {
+                    if let Ok(mut g) = chat_pos.lock() {
+                        *g = Some((x, y));
+                    }
+                }
+                winctl::GeomEvent::Web(x, y) => {
+                    if let Ok(mut g) = web_pos.lock() {
                         *g = Some((x, y));
                     }
                 }
@@ -377,11 +414,7 @@ impl App {
             None
         };
         let zoom = if st.zoom_on {
-            audio::AudioMonitor::start(
-                audio::default_monitor().as_deref(),
-                CH_ZOOM,
-                transcript_log.clone(),
-            )
+            audio::AudioMonitor::start_sink_monitor(CH_ZOOM, transcript_log.clone())
         } else {
             None
         };
@@ -394,7 +427,7 @@ impl App {
             metrics,
             last_mtime,
             currently_visible: true,
-            transcript_log,
+            transcript_log: transcript_log.clone(),
             active_call: None,
             audio: AudioState {
                 mic,
@@ -447,6 +480,21 @@ impl App {
             clipboard_preview,
             clip_open: st.clip_open,
             clip_pos,
+            chat_open: st.chat_open,
+            chat_pos,
+            chat_spawn_size: egui::vec2(
+                st.chat_w.unwrap_or(CHAT_WIN_W),
+                st.chat_h.unwrap_or(CHAT_WIN_H),
+            ),
+            chat_size: egui::vec2(
+                st.chat_w.unwrap_or(CHAT_WIN_W),
+                st.chat_h.unwrap_or(CHAT_WIN_H),
+            ),
+            webmic: (std::env::var("HEALTH_WEBMIC").as_deref() == Ok("1"))
+                .then(|| webmic::WebMic::start(CH_WEB, transcript_log.clone()).ok())
+                .flatten(),
+            webmic_error: None,
+            web_pos,
         }
     }
 
@@ -477,8 +525,10 @@ impl App {
     }
 
     fn start_program(&self) -> Option<audio::AudioMonitor> {
-        let target = self.audio.prog_target.clone().or_else(audio::default_monitor);
-        audio::AudioMonitor::start(target.as_deref(), CH_ZOOM, self.transcript_log.clone())
+        match self.audio.prog_target.as_deref() {
+            Some(t) => audio::AudioMonitor::start(Some(t), CH_ZOOM, self.transcript_log.clone()),
+            None => audio::AudioMonitor::start_sink_monitor(CH_ZOOM, self.transcript_log.clone()),
+        }
     }
 
     fn start_call(&mut self) {
@@ -602,6 +652,14 @@ impl App {
             Some((px, py)) => (Some(px as f32), Some(py as f32)),
             None => (self.last_saved.clip_x, self.last_saved.clip_y),
         };
+        let (chat_x, chat_y) = match self.chat_pos.lock().ok().and_then(|g| *g) {
+            Some((px, py)) => (Some(px as f32), Some(py as f32)),
+            None => (self.last_saved.chat_x, self.last_saved.chat_y),
+        };
+        let (web_x, web_y) = match self.web_pos.lock().ok().and_then(|g| *g) {
+            Some((px, py)) => (Some(px as f32), Some(py as f32)),
+            None => (self.last_saved.web_x, self.last_saved.web_y),
+        };
         state::State {
             x,
             y,
@@ -621,6 +679,13 @@ impl App {
             clip_open: self.clip_open,
             clip_x,
             clip_y,
+            chat_open: self.chat_open,
+            chat_x,
+            chat_y,
+            chat_w: Some(self.chat_size.x),
+            chat_h: Some(self.chat_size.y),
+            web_x,
+            web_y,
         }
     }
 
@@ -719,6 +784,7 @@ impl App {
         let pinned = self.pinned;
         let mut toggle_pin = false;
         let mut toggle_terminal = false;
+        let mut toggle_webmic = false;
         let mut do_restart = false;
         ui.horizontal(|ui| {
             if let Some(t) = &title {
@@ -751,6 +817,23 @@ impl App {
                     .clicked()
                 {
                     toggle_terminal = true;
+                }
+                if ui
+                    .selectable_label(self.webmic.is_some(), "🌐")
+                    .on_hover_text(
+                        "Веб-микрофон: страница на localhost:8787.\n\
+                         При включении ssh-команда и ссылка копируются в буфер.",
+                    )
+                    .clicked()
+                {
+                    toggle_webmic = true;
+                }
+                if let Some(e) = &self.webmic_error {
+                    ui.label(
+                        egui::RichText::new(format!("✖ {e}"))
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(230, 120, 120)),
+                    );
                 }
                 if ui
                     .button("⟳")
@@ -806,6 +889,9 @@ impl App {
                     cur.height(),
                 )));
             }
+        }
+        if toggle_webmic {
+            self.toggle_webmic();
         }
         if do_restart {
             rebuild_and_restart();
@@ -1201,10 +1287,247 @@ impl App {
         }
     }
 
+    fn toggle_chat_window(&mut self) {
+        self.chat_open = !self.chat_open;
+        if !self.chat_open {
+            return;
+        }
+        self.chat_spawn_size = self.chat_size;
+        let pos = self
+            .chat_pos
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .or_else(|| {
+                self.last_saved
+                    .chat_x
+                    .zip(self.last_saved.chat_y)
+                    .map(|(x, y)| (x as i32, y as i32))
+            });
+        if let Some((x, y)) = pos {
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    std::thread::sleep(Duration::from_millis(400));
+                    winctl::set_chat_position(x, y);
+                }
+            });
+        }
+    }
+
+    fn show_chat_window(&mut self, ctx: &egui::Context) {
+        let vb = egui::ViewportBuilder::default()
+            .with_title(winctl::CHAT_CAPTION)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_resizable(true)
+            .with_inner_size([self.chat_spawn_size.x, self.chat_spawn_size.y])
+            .with_min_inner_size([300.0, 240.0]);
+        let id = egui::ViewportId::from_hash_of("hw-chat-panel");
+        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let mut close = false;
+        let mut submitted = None;
+
+        ctx.show_viewport_immediate(id, vb, |cctx, _class| {
+            if cctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+            let frame = egui::Frame::default()
+                .fill(bg)
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(10);
+            egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
+                let panel = ui.max_rect();
+                let grip_rect =
+                    egui::Rect::from_min_max(panel.max - egui::vec2(GRIP, GRIP), panel.max);
+                let drag = ui.interact(
+                    panel,
+                    ui.id().with("chat-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started()
+                    && !drag
+                        .interact_pointer_pos()
+                        .is_some_and(|p| grip_rect.contains(p))
+                {
+                    cctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("💬 Чат")
+                            .size(10.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("✕").clicked() {
+                                close = true;
+                            }
+                        },
+                    );
+                });
+                let log_height = (ui.available_height() - 56.0).max(80.0);
+                submitted = self.chat.ui_capped(ui, log_height);
+                draw_resize_grip(ui, cctx, grip_rect);
+            });
+            self.chat_size = cctx.screen_rect().size();
+        });
+
+        if close {
+            self.chat_open = false;
+        }
+        if let Some(q) = submitted {
+            self.start_deepseek(ctx.clone(), q);
+        }
+    }
+
+    fn toggle_webmic(&mut self) {
+        self.webmic_error = None;
+        if self.webmic.take().is_some() {
+            return;
+        }
+        match webmic::WebMic::start(CH_WEB, self.transcript_log.clone()) {
+            Ok(w) => {
+                clip::set_async(webmic::connect_hint());
+                self.webmic = Some(w);
+                let pos = self.web_pos.lock().ok().and_then(|g| *g).or_else(|| {
+                    self.last_saved
+                        .web_x
+                        .zip(self.last_saved.web_y)
+                        .map(|(x, y)| (x as i32, y as i32))
+                });
+                if let Some((x, y)) = pos {
+                    std::thread::spawn(move || {
+                        for _ in 0..2 {
+                            std::thread::sleep(Duration::from_millis(400));
+                            winctl::set_web_position(x, y);
+                        }
+                    });
+                }
+            }
+            Err(e) => self.webmic_error = Some(e),
+        }
+    }
+
+    fn show_web_window(&mut self, ctx: &egui::Context) {
+        let Some(shared) = self.webmic.as_ref().map(|w| w.shared()) else {
+            return;
+        };
+        let (lines, partial, stt_on, active) = match shared.lock() {
+            Ok(g) => (
+                g.lines.iter().cloned().collect::<Vec<_>>(),
+                g.partial.clone(),
+                g.stt_on,
+                g.client_active(),
+            ),
+            Err(_) => return,
+        };
+        let vb = egui::ViewportBuilder::default()
+            .with_title(winctl::WEB_CAPTION)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_inner_size([420.0, 320.0]);
+        let id = egui::ViewportId::from_hash_of("hw-web-panel");
+        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let mut close = false;
+
+        ctx.show_viewport_immediate(id, vb, |cctx, _class| {
+            cctx.request_repaint_after(Duration::from_millis(250));
+            if cctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+            let frame = egui::Frame::default()
+                .fill(bg)
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .inner_margin(egui::Margin::same(8))
+                .corner_radius(10);
+            egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
+                let panel = ui.max_rect();
+                let drag = ui.interact(
+                    panel,
+                    ui.id().with("web-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started() {
+                    cctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("🌐 Веб-микрофон")
+                            .size(10.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                    );
+                    let (dot, status) = if active {
+                        ("🟢", "клиент говорит")
+                    } else if stt_on {
+                        ("🟡", "тишина")
+                    } else {
+                        ("⚪", "жду клиента")
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{dot} {status}"))
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(140, 146, 158)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if lines.is_empty() && partial.is_empty() {
+                            ui.label(
+                                egui::RichText::new("говори на странице — текст появится тут")
+                                    .size(12.0)
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(90, 96, 108)),
+                            );
+                        }
+                        for l in &lines {
+                            ui.label(
+                                egui::RichText::new(l)
+                                    .size(16.0)
+                                    .color(egui::Color32::from_rgb(205, 210, 220)),
+                            );
+                        }
+                        if !partial.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&partial)
+                                    .size(16.0)
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(130, 136, 148)),
+                            );
+                        }
+                    });
+            });
+        });
+
+        if close {
+            self.webmic = None;
+        }
+    }
+
     fn draw_call(&mut self, ui: &mut egui::Ui, min_height: f32) {
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
+        let zoom_silent_min = self
+            .active_call
+            .as_ref()
+            .and(self.audio.zoom.as_ref())
+            .map(|z| z.silent_for())
+            .filter(|d| *d >= Duration::from_secs(120))
+            .map(|d| d.as_secs() / 60);
         section_sized(ui, "🎙 Кол", min_height, |ui| {
             ui.horizontal(|ui| {
                 let recording = active_name.is_some();
@@ -1224,6 +1547,13 @@ impl App {
                     );
                 }
             });
+            if let Some(m) = zoom_silent_min {
+                ui.label(
+                    egui::RichText::new(format!("⚠ телемост молчит {m} мин"))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(230, 120, 120)),
+                );
+            }
         });
         if call_toggle {
             if self.active_call.is_some() {
@@ -1793,12 +2123,32 @@ impl App {
     }
 
     fn draw_chat(&mut self, ui: &mut egui::Ui) {
-        let submitted = section_collapsible(ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
-            self.chat.ui(ui)
-        })
-        .flatten();
-        if let Some(q) = submitted {
-            self.start_deepseek(ui.ctx().clone(), q);
+        let chat_open = self.chat_open;
+        let inner = section_collapsible(ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
+            let label = if chat_open {
+                "💬 Прикрепить"
+            } else {
+                "💬 Открепить"
+            };
+            let toggle = ui
+                .button(label)
+                .on_hover_text("Плавающее окно чата, независимое от виджета")
+                .clicked();
+            let submitted = if chat_open {
+                ui.weak("чат в отдельном окне");
+                None
+            } else {
+                self.chat.ui(ui)
+            };
+            (toggle, submitted)
+        });
+        if let Some((toggle, submitted)) = inner {
+            if toggle {
+                self.toggle_chat_window();
+            }
+            if let Some(q) = submitted {
+                self.start_deepseek(ui.ctx().clone(), q);
+            }
         }
     }
 
@@ -1835,6 +2185,14 @@ impl eframe::App for App {
 
         if self.clip_open {
             self.show_clip_window(ctx);
+        }
+
+        if self.chat_open {
+            self.show_chat_window(ctx);
+        }
+
+        if self.webmic.is_some() {
+            self.show_web_window(ctx);
         }
 
         if self.cursor_warp_request.swap(false, Ordering::Relaxed) {

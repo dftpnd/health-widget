@@ -43,17 +43,21 @@ impl Chat {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        self.ui_capped(ui, 360.0)
+    }
+
+    pub fn ui_capped(&mut self, ui: &mut egui::Ui, max_height: f32) -> Option<String> {
         if self.messages.is_empty() && !self.pending {
             ui.label(
                 RichText::new("нет сообщений")
-                    .size(11.0)
+                    .size(16.0)
                     .italics()
                     .color(Color32::from_rgb(90, 96, 108)),
             );
         } else {
             egui::ScrollArea::vertical()
                 .id_salt("chat_log")
-                .max_height(360.0)
+                .max_height(max_height)
                 .auto_shrink([false, true])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
@@ -65,10 +69,10 @@ impl Chat {
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(RichText::new(format!("{who}:")).size(17.0).strong().color(color));
+                            ui.label(RichText::new(format!("{who}:")).size(22.0).strong().color(color));
                             ui.label(
                                 RichText::new(&msg.text)
-                                    .size(17.0)
+                                    .size(22.0)
                                     .color(Color32::from_rgb(205, 210, 220)),
                             );
                         });
@@ -78,7 +82,7 @@ impl Chat {
                             ui.add(egui::Spinner::new().size(12.0));
                             ui.label(
                                 RichText::new("думаю…")
-                                    .size(11.0)
+                                    .size(16.0)
                                     .color(Color32::from_rgb(140, 146, 158)),
                             );
                         });
@@ -93,10 +97,11 @@ impl Chat {
         let mut clicked = false;
         let mut resp = None;
         ui.horizontal(|ui| {
-            let clicked_btn = ui.button(RichText::new("➤").size(17.0)).clicked();
+            let clicked_btn = ui.button(RichText::new("➤").size(22.0)).clicked();
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     .hint_text("спросить…")
+                    .font(egui::FontId::proportional(17.5))
                     .desired_width(f32::INFINITY),
             );
             clicked = clicked_btn;
