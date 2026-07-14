@@ -34,6 +34,7 @@ impl Shared {
 pub struct WebMic {
     stop: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
+    token: String,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +43,7 @@ impl WebMic {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Result<Self, String> {
+        let token = ensure_token()?;
         let server = tiny_http::Server::http(("127.0.0.1", PORT))
             .map_err(|e| format!("порт {PORT}: {e}"))?;
         let root = web_root();
@@ -50,12 +52,13 @@ impl WebMic {
         let thread = {
             let stop = stop.clone();
             let shared = shared.clone();
+            let token = token.clone();
             std::thread::spawn(move || {
-                serve_loop(server, root, channel, log, stop, shared);
+                serve_loop(server, root, channel, log, stop, shared, token);
             })
         };
         crate::telemetry::event("webmic.start", serde_json::json!({ "port": PORT }));
-        Ok(Self { stop, shared, thread: Some(thread) })
+        Ok(Self { stop, shared, token, thread: Some(thread) })
     }
 
     pub fn shared(&self) -> Arc<Mutex<Shared>> {
@@ -80,6 +83,7 @@ fn serve_loop(
     log: Option<Arc<TranscriptLog>>,
     stop: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
+    token: String,
 ) {
     let mut stt: Option<(Transcriber, Feeder)> = None;
     let mut last_audio: Option<Instant> = None;
@@ -98,7 +102,7 @@ fn serve_loop(
             Ok(None) => continue,
             Err(_) => break,
         };
-        handle_request(req, &root, channel, &log, &shared, &mut stt, &mut last_audio);
+        handle_request(req, &root, channel, &log, &shared, &mut stt, &mut last_audio, &token);
     }
 }
 
@@ -110,9 +114,14 @@ fn handle_request(
     shared: &Arc<Mutex<Shared>>,
     stt: &mut Option<(Transcriber, Feeder)>,
     last_audio: &mut Option<Instant>,
+    token: &str,
 ) {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+    if needs_token(&path) && !token_ok(&url, token) {
+        let _ = req.respond(tiny_http::Response::empty(403));
+        return;
+    }
     if req.method() == &tiny_http::Method::Post && path == "/api/audio" {
         let mut body = Vec::new();
         let _ = req
@@ -198,11 +207,48 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     })
 }
 
+fn needs_token(path: &str) -> bool {
+    path == "/" || path == "/index.html" || path.starts_with("/api/")
+}
+
+fn token_ok(url: &str, token: &str) -> bool {
+    query_param(url, "t").is_some_and(|t| t == token)
+}
+
 fn rate_from_url(url: &str) -> u32 {
     query_param(url, "rate")
         .and_then(|v| v.parse().ok())
         .filter(|r| (8000..=192_000).contains(r))
         .unwrap_or(48_000)
+}
+
+fn data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("health-widget"))
+}
+
+fn ensure_token() -> Result<String, String> {
+    let dir = data_dir().ok_or_else(|| "нет data_dir".to_string())?;
+    let path = dir.join("webmic-token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out = Command::new("openssl")
+        .args(["rand", "-hex", "16"])
+        .output()
+        .map_err(|e| format!("openssl: {e}"))?;
+    if !out.status.success() {
+        return Err("openssl rand не отработал".to_string());
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if t.is_empty() {
+        return Err("пустой токен".to_string());
+    }
+    std::fs::write(&path, &t).map_err(|e| e.to_string())?;
+    Ok(t)
 }
 
 fn web_root() -> Option<PathBuf> {
@@ -286,6 +332,23 @@ mod tests {
         assert_eq!(rate_from_url("/api/audio?seq=3"), 48000);
         assert_eq!(rate_from_url("/api/audio?rate=999999"), 48000);
         assert_eq!(rate_from_url("/api/audio"), 48000);
+    }
+
+    #[test]
+    fn token_required_paths() {
+        assert!(needs_token("/"));
+        assert!(needs_token("/index.html"));
+        assert!(needs_token("/api/audio"));
+        assert!(!needs_token("/worklet.js"));
+        assert!(!needs_token("/assets/index-abc.js"));
+    }
+
+    #[test]
+    fn token_check() {
+        assert!(token_ok("/?t=secret", "secret"));
+        assert!(token_ok("/api/audio?rate=1&t=secret", "secret"));
+        assert!(!token_ok("/?t=wrong", "secret"));
+        assert!(!token_ok("/", "secret"));
     }
 
     #[test]
