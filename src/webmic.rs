@@ -435,16 +435,23 @@ mod tests {
         }
     }
 
-    fn post_pcm(bytes: &[u8], seq: usize) -> String {
+    fn read_token() -> String {
+        std::fs::read_to_string(dirs::data_dir().unwrap().join("health-widget").join("webmic-token"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn post_pcm(bytes: &[u8], seq: usize, token: &str) -> String {
         let tmp = std::env::temp_dir().join(format!("hw-e2e-{seq}.f32"));
         std::fs::write(&tmp, bytes).unwrap();
         let resp = curl_text(&[
-            "-s",
+            "-sk",
             "-X",
             "POST",
             "--data-binary",
             &format!("@{}", tmp.display()),
-            &format!("http://127.0.0.1:8787/api/audio?rate=44100&seq={seq}"),
+            &format!("https://127.0.0.1:8787/api/audio?rate=44100&seq={seq}&t={token}"),
         ]);
         let _ = std::fs::remove_file(&tmp);
         resp
@@ -458,22 +465,25 @@ mod tests {
         };
         let _wm = WebMic::start("🌐 веб", None).expect("сервер не поднялся");
 
-        let index = curl_text(&["-s", "http://127.0.0.1:8787/"]);
+        let token = read_token();
+        let index = curl_text(&["-sk", &format!("https://127.0.0.1:8787/?t={token}")]);
         assert!(index.contains("id=\"root\""), "статика не отдаётся: {index}");
-        let miss = curl_text(&["-s", "http://127.0.0.1:8787/../etc/passwd"]);
+        let denied = curl_text(&["-sk", "-o", "/dev/null", "-w", "%{http_code}", "https://127.0.0.1:8787/"]);
+        assert_eq!(denied, "403");
+        let miss = curl_text(&["-sk", &format!("https://127.0.0.1:8787/../etc/passwd?t={token}")]);
         assert_eq!(miss, "404");
 
         let data = std::fs::read(&pcm_path).expect("нет PCM-файла");
         let mut finals: Vec<String> = Vec::new();
         let mut seq = 0;
         for c in data.chunks(44100 * 4) {
-            collect_finals(&post_pcm(c, seq), &mut finals);
+            collect_finals(&post_pcm(c, seq, &token), &mut finals);
             seq += 1;
             std::thread::sleep(Duration::from_millis(300));
         }
         let silence = vec![0u8; 44100 * 4];
         for _ in 0..60 {
-            collect_finals(&post_pcm(&silence, seq), &mut finals);
+            collect_finals(&post_pcm(&silence, seq, &token), &mut finals);
             seq += 1;
             if !finals.is_empty() {
                 break;
