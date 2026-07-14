@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -44,8 +44,12 @@ impl WebMic {
         log: Option<Arc<TranscriptLog>>,
     ) -> Result<Self, String> {
         let token = ensure_token()?;
-        let server = tiny_http::Server::http(("127.0.0.1", PORT))
-            .map_err(|e| format!("порт {PORT}: {e}"))?;
+        let (cert, key) = ensure_cert()?;
+        let server = tiny_http::Server::https(
+            ("0.0.0.0", PORT),
+            tiny_http::SslConfig { certificate: cert, private_key: key },
+        )
+        .map_err(|e| format!("порт {PORT}: {e}"))?;
         let root = web_root();
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -249,6 +253,30 @@ fn ensure_token() -> Result<String, String> {
     }
     std::fs::write(&path, &t).map_err(|e| e.to_string())?;
     Ok(t)
+}
+
+fn ensure_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let dir = data_dir().ok_or_else(|| "нет data_dir".to_string())?;
+    let cert = dir.join("webmic-cert.pem");
+    let key = dir.join("webmic-key.pem");
+    if !(cert.exists() && key.exists()) {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let status = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", "/CN=health-widget", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("openssl: {e}"))?;
+        if !status.success() {
+            return Err("openssl req не отработал".to_string());
+        }
+    }
+    let c = std::fs::read(&cert).map_err(|e| e.to_string())?;
+    let k = std::fs::read(&key).map_err(|e| e.to_string())?;
+    Ok((c, k))
 }
 
 fn web_root() -> Option<PathBuf> {
