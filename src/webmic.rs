@@ -185,6 +185,27 @@ fn handle_request(
         respond_code(req, code);
         return;
     }
+    if req.method() == &tiny_http::Method::Post && path == "/api/img" {
+        let ct = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str().to_string())
+            .unwrap_or_default();
+        let mut body = Vec::new();
+        let _ = req.as_reader().take(IMG_MAX as u64 + 1).read_to_end(&mut body);
+        let code = match decode_image(&body, &ct) {
+            Ok(px) => {
+                if let Ok(mut g) = shared.lock() {
+                    g.push_post(|id| Post::Image(id, px));
+                }
+                200
+            }
+            Err(c) => c,
+        };
+        respond_code(req, code);
+        return;
+    }
     let (code, body, mime) = match static_file(root, &path) {
         Some((data, mime)) => (200, data, mime),
         None => (404, b"404".to_vec(), "text/plain"),
@@ -240,6 +261,46 @@ fn on_audio(
         "partial": partial,
         "stt": stt_alive,
     })
+}
+
+const IMG_MAX: usize = 8 * 1024 * 1024;
+const IMG_FIT: u32 = 1600;
+
+fn img_format(content_type: &str) -> Option<image::ImageFormat> {
+    match content_type.split(';').next()?.trim() {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" => Some(image::ImageFormat::Jpeg),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        _ => None,
+    }
+}
+
+fn fit(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    let k = (max as f64 / w as f64).min(max as f64 / h as f64);
+    (
+        ((w as f64 * k).round() as u32).max(1),
+        ((h as f64 * k).round() as u32).max(1),
+    )
+}
+
+fn decode_image(body: &[u8], content_type: &str) -> Result<egui::ColorImage, u16> {
+    if body.len() > IMG_MAX {
+        return Err(413);
+    }
+    let fmt = img_format(content_type).ok_or(415u16)?;
+    let img = image::load_from_memory_with_format(body, fmt).map_err(|_| 415u16)?;
+    let (tw, th) = fit(img.width(), img.height(), IMG_FIT);
+    let img = if (tw, th) != (img.width(), img.height()) {
+        img.resize(tw, th, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(size, &rgba))
 }
 
 fn msg_from(body: &[u8]) -> Result<String, u16> {
@@ -511,6 +572,33 @@ mod tests {
         assert_eq!(sh.posts.len(), 30);
         assert!(matches!(sh.posts.front(), Some(Post::Text(2, _))));
         assert!(matches!(sh.posts.back(), Some(Post::Text(31, _))));
+    }
+
+    #[test]
+    fn img_format_from_content_type() {
+        assert_eq!(img_format("image/png"), Some(image::ImageFormat::Png));
+        assert_eq!(img_format("image/jpeg; charset=utf-8"), Some(image::ImageFormat::Jpeg));
+        assert_eq!(img_format("image/webp"), Some(image::ImageFormat::WebP));
+        assert_eq!(img_format("text/html"), None);
+    }
+
+    #[test]
+    fn fit_downscales_preserving_ratio() {
+        assert_eq!(fit(4000, 3000, 1600), (1600, 1200));
+        assert_eq!(fit(3000, 4000, 1600), (1200, 1600));
+        assert_eq!(fit(800, 600, 1600), (800, 600));
+    }
+
+    #[test]
+    fn decode_rejects_garbage_and_accepts_png() {
+        assert_eq!(decode_image(b"mus", "image/png").err(), Some(415));
+        assert_eq!(decode_image(b"x", "text/plain").err(), Some(415));
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let img = decode_image(&png, "image/png").unwrap();
+        assert_eq!(img.size, [2, 2]);
     }
 
     #[test]
