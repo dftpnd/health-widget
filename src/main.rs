@@ -821,8 +821,8 @@ impl App {
                 if ui
                     .selectable_label(self.webmic.is_some(), "🌐")
                     .on_hover_text(
-                        "Веб-микрофон: страница на localhost:8787.\n\
-                         При включении ssh-команда и ссылка копируются в буфер.",
+                        "Веб-микрофон: https-страница на порту 8787.\n\
+                         При включении ссылка с токеном копируется в буфер.",
                     )
                     .clicked()
                 {
@@ -1391,7 +1391,7 @@ impl App {
         }
         match webmic::WebMic::start(CH_WEB, self.transcript_log.clone()) {
             Ok(w) => {
-                clip::set_async(webmic::connect_hint());
+                clip::set_async(w.hint());
                 self.webmic = Some(w);
                 let pos = self.web_pos.lock().ok().and_then(|g| *g).or_else(|| {
                     self.last_saved

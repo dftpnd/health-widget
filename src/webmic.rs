@@ -68,6 +68,10 @@ impl WebMic {
     pub fn shared(&self) -> Arc<Mutex<Shared>> {
         self.shared.clone()
     }
+
+    pub fn hint(&self) -> String {
+        hint_url(&host(), &self.token)
+    }
 }
 
 impl Drop for WebMic {
@@ -320,14 +324,30 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-pub fn connect_hint() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    let ip = lan_ip().unwrap_or_else(|| "<ip-компа>".to_string());
-    ssh_hint(&user, &ip, PORT)
+fn hint_url(host: &str, token: &str) -> String {
+    format!("https://{host}:{PORT}/?t={token}")
 }
 
-fn ssh_hint(user: &str, ip: &str, port: u16) -> String {
-    format!("ssh -N -L {port}:localhost:{port} {user}@{ip}\nhttp://localhost:{port}")
+fn host() -> String {
+    std::env::var("HEALTH_WEBMIC_HOST")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(public_ip)
+        .or_else(lan_ip)
+        .unwrap_or_else(|| "<ip-компа>".to_string())
+}
+
+fn public_ip() -> Option<String> {
+    let out = Command::new("curl")
+        .args(["-s", "--max-time", "2", "https://api.ipify.org"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!ip.is_empty() && ip.chars().all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':'))
+        .then_some(ip)
 }
 
 fn lan_ip() -> Option<String> {
@@ -380,10 +400,10 @@ mod tests {
     }
 
     #[test]
-    fn ssh_hint_format() {
+    fn hint_url_format() {
         assert_eq!(
-            ssh_hint("mgu", "192.168.1.5", 8787),
-            "ssh -N -L 8787:localhost:8787 mgu@192.168.1.5\nhttp://localhost:8787"
+            hint_url("203.0.113.7", "abc123"),
+            "https://203.0.113.7:8787/?t=abc123"
         );
     }
 
