@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 const CHUNK_MS = 250
+const TOKEN = new URLSearchParams(location.search).get('t') || ''
 
 export default function App() {
   const [running, setRunning] = useState(false)
@@ -44,7 +45,7 @@ export default function App() {
         }
         inFlight = true
         try {
-          const r = await fetch(`api/audio?rate=${ctx.sampleRate}&seq=${seq++}`, {
+          const r = await fetch(`api/audio?rate=${ctx.sampleRate}&seq=${seq++}&t=${TOKEN}`, {
             method: 'POST',
             body: pcm.buffer,
           })
