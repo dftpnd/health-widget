@@ -9,14 +9,58 @@ export default function App() {
   const [partial, setPartial] = useState('')
   const [stt, setStt] = useState(false)
   const [err, setErr] = useState('')
+  const [msg, setMsg] = useState('')
   const session = useRef(null)
   const feed = useRef(null)
+  const fileRef = useRef(null)
 
   useEffect(() => {
     feed.current?.scrollTo(0, feed.current.scrollHeight)
   }, [finals, partial])
 
   useEffect(() => stop, [])
+
+  async function post(path, body, type) {
+    const r = await fetch(`${path}?t=${TOKEN}`, {
+      method: 'POST',
+      headers: type ? { 'Content-Type': type } : {},
+      body,
+    })
+    if (!r.ok) throw new Error(String(r.status))
+  }
+
+  async function sendText() {
+    const text = msg.trim()
+    if (!text) return
+    try {
+      await post('api/msg', text, 'text/plain; charset=utf-8')
+      setFinals((f) => [...f, `→ ${text}`])
+      setMsg('')
+      setErr('')
+    } catch {
+      setErr('текст не отправился')
+    }
+  }
+
+  async function sendImage(file, label) {
+    if (!file) return
+    try {
+      await post('api/img', file, file.type || 'image/png')
+      setFinals((f) => [...f, `→ 🖼 ${label}`])
+      setErr('')
+    } catch {
+      setErr('картинка не отправилась')
+    }
+  }
+
+  useEffect(() => {
+    const onPaste = (e) => {
+      const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'))
+      if (item) sendImage(item.getAsFile(), 'из буфера')
+    }
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [])
 
   async function start() {
     setErr('')
@@ -104,6 +148,27 @@ export default function App() {
           <div key={i}>{t}</div>
         ))}
         {partial && <div className="partial">{partial}</div>}
+      </div>
+      <div className="compose">
+        <input
+          className="msg"
+          placeholder="текст на виджет…"
+          value={msg}
+          onChange={(e) => setMsg(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && sendText()}
+        />
+        <button className="send" onClick={sendText}>➤</button>
+        <button className="send" onClick={() => fileRef.current?.click()}>📎</button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          hidden
+          onChange={(e) => {
+            sendImage(e.target.files?.[0], e.target.files?.[0]?.name || 'файл')
+            e.target.value = ''
+          }}
+        />
       </div>
     </div>
   )
