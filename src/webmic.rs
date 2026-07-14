@@ -71,11 +71,14 @@ impl WebMic {
     }
 
     pub fn hint(&self) -> String {
-        let h = host();
-        match &self.token {
-            Some(t) => hint_url(&h, t),
-            None => format!("https://{h}:{PORT}/"),
-        }
+        hosts()
+            .iter()
+            .map(|h| match &self.token {
+                Some(t) => hint_url(h, t),
+                None => format!("https://{h}:{PORT}/"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -335,13 +338,47 @@ fn hint_url(host: &str, token: &str) -> String {
     format!("https://{host}:{PORT}/?t={token}")
 }
 
-fn host() -> String {
-    std::env::var("HEALTH_WEBMIC_HOST")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(public_ip)
-        .or_else(lan_ip)
-        .unwrap_or_else(|| "<ip-компа>".to_string())
+fn hosts() -> Vec<String> {
+    if let Some(h) = std::env::var("HEALTH_WEBMIC_HOST").ok().filter(|h| !h.is_empty()) {
+        return vec![h];
+    }
+    let mut v: Vec<String> = [vpn_ip(), public_ip().or_else(lan_ip)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if v.is_empty() {
+        v.push("<ip-компа>".to_string());
+    }
+    v
+}
+
+fn vpn_ip() -> Option<String> {
+    let links = Command::new("ip")
+        .args(["-o", "link", "show", "type", "wireguard"])
+        .output()
+        .ok()?;
+    if !links.status.success() {
+        return None;
+    }
+    let dev = wg_dev_from(&String::from_utf8_lossy(&links.stdout))?;
+    let addrs = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", &dev])
+        .output()
+        .ok()?;
+    if !addrs.status.success() {
+        return None;
+    }
+    ip_from_addr_line(&String::from_utf8_lossy(&addrs.stdout))
+}
+
+fn wg_dev_from(text: &str) -> Option<String> {
+    let dev = text.lines().next()?.split_whitespace().nth(1)?;
+    Some(dev.trim_end_matches(':').to_string())
+}
+
+fn ip_from_addr_line(text: &str) -> Option<String> {
+    let addr = text.lines().next()?.split_whitespace().nth(3)?;
+    addr.split('/').next().map(|a| a.to_string())
 }
 
 fn public_ip() -> Option<String> {
@@ -404,6 +441,20 @@ mod tests {
         assert!(token_ok("/api/audio?rate=1&t=secret", "secret"));
         assert!(!token_ok("/?t=wrong", "secret"));
         assert!(!token_ok("/", "secret"));
+    }
+
+    #[test]
+    fn wg_dev_parsed_from_link_line() {
+        let out = "19: linux-ultra: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/none \n";
+        assert_eq!(wg_dev_from(out), Some("linux-ultra".to_string()));
+        assert_eq!(wg_dev_from(""), None);
+    }
+
+    #[test]
+    fn ip_parsed_from_addr_line() {
+        let out = "19: linux-ultra    inet 10.8.0.9/32 scope global linux-ultra\\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(ip_from_addr_line(out), Some("10.8.0.9".to_string()));
+        assert_eq!(ip_from_addr_line(""), None);
     }
 
     #[test]
