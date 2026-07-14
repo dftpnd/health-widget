@@ -16,6 +16,13 @@ const IDLE_STT_STOP: Duration = Duration::from_secs(30);
 const CLIENT_ACTIVE: Duration = Duration::from_secs(2);
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const LINES_CAP: usize = 200;
+pub const MSG_MAX: usize = 64 * 1024;
+const POSTS_CAP: usize = 30;
+
+pub enum Post {
+    Text(u64, String),
+    Image(u64, egui::ColorImage),
+}
 
 #[derive(Default)]
 pub struct Shared {
@@ -23,11 +30,21 @@ pub struct Shared {
     pub partial: String,
     pub stt_on: bool,
     pub last_audio: Option<Instant>,
+    pub posts: VecDeque<Post>,
+    next_post_id: u64,
 }
 
 impl Shared {
     pub fn client_active(&self) -> bool {
         self.last_audio.is_some_and(|t| t.elapsed() < CLIENT_ACTIVE)
+    }
+
+    pub fn push_post(&mut self, make: impl FnOnce(u64) -> Post) {
+        self.next_post_id += 1;
+        if self.posts.len() >= POSTS_CAP {
+            self.posts.pop_front();
+        }
+        self.posts.push_back(make(self.next_post_id));
     }
 }
 
@@ -153,6 +170,21 @@ fn handle_request(
         let _ = req.respond(resp);
         return;
     }
+    if req.method() == &tiny_http::Method::Post && path == "/api/msg" {
+        let mut body = Vec::new();
+        let _ = req.as_reader().take(MSG_MAX as u64 + 1).read_to_end(&mut body);
+        let code = match msg_from(&body) {
+            Ok(text) => {
+                if let Ok(mut g) = shared.lock() {
+                    g.push_post(|id| Post::Text(id, text));
+                }
+                200
+            }
+            Err(c) => c,
+        };
+        respond_code(req, code);
+        return;
+    }
     let (code, body, mime) = match static_file(root, &path) {
         Some((data, mime)) => (200, data, mime),
         None => (404, b"404".to_vec(), "text/plain"),
@@ -208,6 +240,25 @@ fn on_audio(
         "partial": partial,
         "stt": stt_alive,
     })
+}
+
+fn msg_from(body: &[u8]) -> Result<String, u16> {
+    if body.len() > MSG_MAX {
+        return Err(413);
+    }
+    let text = std::str::from_utf8(body).map_err(|_| 400u16)?.trim().to_string();
+    if text.is_empty() {
+        return Err(400);
+    }
+    Ok(text)
+}
+
+fn respond_code(req: tiny_http::Request, code: u16) {
+    let body = if code == 200 { r#"{"ok":true}"# } else { r#"{"ok":false}"# };
+    let resp = tiny_http::Response::from_string(body)
+        .with_status_code(code)
+        .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
+    let _ = req.respond(resp);
 }
 
 fn pcm_from_le(bytes: &[u8]) -> Vec<f32> {
@@ -441,6 +492,25 @@ mod tests {
         assert!(token_ok("/api/audio?rate=1&t=secret", "secret"));
         assert!(!token_ok("/?t=wrong", "secret"));
         assert!(!token_ok("/", "secret"));
+    }
+
+    #[test]
+    fn msg_parsing() {
+        assert_eq!(msg_from("привет".as_bytes()), Ok("привет".to_string()));
+        assert_eq!(msg_from(b"  \n "), Err(400));
+        assert_eq!(msg_from(&[0xff, 0xfe]), Err(400));
+        assert_eq!(msg_from(&vec![b'a'; MSG_MAX + 1]), Err(413));
+    }
+
+    #[test]
+    fn posts_capped_at_30() {
+        let mut sh = Shared::default();
+        for i in 0..31 {
+            sh.push_post(|id| Post::Text(id, format!("m{i}")));
+        }
+        assert_eq!(sh.posts.len(), 30);
+        assert!(matches!(sh.posts.front(), Some(Post::Text(2, _))));
+        assert!(matches!(sh.posts.back(), Some(Post::Text(31, _))));
     }
 
     #[test]
