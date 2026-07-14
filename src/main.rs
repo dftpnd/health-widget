@@ -41,6 +41,8 @@ const GRIP: f32 = 16.0;
 const MARGIN: f32 = 12.0;
 const CHAT_WIN_W: f32 = 440.0;
 const CHAT_WIN_H: f32 = 520.0;
+const WEB_WIN_W: f32 = 420.0;
+const WEB_WIN_H: f32 = 320.0;
 
 const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
@@ -196,6 +198,9 @@ struct App {
     webmic: Option<webmic::WebMic>,
     webmic_error: Option<String>,
     web_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
+    web_spawn_size: egui::Vec2,
+    web_size: egui::Vec2,
+    web_textures: std::collections::HashMap<u64, egui::TextureHandle>,
 }
 
 impl App {
@@ -495,6 +500,9 @@ impl App {
                 .flatten(),
             webmic_error: None,
             web_pos,
+            web_spawn_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
+            web_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
+            web_textures: std::collections::HashMap::new(),
         }
     }
 
@@ -686,6 +694,8 @@ impl App {
             chat_h: Some(self.chat_size.y),
             web_x,
             web_y,
+            web_w: Some(self.web_size.x),
+            web_h: Some(self.web_size.y),
         }
     }
 
@@ -1391,6 +1401,7 @@ impl App {
         }
         match webmic::WebMic::start(CH_WEB, self.transcript_log.clone()) {
             Ok(w) => {
+                self.web_spawn_size = self.web_size;
                 clip::set_async(w.hint());
                 self.webmic = Some(w);
                 let pos = self.web_pos.lock().ok().and_then(|g| *g).or_else(|| {
@@ -1416,22 +1427,50 @@ impl App {
         let Some(shared) = self.webmic.as_ref().map(|w| w.shared()) else {
             return;
         };
-        let (lines, partial, stt_on, active) = match shared.lock() {
-            Ok(g) => (
-                g.lines.iter().cloned().collect::<Vec<_>>(),
-                g.partial.clone(),
-                g.stt_on,
-                g.client_active(),
-            ),
+        enum Snap {
+            Text(String),
+            Image(u64),
+        }
+        let (lines, partial, stt_on, active, posts, new_imgs) = match shared.lock() {
+            Ok(g) => {
+                let mut posts = Vec::new();
+                let mut new_imgs = Vec::new();
+                for p in &g.posts {
+                    match p {
+                        webmic::Post::Text(_, t) => posts.push(Snap::Text(t.clone())),
+                        webmic::Post::Image(id, px) => {
+                            if !self.web_textures.contains_key(id) {
+                                new_imgs.push((*id, px.clone()));
+                            }
+                            posts.push(Snap::Image(*id));
+                        }
+                    }
+                }
+                (
+                    g.lines.iter().cloned().collect::<Vec<_>>(),
+                    g.partial.clone(),
+                    g.stt_on,
+                    g.client_active(),
+                    posts,
+                    new_imgs,
+                )
+            }
             Err(_) => return,
         };
+        for (id, px) in new_imgs {
+            let tex = ctx.load_texture(format!("hwweb-{id}"), px, Default::default());
+            self.web_textures.insert(id, tex);
+        }
+        self.web_textures
+            .retain(|id, _| posts.iter().any(|p| matches!(p, Snap::Image(pid) if pid == id)));
         let vb = egui::ViewportBuilder::default()
             .with_title(winctl::WEB_CAPTION)
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
-            .with_resizable(false)
-            .with_inner_size([420.0, 320.0]);
+            .with_resizable(true)
+            .with_inner_size([self.web_spawn_size.x, self.web_spawn_size.y])
+            .with_min_inner_size([320.0, 280.0]);
         let id = egui::ViewportId::from_hash_of("hw-web-panel");
         let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
         let mut close = false;
@@ -1448,12 +1487,18 @@ impl App {
                 .corner_radius(10);
             egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
                 let panel = ui.max_rect();
+                let grip_rect =
+                    egui::Rect::from_min_max(panel.max - egui::vec2(GRIP, GRIP), panel.max);
                 let drag = ui.interact(
                     panel,
                     ui.id().with("web-drag"),
                     egui::Sense::click_and_drag(),
                 );
-                if drag.drag_started() {
+                if drag.drag_started()
+                    && !drag
+                        .interact_pointer_pos()
+                        .is_some_and(|p| grip_rect.contains(p))
+                {
                     cctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 ui.horizontal(|ui| {
@@ -1481,7 +1526,16 @@ impl App {
                         }
                     });
                 });
+                let half = (ui.available_height() - 40.0).max(80.0) / 2.0;
+                ui.label(
+                    egui::RichText::new("🗣 Речь")
+                        .size(10.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(120, 130, 150)),
+                );
                 egui::ScrollArea::vertical()
+                    .id_salt("web-speech")
+                    .max_height(half)
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
@@ -1509,7 +1563,48 @@ impl App {
                             );
                         }
                     });
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("📥 Присланное")
+                        .size(10.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(120, 130, 150)),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("web-posts")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if posts.is_empty() {
+                            ui.label(
+                                egui::RichText::new("пришли текст или картинку со страницы")
+                                    .size(12.0)
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(90, 96, 108)),
+                            );
+                        }
+                        for p in &posts {
+                            match p {
+                                Snap::Text(t) => {
+                                    ui.label(
+                                        egui::RichText::new(t)
+                                            .size(15.0)
+                                            .color(egui::Color32::from_rgb(205, 210, 220)),
+                                    );
+                                }
+                                Snap::Image(id) => {
+                                    if let Some(tex) = self.web_textures.get(id) {
+                                        let size = tex.size_vec2();
+                                        let k = (ui.available_width() / size.x).min(1.0);
+                                        ui.image((tex.id(), size * k));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                draw_resize_grip(ui, cctx, grip_rect);
             });
+            self.web_size = cctx.screen_rect().size();
         });
 
         if close {

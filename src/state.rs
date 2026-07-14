@@ -50,6 +50,10 @@ pub struct State {
     pub web_x: Option<f32>,
     #[serde(default)]
     pub web_y: Option<f32>,
+    #[serde(default)]
+    pub web_w: Option<f32>,
+    #[serde(default)]
+    pub web_h: Option<f32>,
 }
 
 fn path() -> PathBuf {
