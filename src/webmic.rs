@@ -689,6 +689,34 @@ mod tests {
         let miss = curl_text(&["-sk", &format!("https://127.0.0.1:8787/../etc/passwd?t={token}")]);
         assert_eq!(miss, "404");
 
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let tmp_png = std::env::temp_dir().join("hw-e2e.png");
+        std::fs::write(&tmp_png, &png).unwrap();
+        let msg_code = curl_text(&[
+            "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "--data-binary", "привет", "-H", "Content-Type: text/plain",
+            &format!("https://127.0.0.1:8787/api/msg?t={token}"),
+        ]);
+        assert_eq!(msg_code, "200");
+        let img_code = curl_text(&[
+            "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "--data-binary", &format!("@{}", tmp_png.display()),
+            "-H", "Content-Type: image/png",
+            &format!("https://127.0.0.1:8787/api/img?t={token}"),
+        ]);
+        assert_eq!(img_code, "200");
+        let bad = curl_text(&[
+            "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "--data-binary", "мусор", "-H", "Content-Type: image/png",
+            &format!("https://127.0.0.1:8787/api/img?t={token}"),
+        ]);
+        assert_eq!(bad, "415");
+        assert_eq!(_wm.shared().lock().unwrap().posts.len(), 2);
+        let _ = std::fs::remove_file(&tmp_png);
+
         let data = std::fs::read(&pcm_path).expect("нет PCM-файла");
         let mut finals: Vec<String> = Vec::new();
         let mut seq = 0;
