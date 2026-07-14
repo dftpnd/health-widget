@@ -10,13 +10,19 @@ export default function App() {
   const [stt, setStt] = useState(false)
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
+  const [sent, setSent] = useState([])
   const session = useRef(null)
   const feed = useRef(null)
+  const sentFeed = useRef(null)
   const fileRef = useRef(null)
 
   useEffect(() => {
     feed.current?.scrollTo(0, feed.current.scrollHeight)
   }, [finals, partial])
+
+  useEffect(() => {
+    sentFeed.current?.scrollTo(0, sentFeed.current.scrollHeight)
+  }, [sent])
 
   useEffect(() => stop, [])
 
@@ -34,7 +40,7 @@ export default function App() {
     if (!text) return
     try {
       await post('api/msg', text, 'text/plain; charset=utf-8')
-      setFinals((f) => [...f, `→ ${text}`])
+      setSent((s) => [...s, { kind: 'text', text }])
       setMsg('')
       setErr('')
     } catch {
@@ -46,7 +52,7 @@ export default function App() {
     if (!file) return
     try {
       await post('api/img', file, file.type || 'image/png')
-      setFinals((f) => [...f, `→ 🖼 ${label}`])
+      setSent((s) => [...s, { kind: 'img', url: URL.createObjectURL(file), label }])
       setErr('')
     } catch {
       setErr('картинка не отправилась')
@@ -137,38 +143,56 @@ export default function App() {
         <span className="status">{status}</span>
         {err && <span className="err">✖ {err}</span>}
       </div>
-      <button className={running ? 'talk on' : 'talk'} onClick={running ? stop : start}>
-        {running ? '⏹ Стоп' : '🎤 Говорить'}
-      </button>
-      <div className="feed" ref={feed}>
-        {finals.length === 0 && !partial && (
-          <div className="hint">жми «Говорить» и говори — текст появится тут и в виджете</div>
-        )}
-        {finals.map((t, i) => (
-          <div key={i}>{t}</div>
-        ))}
-        {partial && <div className="partial">{partial}</div>}
-      </div>
-      <div className="compose">
-        <input
-          className="msg"
-          placeholder="текст на виджет…"
-          value={msg}
-          onChange={(e) => setMsg(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && sendText()}
-        />
-        <button className="send" onClick={sendText}>➤</button>
-        <button className="send" onClick={() => fileRef.current?.click()}>📎</button>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          hidden
-          onChange={(e) => {
-            sendImage(e.target.files?.[0], e.target.files?.[0]?.name || 'файл')
-            e.target.value = ''
-          }}
-        />
+      <div className="cols">
+        <div className="col">
+          <button className={running ? 'talk on' : 'talk'} onClick={running ? stop : start}>
+            {running ? '⏹ Стоп' : '🎤 Говорить'}
+          </button>
+          <div className="feed" ref={feed}>
+            {finals.length === 0 && !partial && (
+              <div className="hint">жми «Говорить» и говори — текст появится тут и в виджете</div>
+            )}
+            {finals.map((t, i) => (
+              <div key={i}>{t}</div>
+            ))}
+            {partial && <div className="partial">{partial}</div>}
+          </div>
+        </div>
+        <div className="col">
+          <div className="feed sent" ref={sentFeed}>
+            {sent.length === 0 && (
+              <div className="hint">текст и картинки для виджета — сюда: поле ниже, 📎 или Ctrl+V</div>
+            )}
+            {sent.map((it, i) =>
+              it.kind === 'text' ? (
+                <div key={i}>→ {it.text}</div>
+              ) : (
+                <img key={i} className="thumb" src={it.url} alt={it.label} title={it.label} />
+              )
+            )}
+          </div>
+          <div className="compose">
+            <input
+              className="msg"
+              placeholder="текст на виджет…"
+              value={msg}
+              onChange={(e) => setMsg(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && sendText()}
+            />
+            <button className="send" onClick={sendText}>➤</button>
+            <button className="send" onClick={() => fileRef.current?.click()}>📎</button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              hidden
+              onChange={(e) => {
+                sendImage(e.target.files?.[0], e.target.files?.[0]?.name || 'файл')
+                e.target.value = ''
+              }}
+            />
+          </div>
+        </div>
       </div>
     </div>
   )
