@@ -217,6 +217,7 @@ KWin 6.6 отдаёт клиентам только `ext_data_control_v1`, а wl
 | `HEALTH_TRANSCRIBE`     | онлайн-транскрипция (1/0)            | 1 |
 | `HEALTH_WEBMIC`         | веб-микрофон при старте (1/0)        | 0 |
 | `HEALTH_WEBMIC_HOST`    | хост для ссылки веб-микрофона        | публичный IP (ipify) |
+| `HEALTH_WEBMIC_OPEN`    | веб-микрофон без токена, для отладки (1/0) | 0 |
 | `HEALTH_STT_MIN_FREE_MIB` | мин. свободная VRAM для старта STT (MiB) | 5000 |
 | `WHISPER_MODEL`         | имя/путь модели whisper             | `large-v3` |
 | `WHISPER_PYTHON`        | python с `faster-whisper`           | `~/.local/share/health-widget/venv-whisper/bin/python` |

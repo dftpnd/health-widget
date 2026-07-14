@@ -34,7 +34,7 @@ impl Shared {
 pub struct WebMic {
     stop: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
-    token: String,
+    token: Option<String>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -43,7 +43,8 @@ impl WebMic {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Result<Self, String> {
-        let token = ensure_token()?;
+        let open = std::env::var("HEALTH_WEBMIC_OPEN").as_deref() == Ok("1");
+        let token = if open { None } else { Some(ensure_token()?) };
         let (cert, key) = ensure_cert()?;
         let server = tiny_http::Server::https(
             ("0.0.0.0", PORT),
@@ -70,7 +71,11 @@ impl WebMic {
     }
 
     pub fn hint(&self) -> String {
-        hint_url(&host(), &self.token)
+        let h = host();
+        match &self.token {
+            Some(t) => hint_url(&h, t),
+            None => format!("https://{h}:{PORT}/"),
+        }
     }
 }
 
@@ -91,7 +96,7 @@ fn serve_loop(
     log: Option<Arc<TranscriptLog>>,
     stop: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
-    token: String,
+    token: Option<String>,
 ) {
     let mut stt: Option<(Transcriber, Feeder)> = None;
     let mut last_audio: Option<Instant> = None;
@@ -110,7 +115,7 @@ fn serve_loop(
             Ok(None) => continue,
             Err(_) => break,
         };
-        handle_request(req, &root, channel, &log, &shared, &mut stt, &mut last_audio, &token);
+        handle_request(req, &root, channel, &log, &shared, &mut stt, &mut last_audio, token.as_deref());
     }
 }
 
@@ -122,13 +127,15 @@ fn handle_request(
     shared: &Arc<Mutex<Shared>>,
     stt: &mut Option<(Transcriber, Feeder)>,
     last_audio: &mut Option<Instant>,
-    token: &str,
+    token: Option<&str>,
 ) {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
-    if needs_token(&path) && !token_ok(&url, token) {
-        let _ = req.respond(tiny_http::Response::empty(403));
-        return;
+    if let Some(token) = token {
+        if needs_token(&path) && !token_ok(&url, token) {
+            let _ = req.respond(tiny_http::Response::empty(403));
+            return;
+        }
     }
     if req.method() == &tiny_http::Method::Post && path == "/api/audio" {
         let mut body = Vec::new();
