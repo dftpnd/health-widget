@@ -61,8 +61,8 @@ impl WebMic {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Result<Self, String> {
-        let open = std::env::var("HEALTH_WEBMIC_OPEN").as_deref() == Ok("1");
-        let token = if open { None } else { Some(ensure_token()?) };
+        let with_token = std::env::var("HEALTH_WEBMIC_TOKEN").as_deref() == Ok("1");
+        let token = if with_token { Some(ensure_token()?) } else { None };
         let (cert, key) = ensure_cert()?;
         let server = tiny_http::Server::https(
             ("0.0.0.0", PORT),
@@ -923,6 +923,7 @@ mod tests {
     #[test]
     #[ignore]
     fn e2e_zoom_ws() {
+        std::env::set_var("HEALTH_WEBMIC_TOKEN", "1");
         let wm = WebMic::start("🌐 веб", None).expect("сервер не поднялся");
         let token = read_token();
 
@@ -987,6 +988,7 @@ mod tests {
         let Ok(pcm_path) = std::env::var("HW_E2E_PCM") else {
             return;
         };
+        std::env::set_var("HEALTH_WEBMIC_TOKEN", "1");
         let _wm = WebMic::start("🌐 веб", None).expect("сервер не поднялся");
 
         let token = read_token();
