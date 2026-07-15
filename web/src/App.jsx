@@ -11,14 +11,51 @@ export default function App() {
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
   const [sent, setSent] = useState([])
+  const [zoom, setZoom] = useState({ on: false, text: '', partial: '' })
   const session = useRef(null)
   const feed = useRef(null)
+  const zoomFeed = useRef(null)
   const sentFeed = useRef(null)
   const fileRef = useRef(null)
 
   useEffect(() => {
     feed.current?.scrollTo(0, feed.current.scrollHeight)
   }, [finals, partial])
+
+  useEffect(() => {
+    zoomFeed.current?.scrollTo(0, zoomFeed.current.scrollHeight)
+  }, [zoom])
+
+  useEffect(() => {
+    let ws
+    let timer
+    let closed = false
+    const connect = () => {
+      ws = new WebSocket(`wss://${location.host}/api/zoom?t=${TOKEN}`)
+      ws.onmessage = (e) => {
+        let m
+        try {
+          m = JSON.parse(e.data)
+        } catch {
+          return
+        }
+        setZoom((z) => ({
+          on: m.on !== undefined ? !!m.on : z.on,
+          text: m.full !== undefined ? m.full : m.add ? z.text + m.add : z.text,
+          partial: m.partial !== undefined ? m.partial : z.partial,
+        }))
+      }
+      ws.onclose = () => {
+        if (!closed) timer = setTimeout(connect, 2000)
+      }
+    }
+    connect()
+    return () => {
+      closed = true
+      clearTimeout(timer)
+      ws?.close()
+    }
+  }, [])
 
   useEffect(() => {
     sentFeed.current?.scrollTo(0, sentFeed.current.scrollHeight)
@@ -156,6 +193,17 @@ export default function App() {
               <div key={i}>{t}</div>
             ))}
             {partial && <div className="partial">{partial}</div>}
+          </div>
+          <div className="zoomhdr">🔊 Телемост</div>
+          <div className="feed zoom" ref={zoomFeed}>
+            {!zoom.on && !zoom.text && (
+              <div className="hint">захват телемоста выключен — включи 🔊 в виджете</div>
+            )}
+            {zoom.on && !zoom.text && !zoom.partial && (
+              <div className="hint">жду речь из телемоста…</div>
+            )}
+            {zoom.text}
+            {zoom.partial && <span className="partial"> {zoom.partial}</span>}
           </div>
         </div>
         <div className="col">

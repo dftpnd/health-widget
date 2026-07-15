@@ -12,9 +12,9 @@ const MAX_FINALS: usize = 50_000;
 const FRESH_CAP: usize = 32;
 
 #[derive(Default)]
-struct Transcript {
-    finals: String,
-    partial: String,
+pub struct Transcript {
+    pub finals: String,
+    pub partial: String,
 }
 
 pub struct Transcriber {
@@ -152,6 +152,10 @@ impl Transcriber {
 
     pub fn fresh_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
         self.fresh.clone()
+    }
+
+    pub fn state_handle(&self) -> Arc<Mutex<Transcript>> {
+        self.state.clone()
     }
 
     pub fn text(&self) -> (String, String) {

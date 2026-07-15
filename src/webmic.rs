@@ -1,6 +1,6 @@
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::transcribe::{Feeder, Transcriber};
+use crate::transcribe::{Feeder, Transcriber, Transcript};
 use crate::transcript_log::TranscriptLog;
 
 pub const PORT: u16 = 8787;
@@ -31,6 +31,7 @@ pub struct Shared {
     pub stt_on: bool,
     pub last_audio: Option<Instant>,
     pub posts: VecDeque<Post>,
+    pub zoom: Option<Arc<Mutex<Transcript>>>,
     next_post_id: u64,
 }
 
@@ -135,7 +136,7 @@ fn serve_loop(
             Ok(None) => continue,
             Err(_) => break,
         };
-        handle_request(req, &root, channel, &log, &shared, &mut stt, &mut last_audio, token.as_deref());
+        handle_request(req, &root, channel, &log, &shared, &stop, &mut stt, &mut last_audio, token.as_deref());
     }
 }
 
@@ -145,6 +146,7 @@ fn handle_request(
     channel: &'static str,
     log: &Option<Arc<TranscriptLog>>,
     shared: &Arc<Mutex<Shared>>,
+    stop: &Arc<AtomicBool>,
     stt: &mut Option<(Transcriber, Feeder)>,
     last_audio: &mut Option<Instant>,
     token: Option<&str>,
@@ -183,6 +185,28 @@ fn handle_request(
             Err(c) => c,
         };
         respond_code(req, code);
+        return;
+    }
+    if path == "/api/zoom" {
+        let key = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Sec-WebSocket-Key"))
+            .map(|h| h.value.as_str().trim().to_string());
+        match key.and_then(|k| ws_accept(&k)) {
+            Some(accept) => {
+                let resp = tiny_http::Response::empty(101).with_header(
+                    tiny_http::Header::from_bytes("Sec-WebSocket-Accept", accept).unwrap(),
+                );
+                let stream = req.upgrade("websocket", resp);
+                let shared = shared.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || zoom_ws_loop(stream, shared, stop));
+            }
+            None => {
+                let _ = req.respond(tiny_http::Response::empty(400));
+            }
+        }
         return;
     }
     if req.method() == &tiny_http::Method::Post && path == "/api/img" {
@@ -261,6 +285,135 @@ fn on_audio(
         "partial": partial,
         "stt": stt_alive,
     })
+}
+
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_TICK: Duration = Duration::from_millis(300);
+const WS_HEARTBEAT_TICKS: u32 = 30;
+
+#[derive(Default)]
+struct ZoomSent {
+    started: bool,
+    on: bool,
+    finals: String,
+    partial: String,
+}
+
+fn zoom_full(on: bool, finals: &str, partial: &str) -> String {
+    serde_json::json!({ "on": on, "full": finals, "partial": partial }).to_string()
+}
+
+fn zoom_msg(sent: &mut ZoomSent, on: bool, finals: &str, partial: &str) -> Option<String> {
+    let first = !std::mem::replace(&mut sent.started, true);
+    if !on {
+        sent.finals.clear();
+        sent.partial.clear();
+        let was_on = std::mem::replace(&mut sent.on, false);
+        return (first || was_on).then(|| serde_json::json!({ "on": false }).to_string());
+    }
+    if first || !sent.on || !finals.starts_with(sent.finals.as_str()) {
+        sent.on = true;
+        sent.finals = finals.to_string();
+        sent.partial = partial.to_string();
+        return Some(zoom_full(true, finals, partial));
+    }
+    let add = &finals[sent.finals.len()..];
+    if add.is_empty() && partial == sent.partial {
+        return None;
+    }
+    let msg = serde_json::json!({ "on": true, "add": add, "partial": partial }).to_string();
+    sent.finals = finals.to_string();
+    sent.partial = partial.to_string();
+    Some(msg)
+}
+
+fn ws_text_frame(payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(payload.len() + 10);
+    f.push(0x81);
+    match payload.len() {
+        n if n < 126 => f.push(n as u8),
+        n if n <= 0xFFFF => {
+            f.push(126);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            f.push(127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    f.extend_from_slice(payload);
+    f
+}
+
+fn b64(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = u32::from_be_bytes([0, c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)]);
+        s.push(A[(n >> 18 & 63) as usize] as char);
+        s.push(A[(n >> 12 & 63) as usize] as char);
+        s.push(if c.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
+        s.push(if c.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+    }
+    s
+}
+
+fn ws_accept(key: &str) -> Option<String> {
+    let mut child = Command::new("openssl")
+        .args(["dgst", "-sha1", "-binary"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(format!("{key}{WS_GUID}").as_bytes())
+        .ok()?;
+    let out = child.wait_with_output().ok()?;
+    (out.status.success() && out.stdout.len() == 20).then(|| b64(&out.stdout))
+}
+
+fn zoom_snapshot(shared: &Arc<Mutex<Shared>>) -> (bool, String, String) {
+    let handle = shared.lock().ok().and_then(|g| g.zoom.clone());
+    match handle.and_then(|h| h.lock().ok().map(|t| (t.finals.clone(), t.partial.clone()))) {
+        Some((f, p)) => (true, f, p),
+        None => (false, String::new(), String::new()),
+    }
+}
+
+fn zoom_ws_loop(
+    mut stream: Box<dyn tiny_http::ReadWrite + Send>,
+    shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut sent = ZoomSent::default();
+    let mut quiet = 0u32;
+    while !stop.load(Ordering::Relaxed) {
+        let (on, finals, partial) = zoom_snapshot(&shared);
+        let msg = zoom_msg(&mut sent, on, &finals, &partial);
+        let out = match msg {
+            Some(m) => Some(m),
+            None if quiet >= WS_HEARTBEAT_TICKS => {
+                Some(serde_json::json!({ "on": sent.on }).to_string())
+            }
+            None => None,
+        };
+        match out {
+            Some(m) => {
+                quiet = 0;
+                let write = stream
+                    .write_all(&ws_text_frame(m.as_bytes()))
+                    .and_then(|_| stream.flush());
+                if write.is_err() {
+                    return;
+                }
+            }
+            None => quiet += 1,
+        }
+        std::thread::sleep(WS_TICK);
+    }
 }
 
 const IMG_MAX: usize = 8 * 1024 * 1024;
@@ -575,6 +728,77 @@ mod tests {
     }
 
     #[test]
+    fn b64_vectors() {
+        assert_eq!(b64(b""), "");
+        assert_eq!(b64(b"f"), "Zg==");
+        assert_eq!(b64(b"fo"), "Zm8=");
+        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn ws_accept_rfc_vector() {
+        assert_eq!(
+            ws_accept("dGhlIHNhbXBsZSBub25jZQ==").as_deref(),
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        );
+    }
+
+    #[test]
+    fn ws_frame_lengths() {
+        let small = ws_text_frame(&[b'a'; 5]);
+        assert_eq!(&small[..2], &[0x81, 5]);
+        assert_eq!(small.len(), 7);
+        let mid = ws_text_frame(&[b'a'; 300]);
+        assert_eq!(&mid[..4], &[0x81, 126, 1, 44]);
+        assert_eq!(mid.len(), 304);
+        let big = ws_text_frame(&[b'a'; 70_000]);
+        assert_eq!(big[1], 127);
+        assert_eq!(&big[2..10], &70_000u64.to_be_bytes());
+        assert_eq!(big.len(), 70_010);
+    }
+
+    #[test]
+    fn zoom_msg_protocol() {
+        let mut sent = ZoomSent::default();
+        assert_eq!(
+            zoom_msg(&mut sent, false, "", "").as_deref(),
+            Some(r#"{"on":false}"#)
+        );
+        assert_eq!(zoom_msg(&mut sent, false, "", ""), None);
+        assert_eq!(
+            zoom_msg(&mut sent, true, "привет", "ми").as_deref(),
+            Some(r#"{"full":"привет","on":true,"partial":"ми"}"#)
+        );
+        assert_eq!(zoom_msg(&mut sent, true, "привет", "ми"), None);
+        assert_eq!(
+            zoom_msg(&mut sent, true, "привет мир", "").as_deref(),
+            Some(r#"{"add":" мир","on":true,"partial":""}"#)
+        );
+        assert_eq!(
+            zoom_msg(&mut sent, true, "обрезано", "").as_deref(),
+            Some(r#"{"full":"обрезано","on":true,"partial":""}"#)
+        );
+        assert_eq!(
+            zoom_msg(&mut sent, false, "", "").as_deref(),
+            Some(r#"{"on":false}"#)
+        );
+        assert_eq!(
+            zoom_msg(&mut sent, true, "", "").as_deref(),
+            Some(r#"{"full":"","on":true,"partial":""}"#)
+        );
+    }
+
+    #[test]
+    fn zoom_msg_first_tick_on() {
+        let mut sent = ZoomSent::default();
+        assert_eq!(
+            zoom_msg(&mut sent, true, "старт", "").as_deref(),
+            Some(r#"{"full":"старт","on":true,"partial":""}"#)
+        );
+    }
+
+    #[test]
     fn img_format_from_content_type() {
         assert_eq!(img_format("image/png"), Some(image::ImageFormat::Png));
         assert_eq!(img_format("image/jpeg; charset=utf-8"), Some(image::ImageFormat::Jpeg));
@@ -671,6 +895,90 @@ mod tests {
         ]);
         let _ = std::fs::remove_file(&tmp);
         resp
+    }
+
+    fn read_exact_n(r: &mut impl Read, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let mut got = 0;
+        while got < n {
+            match r.read(&mut buf[got..]) {
+                Ok(0) | Err(_) => panic!("поток оборвался на {got}/{n}"),
+                Ok(k) => got += k,
+            }
+        }
+        buf
+    }
+
+    fn read_ws_text(r: &mut impl Read) -> String {
+        let head = read_exact_n(r, 2);
+        assert_eq!(head[0], 0x81);
+        let len = match head[1] {
+            126 => u16::from_be_bytes(read_exact_n(r, 2).try_into().unwrap()) as usize,
+            127 => u64::from_be_bytes(read_exact_n(r, 8).try_into().unwrap()) as usize,
+            n => n as usize,
+        };
+        String::from_utf8(read_exact_n(r, len)).unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn e2e_zoom_ws() {
+        let wm = WebMic::start("🌐 веб", None).expect("сервер не поднялся");
+        let token = read_token();
+
+        let no_key = curl_text(&[
+            "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+            &format!("https://127.0.0.1:8787/api/zoom?t={token}"),
+        ]);
+        assert_eq!(no_key, "400");
+
+        let zoom = Arc::new(Mutex::new(crate::transcribe::Transcript::default()));
+        wm.shared().lock().unwrap().zoom = Some(zoom.clone());
+
+        let mut child = Command::new("openssl")
+            .args(["s_client", "-quiet", "-connect", "127.0.0.1:8787"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("openssl s_client");
+        let mut sin = child.stdin.take().unwrap();
+        let mut sout = child.stdout.take().unwrap();
+        write!(
+            sin,
+            "GET /api/zoom?t={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(sout.read(&mut byte).unwrap(), 1, "хедеры оборвались");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 101"), "нет 101: {head}");
+        assert!(
+            head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "нет accept-ключа: {head}"
+        );
+
+        assert_eq!(
+            read_ws_text(&mut sout),
+            r#"{"full":"","on":true,"partial":""}"#
+        );
+
+        zoom.lock().unwrap().finals = "привет".to_string();
+        assert_eq!(
+            read_ws_text(&mut sout),
+            r#"{"add":"привет","on":true,"partial":""}"#
+        );
+
+        wm.shared().lock().unwrap().zoom = None;
+        assert_eq!(read_ws_text(&mut sout), r#"{"on":false}"#);
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

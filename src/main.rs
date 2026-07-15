@@ -1432,7 +1432,8 @@ impl App {
             Image(u64),
         }
         let (lines, partial, stt_on, active, posts, new_imgs) = match shared.lock() {
-            Ok(g) => {
+            Ok(mut g) => {
+                g.zoom = self.audio.zoom.as_ref().and_then(|m| m.transcript_handle());
                 let mut posts = Vec::new();
                 let mut new_imgs = Vec::new();
                 for p in &g.posts {

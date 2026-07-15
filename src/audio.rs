@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::path::Path;
 
 use crate::recorder::WavRecorder;
-use crate::transcribe::Transcriber;
+use crate::transcribe::{Transcriber, Transcript};
 use crate::transcript_log::TranscriptLog;
 
 const CAP: usize = 2048;
@@ -308,6 +308,10 @@ impl AudioMonitor {
 
     pub fn fresh_finals(&self) -> Option<Arc<Mutex<VecDeque<String>>>> {
         self.transcriber.as_ref().map(|t| t.fresh_handle())
+    }
+
+    pub fn transcript_handle(&self) -> Option<Arc<Mutex<Transcript>>> {
+        self.transcriber.as_ref().map(|t| t.state_handle())
     }
 }
 
