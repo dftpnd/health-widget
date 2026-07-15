@@ -197,6 +197,7 @@ struct App {
     chat_size: egui::Vec2,
     webmic: Option<webmic::WebMic>,
     webmic_error: Option<String>,
+    web_raised: bool,
     web_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
     web_spawn_size: egui::Vec2,
     web_size: egui::Vec2,
@@ -499,6 +500,7 @@ impl App {
                 .then(|| webmic::WebMic::start(CH_WEB, transcript_log.clone()).ok())
                 .flatten(),
             webmic_error: None,
+            web_raised: false,
             web_pos,
             web_spawn_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
             web_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
@@ -1397,6 +1399,7 @@ impl App {
     fn toggle_webmic(&mut self) {
         self.webmic_error = None;
         if self.webmic.take().is_some() {
+            self.web_raised = false;
             return;
         }
         match webmic::WebMic::start(CH_WEB, self.transcript_log.clone()) {
@@ -1425,8 +1428,18 @@ impl App {
 
     fn show_web_window(&mut self, ctx: &egui::Context) {
         let Some(shared) = self.webmic.as_ref().map(|w| w.shared()) else {
+            self.web_raised = false;
             return;
         };
+        if !self.web_raised {
+            self.web_raised = true;
+            std::thread::spawn(|| {
+                for _ in 0..2 {
+                    std::thread::sleep(Duration::from_millis(400));
+                    winctl::set_web_keep_above();
+                }
+            });
+        }
         enum Snap {
             Text(String),
             Image(u64),
@@ -1610,6 +1623,7 @@ impl App {
 
         if close {
             self.webmic = None;
+            self.web_raised = false;
         }
     }
 

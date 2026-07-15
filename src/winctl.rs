@@ -65,6 +65,13 @@ pub fn set_keep_above(on: bool) -> bool {
     run_kwin_script(&for_our_window(&format!("w.keepAbove = {on};")), "keepabove")
 }
 
+pub fn set_web_keep_above() -> bool {
+    run_kwin_script(
+        &for_captioned_window(WEB_CAPTION, "w.keepAbove = true;"),
+        "webabove",
+    )
+}
+
 pub fn set_position(x: i32, y: i32) -> bool {
     let body = for_our_window(&format!(
         "var g = w.frameGeometry; w.frameGeometry = {{ x: {x}, y: {y}, width: g.width, height: g.height }}; \
