@@ -1551,6 +1551,7 @@ impl App {
                     .id_salt("web-speech")
                     .max_height(half)
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         if lines.is_empty() && partial.is_empty() {
@@ -1586,7 +1587,9 @@ impl App {
                 );
                 egui::ScrollArea::vertical()
                     .id_salt("web-posts")
+                    .max_height(ui.available_height() - GRIP)
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         if posts.is_empty() {
