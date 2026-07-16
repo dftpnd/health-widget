@@ -1955,7 +1955,8 @@ impl App {
                                 format!("🔎 Все группы ({total})"),
                             )
                             .on_hover_text(
-                                "Сканировать все группы подряд в очередь \
+                                "Сканировать все группы подряд в очередь, \
+                                 затем само запустится дообогащение \
                                  (повторно — стоп)",
                             )
                             .clicked()
@@ -1974,7 +1975,8 @@ impl App {
                                 if ui
                                     .selectable_label(active, label)
                                     .on_hover_text(
-                                        "Скан группы в очередь откликов \
+                                        "Скан группы в очередь откликов, \
+                                         затем само запустится дообогащение \
                                          (повторно — стоп)",
                                     )
                                     .clicked()
@@ -2329,16 +2331,30 @@ impl eframe::App for App {
         }
 
         if self.autopilot.proc.as_mut().is_some_and(|p| !p.alive()) {
-            let done_msg = match self.autopilot.proc.as_ref().map(|p| p.phase()) {
-                Some(pilot::Phase::Scan(_)) | Some(pilot::Phase::ScanAll) => Some("скан завершён"),
-                Some(pilot::Phase::Enrich) => Some("обогащение завершено"),
-                _ => None,
-            };
+            let finished = self.autopilot.proc.as_ref().map(|p| p.phase().clone());
             self.autopilot.proc = None;
-            self.autopilot.want = None;
-            let msg = done_msg.unwrap_or("автопилот остановлен");
-            self.autopilot.status = msg.to_string();
-            telemetry::event("pilot.exit", serde_json::json!({ "reason": msg }));
+            if matches!(
+                finished,
+                Some(pilot::Phase::Scan(_)) | Some(pilot::Phase::ScanAll)
+            ) {
+                telemetry::event(
+                    "pilot.exit",
+                    serde_json::json!({ "reason": "скан завершён", "chain": "enrich" }),
+                );
+                self.autopilot.want = Some(pilot::Phase::Enrich);
+                self.reconcile_pilot();
+                if self.autopilot.proc.is_some() {
+                    self.autopilot.status = "скан завершён — дообогащаю пул".to_string();
+                }
+            } else {
+                self.autopilot.want = None;
+                let msg = match finished {
+                    Some(pilot::Phase::Enrich) => "обогащение завершено",
+                    _ => "автопилот остановлен",
+                };
+                self.autopilot.status = msg.to_string();
+                telemetry::event("pilot.exit", serde_json::json!({ "reason": msg }));
+            }
         }
 
         let want_visible = self.shared.user_visible.load(Ordering::Relaxed)
