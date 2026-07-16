@@ -228,6 +228,11 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
 
     if let Some((_, out)) = KEY_MAP.iter().find(|(k, _)| k.0 == code) {
         emit(ui, out, value);
+    } else if value == 1 {
+        crate::telemetry::event(
+            "tartarus.unknown_key",
+            serde_json::json!({ "code": code, "name": format!("{:?}", KeyCode(code)) }),
+        );
     }
 }
 
