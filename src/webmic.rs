@@ -33,6 +33,8 @@ pub struct Shared {
     pub posts: VecDeque<Post>,
     pub zoom: Option<Arc<Mutex<Transcript>>>,
     next_post_id: u64,
+    cleared_lines: Option<VecDeque<String>>,
+    cleared_posts: Option<VecDeque<Post>>,
 }
 
 impl Shared {
@@ -46,6 +48,39 @@ impl Shared {
             self.posts.pop_front();
         }
         self.posts.push_back(make(self.next_post_id));
+    }
+
+    pub fn clear_said(&mut self) {
+        if !self.lines.is_empty() {
+            self.cleared_lines = Some(std::mem::take(&mut self.lines));
+        }
+        self.partial.clear();
+    }
+
+    pub fn undo_said(&mut self) {
+        if let Some(mut old) = self.cleared_lines.take() {
+            old.extend(self.lines.drain(..));
+            while old.len() > LINES_CAP {
+                old.pop_front();
+            }
+            self.lines = old;
+        }
+    }
+
+    pub fn clear_sent(&mut self) {
+        if !self.posts.is_empty() {
+            self.cleared_posts = Some(std::mem::take(&mut self.posts));
+        }
+    }
+
+    pub fn undo_sent(&mut self) {
+        if let Some(mut old) = self.cleared_posts.take() {
+            old.extend(self.posts.drain(..));
+            while old.len() > POSTS_CAP {
+                old.pop_front();
+            }
+            self.posts = old;
+        }
     }
 }
 
@@ -207,6 +242,34 @@ fn handle_request(
                 let _ = req.respond(tiny_http::Response::empty(400));
             }
         }
+        return;
+    }
+    if req.method() == &tiny_http::Method::Post && (path == "/api/clear" || path == "/api/undo") {
+        let undo = path == "/api/undo";
+        let code = match query_param(&url, "what").as_deref() {
+            Some("said") => {
+                if let Ok(mut g) = shared.lock() {
+                    if undo {
+                        g.undo_said();
+                    } else {
+                        g.clear_said();
+                    }
+                }
+                200
+            }
+            Some("sent") => {
+                if let Ok(mut g) = shared.lock() {
+                    if undo {
+                        g.undo_sent();
+                    } else {
+                        g.clear_sent();
+                    }
+                }
+                200
+            }
+            _ => 400,
+        };
+        respond_code(req, code);
         return;
     }
     if req.method() == &tiny_http::Method::Post && path == "/api/img" {
@@ -728,6 +791,54 @@ mod tests {
     }
 
     #[test]
+    fn clear_undo_said_keeps_fresh_lines() {
+        let mut sh = Shared::default();
+        sh.lines.push_back("раз".to_string());
+        sh.lines.push_back("два".to_string());
+        sh.partial = "хвост".to_string();
+        sh.clear_said();
+        assert!(sh.lines.is_empty());
+        assert!(sh.partial.is_empty());
+        sh.lines.push_back("три".to_string());
+        sh.undo_said();
+        assert_eq!(
+            sh.lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["раз", "два", "три"]
+        );
+        sh.undo_said();
+        assert_eq!(sh.lines.len(), 3);
+    }
+
+    #[test]
+    fn clear_of_empty_feed_keeps_stash() {
+        let mut sh = Shared::default();
+        sh.lines.push_back("раз".to_string());
+        sh.clear_said();
+        sh.clear_said();
+        sh.undo_said();
+        assert_eq!(
+            sh.lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["раз"]
+        );
+    }
+
+    #[test]
+    fn clear_undo_sent_restores_posts_before_new() {
+        let mut sh = Shared::default();
+        sh.push_post(|id| Post::Text(id, "раз".to_string()));
+        sh.push_post(|id| Post::Text(id, "два".to_string()));
+        sh.clear_sent();
+        assert!(sh.posts.is_empty());
+        sh.push_post(|id| Post::Text(id, "три".to_string()));
+        sh.undo_sent();
+        assert_eq!(sh.posts.len(), 3);
+        assert!(matches!(sh.posts.front(), Some(Post::Text(1, _))));
+        assert!(matches!(sh.posts.back(), Some(Post::Text(3, _))));
+        sh.undo_sent();
+        assert_eq!(sh.posts.len(), 3);
+    }
+
+    #[test]
     fn b64_vectors() {
         assert_eq!(b64(b""), "");
         assert_eq!(b64(b"f"), "Zg==");
@@ -980,6 +1091,45 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn e2e_clear_undo_roundtrip() {
+        std::env::set_var("HEALTH_WEBMIC_TOKEN", "1");
+        let wm = WebMic::start("🌐 веб", None).expect("сервер не поднялся");
+        let token = read_token();
+        let post_code = |path: &str| {
+            curl_text(&[
+                "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+                &format!("https://127.0.0.1:8787{path}&t={token}"),
+            ])
+        };
+        for text in ["раз", "два"] {
+            let code = curl_text(&[
+                "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+                "--data-binary", text, "-H", "Content-Type: text/plain",
+                &format!("https://127.0.0.1:8787/api/msg?t={token}"),
+            ]);
+            assert_eq!(code, "200");
+        }
+        if let Ok(mut g) = wm.shared().lock() {
+            g.lines.push_back("сказано".to_string());
+        }
+        assert_eq!(post_code("/api/clear?what=sent"), "200");
+        assert!(wm.shared().lock().unwrap().posts.is_empty());
+        assert_eq!(post_code("/api/undo?what=sent"), "200");
+        assert_eq!(wm.shared().lock().unwrap().posts.len(), 2);
+        assert_eq!(post_code("/api/clear?what=said"), "200");
+        assert!(wm.shared().lock().unwrap().lines.is_empty());
+        assert_eq!(post_code("/api/undo?what=said"), "200");
+        assert_eq!(wm.shared().lock().unwrap().lines.len(), 1);
+        assert_eq!(post_code("/api/clear?what=huh"), "400");
+        let no_token = curl_text(&[
+            "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+            "https://127.0.0.1:8787/api/clear?what=sent",
+        ]);
+        assert_eq!(no_token, "403");
     }
 
     #[test]

@@ -11,6 +11,8 @@ export default function App() {
   const [err, setErr] = useState('')
   const [msg, setMsg] = useState('')
   const [sent, setSent] = useState([])
+  const [saidStash, setSaidStash] = useState(null)
+  const [sentStash, setSentStash] = useState(null)
   const [zoom, setZoom] = useState({ on: false, text: '', partial: '' })
   const session = useRef(null)
   const feed = useRef(null)
@@ -64,12 +66,61 @@ export default function App() {
   useEffect(() => stop, [])
 
   async function post(path, body, type) {
-    const r = await fetch(`${path}?t=${TOKEN}`, {
+    const sep = path.includes('?') ? '&' : '?'
+    const r = await fetch(`${path}${sep}t=${TOKEN}`, {
       method: 'POST',
       headers: type ? { 'Content-Type': type } : {},
       body,
     })
     if (!r.ok) throw new Error(String(r.status))
+  }
+
+  async function clearSaid() {
+    if (finals.length === 0) return
+    setSaidStash(finals)
+    setFinals([])
+    try {
+      await post('api/clear?what=said', '')
+      setErr('')
+    } catch {
+      setErr('очистка не дошла до виджета')
+    }
+  }
+
+  async function undoSaid() {
+    if (!saidStash) return
+    setFinals((f) => [...saidStash, ...f])
+    setSaidStash(null)
+    try {
+      await post('api/undo?what=said', '')
+      setErr('')
+    } catch {
+      setErr('возврат не дошёл до виджета')
+    }
+  }
+
+  async function clearSent() {
+    if (sent.length === 0) return
+    setSentStash(sent)
+    setSent([])
+    try {
+      await post('api/clear?what=sent', '')
+      setErr('')
+    } catch {
+      setErr('очистка не дошла до виджета')
+    }
+  }
+
+  async function undoSent() {
+    if (!sentStash) return
+    setSent((s) => [...sentStash, ...s])
+    setSentStash(null)
+    try {
+      await post('api/undo?what=sent', '')
+      setErr('')
+    } catch {
+      setErr('возврат не дошёл до виджета')
+    }
   }
 
   async function sendText() {
@@ -185,6 +236,16 @@ export default function App() {
           <button className={running ? 'talk on' : 'talk'} onClick={running ? stop : start}>
             {running ? '⏹ Стоп' : '🎤 Говорить'}
           </button>
+          <div className="feedbar">
+            <span className="zoomhdr">🗣 Речь</span>
+            <span className="gap" />
+            <button className="mini" onClick={clearSaid} disabled={finals.length === 0} title="очистить сказанное">
+              🗑
+            </button>
+            <button className="mini" onClick={undoSaid} disabled={!saidStash} title="вернуть последнюю очистку">
+              ↩
+            </button>
+          </div>
           <div className="feed" ref={feed}>
             {finals.length === 0 && !partial && (
               <div className="hint">жми «Говорить» и говори — текст появится тут и в виджете</div>
@@ -207,6 +268,16 @@ export default function App() {
           </div>
         </div>
         <div className="col">
+          <div className="feedbar">
+            <span className="zoomhdr">✉ Отправленное</span>
+            <span className="gap" />
+            <button className="mini" onClick={clearSent} disabled={sent.length === 0} title="очистить отправленное">
+              🗑
+            </button>
+            <button className="mini" onClick={undoSent} disabled={!sentStash} title="вернуть последнюю очистку">
+              ↩
+            </button>
+          </div>
           <div className="feed sent" ref={sentFeed}>
             {sent.length === 0 && (
               <div className="hint">текст и картинки для виджета — сюда: поле ниже, 📎 или Ctrl+V</div>

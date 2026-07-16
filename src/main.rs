@@ -36,6 +36,7 @@ use transcript_log::TranscriptLog;
 const CH_MIC: &str = "🎤 я";
 const CH_ZOOM: &str = "🔊 телемост";
 const CH_WEB: &str = "🌐 веб";
+const WEB_FRESH_GLOW: Duration = Duration::from_millis(2200);
 
 const GRIP: f32 = 16.0;
 const MARGIN: f32 = 12.0;
@@ -202,6 +203,8 @@ struct App {
     web_spawn_size: egui::Vec2,
     web_size: egui::Vec2,
     web_textures: std::collections::HashMap<u64, egui::TextureHandle>,
+    web_last_post_id: u64,
+    web_fresh_posts: Vec<(u64, Instant)>,
 }
 
 impl App {
@@ -505,6 +508,8 @@ impl App {
             web_spawn_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
             web_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
             web_textures: std::collections::HashMap::new(),
+            web_last_post_id: 0,
+            web_fresh_posts: Vec::new(),
         }
     }
 
@@ -1398,6 +1403,8 @@ impl App {
 
     fn toggle_webmic(&mut self) {
         self.webmic_error = None;
+        self.web_last_post_id = 0;
+        self.web_fresh_posts.clear();
         if self.webmic.take().is_some() {
             self.web_raised = false;
             return;
@@ -1441,8 +1448,15 @@ impl App {
             });
         }
         enum Snap {
-            Text(String),
+            Text(u64, String),
             Image(u64),
+        }
+        impl Snap {
+            fn id(&self) -> u64 {
+                match self {
+                    Snap::Text(id, _) | Snap::Image(id) => *id,
+                }
+            }
         }
         let (lines, partial, stt_on, active, posts, new_imgs) = match shared.lock() {
             Ok(mut g) => {
@@ -1451,7 +1465,7 @@ impl App {
                 let mut new_imgs = Vec::new();
                 for p in &g.posts {
                     match p {
-                        webmic::Post::Text(_, t) => posts.push(Snap::Text(t.clone())),
+                        webmic::Post::Text(id, t) => posts.push(Snap::Text(*id, t.clone())),
                         webmic::Post::Image(id, px) => {
                             if !self.web_textures.contains_key(id) {
                                 new_imgs.push((*id, px.clone()));
@@ -1477,6 +1491,17 @@ impl App {
         }
         self.web_textures
             .retain(|id, _| posts.iter().any(|p| matches!(p, Snap::Image(pid) if pid == id)));
+        let now = Instant::now();
+        for p in &posts {
+            if p.id() > self.web_last_post_id {
+                self.web_fresh_posts.push((p.id(), now));
+            }
+        }
+        if let Some(max_id) = posts.iter().map(Snap::id).max() {
+            self.web_last_post_id = self.web_last_post_id.max(max_id);
+        }
+        self.web_fresh_posts
+            .retain(|(_, t)| t.elapsed() < WEB_FRESH_GLOW);
         let vb = egui::ViewportBuilder::default()
             .with_title(winctl::WEB_CAPTION)
             .with_decorations(false)
@@ -1490,7 +1515,12 @@ impl App {
         let mut close = false;
 
         ctx.show_viewport_immediate(id, vb, |cctx, _class| {
-            cctx.request_repaint_after(Duration::from_millis(250));
+            let tick = if self.web_fresh_posts.is_empty() {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(30)
+            };
+            cctx.request_repaint_after(tick);
             if cctx.input(|i| i.viewport().close_requested()) {
                 close = true;
             }
@@ -1601,8 +1631,32 @@ impl App {
                             );
                         }
                         for p in &posts {
-                            match p {
-                                Snap::Text(t) => {
+                            let glow = self
+                                .web_fresh_posts
+                                .iter()
+                                .find(|(id, _)| *id == p.id())
+                                .map(|(_, t)| {
+                                    1.0 - t.elapsed().as_secs_f32()
+                                        / WEB_FRESH_GLOW.as_secs_f32()
+                                })
+                                .filter(|k| *k > 0.0);
+                            let frame = match glow {
+                                Some(k) => egui::Frame::default()
+                                    .stroke(egui::Stroke::new(
+                                        1.5,
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            110,
+                                            170,
+                                            255,
+                                            (k * 230.0) as u8,
+                                        ),
+                                    ))
+                                    .corner_radius(6)
+                                    .inner_margin(egui::Margin::same(4)),
+                                None => egui::Frame::default(),
+                            };
+                            frame.show(ui, |ui| match p {
+                                Snap::Text(_, t) => {
                                     ui.label(
                                         egui::RichText::new(t)
                                             .size(15.0)
@@ -1616,7 +1670,7 @@ impl App {
                                         ui.image((tex.id(), size * k));
                                     }
                                 }
-                            }
+                            });
                         }
                     });
                 draw_resize_grip(ui, cctx, grip_rect);
