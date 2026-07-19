@@ -2,14 +2,16 @@
 """Потоковое распознавание речи для health-widget через faster-whisper.
 
 Читает СЫРОЙ моно-PCM s16le 16000 Гц из stdin (его пишет Rust-канал после ресемплинга)
-и печатает построчный JSON в stdout — только законченные фразы:
+и печатает построчный JSON в stdout — черновик текущей фразы и законченные куски:
 
-    {"final": "Запусти Kubernetes"}
+    {"partial": "Запусти Kuber"}
+    {"final": "Запусти Kubernetes."}
 
-Endpointing по энергии (пауза => конец фразы), инференс на GPU (CUDA), два рычага под
-IT-термины: hotwords при распознавании + словарь пост-коррекции.
-Короткие сегменты декодируются дважды (второй раз со сдвигом входа): на шуме декод
-нестабилен и такие сегменты отбрасываются, на речи — совпадает.
+Стриминг по LocalAgreement-2: скользящий буфер декодируется каждые ~1 с нового аудио,
+совпавший префикс слов двух последовательных декодов коммитится в финал, хвост уходит
+черновиком. Пауза ≥0.4 с — флаш; короткая изолированная фраза при флаше декодируется
+дважды (второй раз со сдвигом входа): на шуме декод нестабилен и не коммитится.
+Инференс на GPU (CUDA), два рычага под IT-термины: hotwords + словарь пост-коррекции.
 Никакой сети в рантайме (модель кэшируется локально при установке).
 
 Аргументы:
@@ -24,7 +26,6 @@ import re
 import sys
 import json
 import time
-import difflib
 import threading
 from typing import Iterable
 
@@ -151,12 +152,11 @@ SAMPLE_RATE = 16000
 FRAME = 320
 FRAME_BYTES = FRAME * 2
 SILENCE_RMS = 500.0
-SILENCE_TAIL = 0.6
+SILENCE_TAIL = 0.4
 MIN_SPEECH = 0.3
-MAX_SEGMENT = 15.0
+MIN_NEW_AUDIO = 1.0
 MAX_BUFFER = 12.0
 STABILITY_MAX_SECONDS = 3.0
-STABILITY_MIN_SIMILARITY = 0.7
 PERTURB_PAD_SECONDS = 0.15
 PERTURB_GAIN = 0.9
 SENT_END = ".?!…"
@@ -189,19 +189,6 @@ def take_final(pending: list[str], limit: int = FINAL_MAX_WORDS) -> tuple[str, l
     if len(pending) >= limit:
         return " ".join(pending), []
     return "", pending
-
-def _match_form(text: str) -> str:
-    return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
-
-def texts_agree(a: str, b: str) -> bool:
-    na, nb = _match_form(a), _match_form(b)
-    if not na and not nb:
-        return True
-    if not na or not nb:
-        return False
-    if na in nb or nb in na:
-        return True
-    return difflib.SequenceMatcher(None, na, nb).ratio() >= STABILITY_MIN_SIMILARITY
 
 _buf = bytearray()
 _buf_lock = threading.Lock()
@@ -265,81 +252,115 @@ def main() -> int:
     threading.Thread(target=_drain_stdin, daemon=True).start()
     model = WhisperModel(model_name, device=device, compute_type=compute)
 
-    def transcribe_text(audio) -> str:
-        segments, _ = model.transcribe(
-            audio, language="ru", beam_size=5, vad_filter=True,
-            condition_on_previous_text=False,
-            hotwords=hotwords,
-        )
-        parts = [
-            s.text.strip()
-            for s in segments
-            if not is_hallucination(
-                s.text,
-                getattr(s, "no_speech_prob", 0.0),
-                getattr(s, "avg_logprob", 0.0),
-                getattr(s, "compression_ratio", 0.0),
-            )
-        ]
-        return " ".join(p for p in parts if p).strip()
+    def to_float(raw: bytes):
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def perturb(audio):
+    def perturbed(audio_f):
         pad = np.zeros(int(PERTURB_PAD_SECONDS * SAMPLE_RATE), dtype=np.float32)
-        return np.concatenate([pad, audio * PERTURB_GAIN])
+        return np.concatenate([pad, audio_f * PERTURB_GAIN])
 
-    def emit(raw: bytes):
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        text = transcribe_text(audio)
-        if not text:
-            return
-        if len(audio) <= STABILITY_MAX_SECONDS * SAMPLE_RATE:
-            if not texts_agree(text, transcribe_text(perturb(audio))):
-                return
-        text = apply_corrections(text, corrections)
+    def decode(audio_f):
+        segments, _ = model.transcribe(
+            audio_f, language="ru", beam_size=5, vad_filter=True,
+            condition_on_previous_text=False, hotwords=hotwords,
+            word_timestamps=True,
+        )
+        return flatten_words(list(segments))
+
+    def emit_final(text: str):
+        text = apply_corrections(text.strip(), corrections)
         if text:
             sys.stdout.write(json.dumps({"final": text}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
 
-    pending = bytearray()
-    utter = bytearray()
+    def emit_partial(text: str):
+        sys.stdout.write(json.dumps({"partial": text}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    audio = bytearray()
+    pending_bytes = bytearray()
+    prev_words = []
+    committed = 0
+    final_words = []
     speaking = False
     silence_run = 0.0
+    speech_secs = 0.0
+    since_decode = 0
+    min_decode_bytes = int(MIN_NEW_AUDIO * SAMPLE_RATE) * 2
+
+    def stream_step():
+        nonlocal prev_words, committed, final_words, since_decode
+        cur = decode(to_float(bytes(audio)))
+        committed, newly, partial = advance(prev_words, committed, cur)
+        prev_words = cur
+        final_words.extend(newly)
+        out, final_words = take_final(final_words)
+        if out:
+            emit_final(out)
+        emit_partial(" ".join(final_words + ([partial] if partial else [])))
+        since_decode = 0
+        end = cur[committed - 1][2] if 0 < committed <= len(cur) else None
+        cut = cut_bytes(len(audio), end, MAX_BUFFER)
+        if cut:
+            del audio[:cut]
+            prev_words = []
+            committed = 0
+
+    def flush():
+        nonlocal prev_words, committed, final_words, speaking
+        nonlocal silence_run, speech_secs, since_decode
+        if audio and (committed or final_words or speech_secs >= MIN_SPEECH):
+            f = to_float(bytes(audio))
+            cur = decode(f)
+            if (
+                not committed
+                and not final_words
+                and len(audio) <= STABILITY_MAX_SECONDS * SAMPLE_RATE * 2
+            ):
+                alt = decode(perturbed(f))
+                cur = cur[: common_prefix(cur, alt)]
+            tail = [w for w, _s, _e in cur[committed:]]
+            emit_final(" ".join(final_words + tail))
+        audio.clear()
+        prev_words = []
+        committed = 0
+        final_words = []
+        speaking = False
+        silence_run = 0.0
+        speech_secs = 0.0
+        since_decode = 0
+        emit_partial("")
 
     while True:
         chunk = _take(65536)
         if chunk:
-            pending.extend(chunk)
+            pending_bytes.extend(chunk)
         elif not _stdin_open:
-            if len(utter) > MIN_SPEECH * SAMPLE_RATE * 2:
-                emit(bytes(utter))
+            flush()
             break
         else:
             time.sleep(0.02)
             continue
 
-        while len(pending) >= FRAME_BYTES:
-            frame = bytes(pending[:FRAME_BYTES])
-            del pending[:FRAME_BYTES]
+        while len(pending_bytes) >= FRAME_BYTES:
+            frame = bytes(pending_bytes[:FRAME_BYTES])
+            del pending_bytes[:FRAME_BYTES]
             samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
             if rms >= SILENCE_RMS:
                 speaking = True
-                utter.extend(frame)
                 silence_run = 0.0
+                speech_secs += FRAME / SAMPLE_RATE
             elif speaking:
-                utter.extend(frame)
                 silence_run += FRAME / SAMPLE_RATE
+            if speaking:
+                audio.extend(frame)
+                since_decode += FRAME_BYTES
                 if silence_run >= SILENCE_TAIL:
-                    if len(utter) > MIN_SPEECH * SAMPLE_RATE * 2:
-                        emit(bytes(utter))
-                    utter = bytearray()
-                    speaking = False
-                    silence_run = 0.0
-            if speaking and len(utter) >= MAX_SEGMENT * SAMPLE_RATE * 2:
-                emit(bytes(utter))
-                utter = bytearray()
-                speaking = False
-                silence_run = 0.0
+                    flush()
+
+        if speaking and since_decode >= min_decode_bytes:
+            stream_step()
     return 0
 
 if __name__ == "__main__":

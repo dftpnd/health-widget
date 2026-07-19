@@ -7,7 +7,6 @@ from whisper_stream import (
     load_hotwords,
     load_corrections,
     is_hallucination,
-    texts_agree,
     norm_word,
     common_prefix,
     advance,
@@ -16,38 +15,6 @@ from whisper_stream import (
     cut_bytes,
     SAMPLE_RATE,
 )
-
-class TestTextsAgree(unittest.TestCase):
-    def test_identical_agree(self):
-        self.assertTrue(texts_agree("Да, согласен.", "Да, согласен."))
-
-    def test_case_and_punct_ignored(self):
-        self.assertTrue(texts_agree("Нет.", "нет"))
-        self.assertTrue(texts_agree("хорошо, спасибо, до свидания",
-                                    "Хорошо! Спасибо. До свидания"))
-
-    def test_minor_ending_variation_agrees(self):
-        self.assertTrue(texts_agree("Отпочковалась на несколько.",
-                                    "Отпочковалось на несколько."))
-        self.assertTrue(texts_agree("только окладное", "только окладная"))
-
-    def test_containment_agrees(self):
-        self.assertTrue(texts_agree("Это стрессовая штука.", "стрессовая"))
-        self.assertTrue(texts_agree("нам нравилось", "И все, что нам нравилось."))
-
-    def test_unstable_decodes_disagree(self):
-        self.assertFalse(texts_agree("и т.д.", "Продолжение следует..."))
-        self.assertFalse(texts_agree("Здравствуйте!", "Тарас."))
-        self.assertFalse(texts_agree("ПОДПИШИСЬ НА КАНАЛ!",
-                                     "ПРОДОЛЖЕНИЕ В СЛЕДУЮЩЕЙ ЧАСТИ"))
-        self.assertFalse(texts_agree("1, 2, 3.", "раз, два, три"))
-
-    def test_one_side_empty_disagrees(self):
-        self.assertFalse(texts_agree("и т.д.", ""))
-        self.assertFalse(texts_agree("", "Продолжение следует..."))
-
-    def test_both_empty_agree(self):
-        self.assertTrue(texts_agree("", ""))
 
 class TestHallucinations(unittest.TestCase):
     def test_prodolzhenie_sleduet_dropped(self):
