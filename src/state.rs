@@ -24,8 +24,8 @@ pub struct State {
     pub terminal_width: Option<f32>,
     #[serde(default)]
     pub autopilot_collapsed: bool,
-    #[serde(default)]
-    pub metrics_collapsed: bool,
+    #[serde(default, alias = "metrics_collapsed")]
+    pub scopes_collapsed: bool,
     #[serde(default)]
     pub chat_collapsed: bool,
     #[serde(default)]

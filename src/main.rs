@@ -139,13 +139,15 @@ impl TranscriptKeys {
 }
 
 const WINDOW_MOVE_STEP: i32 = 40;
+const WHEEL_SCROLL_STEP: f32 = 60.0;
 
 #[derive(Clone)]
 struct WindowMove {
     dx: Arc<AtomicI32>,
     dy: Arc<AtomicI32>,
     busy: Arc<AtomicBool>,
-    web: Arc<AtomicBool>,
+    next: Arc<AtomicBool>,
+    wheel: Arc<AtomicI32>,
 }
 
 impl WindowMove {
@@ -154,9 +156,17 @@ impl WindowMove {
             dx: Arc::new(AtomicI32::new(0)),
             dy: Arc::new(AtomicI32::new(0)),
             busy: Arc::new(AtomicBool::new(false)),
-            web: Arc::new(AtomicBool::new(false)),
+            next: Arc::new(AtomicBool::new(false)),
+            wheel: Arc::new(AtomicI32::new(0)),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MoveTarget {
+    Widget,
+    Web,
+    Chat,
 }
 
 struct App {
@@ -176,20 +186,25 @@ struct App {
     prev_state: state::State,
     stable_since: Instant,
     shot: ShotState,
-    cursor_warp_request: Arc<AtomicBool>,
+    // cursor_warp_request: Arc<AtomicBool>,
     paste_code: Arc<AtomicBool>,
-    prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
+    // prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     transcript_keys: TranscriptKeys,
     win_move: WindowMove,
+    move_target: MoveTarget,
+    wheel_ticks: i32,
     terminal: Option<terminal::Terminal>,
     terminal_open: bool,
     width_one_col: Option<f32>,
     terminal_width: f32,
     autopilot_collapsed: bool,
-    metrics_collapsed: bool,
+    scopes_collapsed: bool,
     chat: chat::Chat,
     chat_collapsed: bool,
     deepseek: Option<deepseek::Slot>,
+    system_prompt: String,
+    prompt_draft: String,
+    prompt_open: bool,
     help_open: bool,
     clipboard_preview: Arc<std::sync::Mutex<String>>,
     clip_open: bool,
@@ -201,6 +216,8 @@ struct App {
     webmic: Option<webmic::WebMic>,
     webmic_error: Option<String>,
     web_raised: bool,
+    web_speech_unstuck: bool,
+    web_posts_unstuck: bool,
     web_pos: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
     web_spawn_size: egui::Vec2,
     web_size: egui::Vec2,
@@ -226,7 +243,7 @@ impl App {
             Arc::new(std::sync::Mutex::new(screenshot::ShotStatus::Idle));
         let shot_request = Arc::new(AtomicBool::new(false));
 
-        let cursor_warp_request = Arc::new(AtomicBool::new(false));
+        // let cursor_warp_request = Arc::new(AtomicBool::new(false));
         let paste_code = Arc::new(AtomicBool::new(false));
         let transcript_keys = TranscriptKeys::new();
         let win_move = WindowMove::new();
@@ -235,13 +252,13 @@ impl App {
             let shared = shared.clone();
             let ctx = cc.egui_ctx.clone();
             let shot_request = shot_request.clone();
-            let cursor_warp_request = cursor_warp_request.clone();
-            let rt_cursor_warp = libc::SIGRTMIN() + 2;
+            // let cursor_warp_request = cursor_warp_request.clone();
+            // let rt_cursor_warp = libc::SIGRTMIN() + 2;
             std::thread::spawn(move || {
                 let mut signals = signal_hook::iterator::Signals::new([
                     signal_hook::consts::SIGUSR1,
                     signal_hook::consts::SIGUSR2,
-                    rt_cursor_warp,
+                    // rt_cursor_warp,
                 ])
                 .expect("cannot register signal handler");
                 for sig in signals.forever() {
@@ -250,11 +267,11 @@ impl App {
                         ctx.request_repaint();
                         continue;
                     }
-                    if sig == rt_cursor_warp {
-                        cursor_warp_request.store(true, Ordering::Relaxed);
-                        ctx.request_repaint();
-                        continue;
-                    }
+                    // if sig == rt_cursor_warp {
+                    //     cursor_warp_request.store(true, Ordering::Relaxed);
+                    //     ctx.request_repaint();
+                    //     continue;
+                    // }
                     let prev = shared.user_visible.load(Ordering::Relaxed);
                     shared.user_visible.store(!prev, Ordering::Relaxed);
                     ctx.request_repaint();
@@ -264,7 +281,7 @@ impl App {
 
         tartarus::spawn(tartarus::Handles {
             shot_request: shot_request.clone(),
-            cursor_warp_request: cursor_warp_request.clone(),
+            // cursor_warp_request: cursor_warp_request.clone(),
             clear_mic: transcript_keys.clear_mic.clone(),
             clear_zoom: transcript_keys.clear_zoom.clone(),
             copy_mic: transcript_keys.copy_mic.clone(),
@@ -273,7 +290,8 @@ impl App {
             paste_code: paste_code.clone(),
             move_dx: win_move.dx.clone(),
             move_dy: win_move.dy.clone(),
-            move_web: win_move.web.clone(),
+            move_next: win_move.next.clone(),
+            wheel: win_move.wheel.clone(),
             ctx: cc.egui_ctx.clone(),
         });
 
@@ -474,20 +492,25 @@ impl App {
                 active: false,
                 points: Vec::new(),
             },
-            cursor_warp_request,
+            // cursor_warp_request,
             paste_code,
-            prev_cursor: Arc::new(std::sync::Mutex::new(None)),
+            // prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             transcript_keys,
             win_move,
+            move_target: MoveTarget::Widget,
+            wheel_ticks: 0,
             terminal: None,
             terminal_open: st.terminal_open,
             width_one_col: None,
             terminal_width: st.terminal_width.unwrap_or(TERMINAL_W),
             autopilot_collapsed: st.autopilot_collapsed,
-            metrics_collapsed: st.metrics_collapsed,
+            scopes_collapsed: st.scopes_collapsed,
             chat: chat::Chat::default(),
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
+            system_prompt: String::new(),
+            prompt_draft: String::new(),
+            prompt_open: false,
             help_open: false,
             clipboard_preview,
             clip_open: st.clip_open,
@@ -507,6 +530,8 @@ impl App {
                 .flatten(),
             webmic_error: None,
             web_raised: false,
+            web_speech_unstuck: false,
+            web_posts_unstuck: false,
             web_pos,
             web_spawn_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
             web_size: egui::vec2(st.web_w.unwrap_or(WEB_WIN_W), st.web_h.unwrap_or(WEB_WIN_H)),
@@ -691,7 +716,7 @@ impl App {
             pilot_strictness: Some(self.autopilot.strictness.clone()),
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
-            metrics_collapsed: self.metrics_collapsed,
+            scopes_collapsed: self.scopes_collapsed,
             chat_collapsed: self.chat_collapsed,
             terminal_open: self.terminal_open,
             clip_open: self.clip_open,
@@ -848,6 +873,16 @@ impl App {
                 {
                     toggle_webmic = true;
                 }
+                if ui
+                    .selectable_label(self.prompt_open, "📝")
+                    .on_hover_text("Системный промпт для чата: вставить свой текст")
+                    .clicked()
+                {
+                    self.prompt_open = !self.prompt_open;
+                    if self.prompt_open {
+                        self.prompt_draft = self.system_prompt.clone();
+                    }
+                }
                 if let Some(e) = &self.webmic_error {
                     ui.label(
                         egui::RichText::new(format!("✖ {e}"))
@@ -919,7 +954,63 @@ impl App {
         if self.help_open {
             self.draw_keys_help(ctx);
         }
+        if self.prompt_open {
+            self.draw_prompt_editor(ctx);
+        }
         ui.add_space(2.0);
+    }
+
+    fn draw_prompt_editor(&mut self, ctx: &egui::Context) {
+        let accent = egui::Color32::from_rgb(180, 200, 255);
+        let modal = egui::Modal::new(egui::Id::new("prompt_editor")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("📝 Системный промпт").size(15.0).strong().color(accent));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").clicked() {
+                        self.prompt_open = false;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("prompt_editor_scroll")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.prompt_draft)
+                            .hint_text("вставь сюда промпт для чата…")
+                            .font(egui::FontId::proportional(13.0))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(10),
+                    );
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("💾 Сохранить").clicked() {
+                    self.system_prompt = self.prompt_draft.clone();
+                    self.prompt_open = false;
+                }
+                let saved = self.prompt_draft == self.system_prompt;
+                if saved && !self.system_prompt.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new("✔ применён")
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(120, 210, 150)),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Пусто — вопрос уходит в модель без системного промпта. Живёт до перезапуска виджета.")
+                    .size(10.0)
+                    .italics()
+                    .color(egui::Color32::from_rgb(120, 126, 138)),
+            );
+        });
+        if modal.should_close() {
+            self.prompt_open = false;
+        }
     }
 
     fn draw_keys_help(&mut self, ctx: &egui::Context) {
@@ -931,8 +1022,9 @@ impl App {
             ("08", "📤 Копировать зум + отправить в чат"),
             ("10", "⌨ Печатать код из буфера в позиции курсора"),
             ("12", "🗑 Очистить чат"),
-            ("20", "🎯 Курсор в центр виджета"),
-            ("D-pad", "🕹 Двигать виджет по экрану"),
+            ("20", "🎛 Цель D-pad: виджет → веб-мик → чат"),
+            ("D-pad", "🕹 Двигать выбранное окно по экрану"),
+            ("Колесо", "🖱 Скролл выбранного окна (чат / веб-мик)"),
         ];
         let accent = egui::Color32::from_rgb(180, 200, 255);
         let modal = egui::Modal::new(egui::Id::new("keys_help")).show(ctx, |ui| {
@@ -1335,6 +1427,11 @@ impl App {
     }
 
     fn show_chat_window(&mut self, ctx: &egui::Context) {
+        let wheel = if self.move_target == MoveTarget::Chat {
+            self.wheel_ticks as f32 * WHEEL_SCROLL_STEP
+        } else {
+            0.0
+        };
         let vb = egui::ViewportBuilder::default()
             .with_title(winctl::CHAT_CAPTION)
             .with_decorations(false)
@@ -1352,9 +1449,14 @@ impl App {
             if cctx.input(|i| i.viewport().close_requested()) {
                 close = true;
             }
+            let stroke = if self.move_target == MoveTarget::Chat {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232))
+            } else {
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78))
+            };
             let frame = egui::Frame::default()
                 .fill(bg)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .stroke(stroke)
                 .inner_margin(egui::Margin::same(8))
                 .corner_radius(10);
             egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
@@ -1390,7 +1492,7 @@ impl App {
                     );
                 });
                 let log_height = (ui.available_height() - 56.0).max(80.0);
-                submitted = self.chat.ui_capped(ui, log_height);
+                submitted = self.chat.ui_scrolled(ui, log_height, wheel);
                 draw_resize_grip(ui, cctx, grip_rect);
             });
             self.chat_size = cctx.screen_rect().size();
@@ -1437,6 +1539,15 @@ impl App {
     }
 
     fn show_web_window(&mut self, ctx: &egui::Context) {
+        let wheel = if self.move_target == MoveTarget::Web {
+            self.wheel_ticks as f32 * WHEEL_SCROLL_STEP
+        } else {
+            0.0
+        };
+        if wheel > 0.0 {
+            self.web_speech_unstuck = true;
+            self.web_posts_unstuck = true;
+        }
         let Some(shared) = self.webmic.as_ref().map(|w| w.shared()) else {
             self.web_raised = false;
             return;
@@ -1527,7 +1638,7 @@ impl App {
             if cctx.input(|i| i.viewport().close_requested()) {
                 close = true;
             }
-            let stroke = if self.win_move.web.load(Ordering::Relaxed) {
+            let stroke = if self.move_target == MoveTarget::Web {
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232))
             } else {
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78))
@@ -1585,13 +1696,17 @@ impl App {
                         .strong()
                         .color(egui::Color32::from_rgb(120, 130, 150)),
                 );
-                egui::ScrollArea::vertical()
+                let speech_out = egui::ScrollArea::vertical()
                     .id_salt("web-speech")
                     .max_height(half)
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .stick_to_bottom(true)
+                    .animated(false)
+                    .stick_to_bottom(!self.web_speech_unstuck)
                     .show(ui, |ui| {
+                        if wheel != 0.0 {
+                            ui.scroll_with_delta(egui::vec2(0.0, wheel));
+                        }
                         if lines.is_empty() && partial.is_empty() {
                             ui.label(
                                 egui::RichText::new("говори на странице — текст появится тут")
@@ -1616,6 +1731,11 @@ impl App {
                             );
                         }
                     });
+                let speech_max =
+                    (speech_out.content_size.y - speech_out.inner_rect.height()).max(0.0);
+                if speech_out.state.offset.y >= speech_max - 4.0 {
+                    self.web_speech_unstuck = false;
+                }
                 ui.separator();
                 ui.label(
                     egui::RichText::new("📥 Присланное")
@@ -1623,13 +1743,17 @@ impl App {
                         .strong()
                         .color(egui::Color32::from_rgb(120, 130, 150)),
                 );
-                egui::ScrollArea::vertical()
+                let posts_out = egui::ScrollArea::vertical()
                     .id_salt("web-posts")
                     .max_height(ui.available_height() - GRIP)
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .stick_to_bottom(true)
+                    .animated(false)
+                    .stick_to_bottom(!self.web_posts_unstuck)
                     .show(ui, |ui| {
+                        if wheel != 0.0 {
+                            ui.scroll_with_delta(egui::vec2(0.0, wheel));
+                        }
                         if posts.is_empty() {
                             ui.label(
                                 egui::RichText::new("пришли текст или картинку со страницы")
@@ -1681,6 +1805,11 @@ impl App {
                             });
                         }
                     });
+                let posts_max =
+                    (posts_out.content_size.y - posts_out.inner_rect.height()).max(0.0);
+                if posts_out.state.offset.y >= posts_max - 4.0 {
+                    self.web_posts_unstuck = false;
+                }
                 draw_resize_grip(ui, cctx, grip_rect);
             });
             self.web_size = cctx.screen_rect().size();
@@ -2186,7 +2315,35 @@ impl App {
         }
     }
 
+    fn move_target_available(&self, target: MoveTarget) -> bool {
+        match target {
+            MoveTarget::Widget => true,
+            MoveTarget::Web => self.webmic.is_some(),
+            MoveTarget::Chat => self.chat_open,
+        }
+    }
+
+    fn next_move_target(&self) -> MoveTarget {
+        let mut t = self.move_target;
+        loop {
+            t = match t {
+                MoveTarget::Widget => MoveTarget::Web,
+                MoveTarget::Web => MoveTarget::Chat,
+                MoveTarget::Chat => MoveTarget::Widget,
+            };
+            if self.move_target_available(t) {
+                return t;
+            }
+        }
+    }
+
     fn process_window_move(&mut self, ctx: &egui::Context) {
+        if self.win_move.next.swap(false, Ordering::Relaxed) {
+            self.move_target = self.next_move_target();
+        }
+        if !self.move_target_available(self.move_target) {
+            self.move_target = MoveTarget::Widget;
+        }
         let dx = self.win_move.dx.swap(0, Ordering::Relaxed);
         let dy = self.win_move.dy.swap(0, Ordering::Relaxed);
         if dx == 0 && dy == 0 {
@@ -2198,14 +2355,14 @@ impl App {
             return;
         }
         let busy = self.win_move.busy.clone();
-        let web = self.win_move.web.load(Ordering::Relaxed);
+        let target = self.move_target;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            if web {
-                winctl::move_web_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
-            } else {
-                winctl::move_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
-            }
+            match target {
+                MoveTarget::Widget => winctl::move_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP),
+                MoveTarget::Web => winctl::move_web_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP),
+                MoveTarget::Chat => winctl::move_chat_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP),
+            };
             busy.store(false, Ordering::Relaxed);
             ctx.request_repaint();
         });
@@ -2216,7 +2373,8 @@ impl App {
             let mut picked: Option<String> = None;
             let mut clear_mic = false;
             let mut clear_zoom = false;
-            section(ui, "📈 Осциллограммы", |ui| {
+            let mut collapsed = self.scopes_collapsed;
+            section_collapsible(ui, "📈 Осциллограммы", &mut collapsed, |ui| {
                 if let Some(mon) = &self.audio.mic {
                     mon.snapshot(&mut self.audio.scope);
                     let color = egui::Color32::from_rgb(120, 210, 150);
@@ -2225,7 +2383,7 @@ impl App {
                             egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
+                            if ui.small_button("🗑").on_hover_text("Очистить текст").clicked() {
                                 clear_mic = true;
                             }
                         });
@@ -2243,7 +2401,7 @@ impl App {
                             egui::RichText::new("🔊 Zoom/Телемост").size(11.0).color(color),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("🧹").on_hover_text("Очистить текст").clicked() {
+                            if ui.small_button("🗑").on_hover_text("Очистить текст").clicked() {
                                 clear_zoom = true;
                             }
                         });
@@ -2253,6 +2411,7 @@ impl App {
                         .or(picked.take());
                 }
             });
+            self.scopes_collapsed = collapsed;
             if clear_mic {
                 if let Some(mon) = &self.audio.mic {
                     mon.clear_transcript();
@@ -2284,7 +2443,7 @@ impl App {
         self.deepseek = Some(deepseek::ask(
             ctx,
             self.cfg.autopilot_dir.clone(),
-            self.autopilot.profile.clone(),
+            self.system_prompt.clone(),
             q,
         ));
     }
@@ -2353,6 +2512,8 @@ impl eframe::App for App {
 
         self.maybe_reload();
 
+        self.wheel_ticks = self.win_move.wheel.swap(0, Ordering::Relaxed);
+
         self.poll_deepseek();
 
         if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
@@ -2377,21 +2538,21 @@ impl eframe::App for App {
             self.show_web_window(ctx);
         }
 
-        if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
-            telemetry::event("hotkey.cursor_warp", serde_json::json!({}));
-            let cslot = self.prev_cursor.clone();
-            std::thread::spawn(move || {
-                let mut slot = cslot.lock().unwrap();
-                if let Some((nx, ny)) = slot.take() {
-                    winctl::warp_cursor_norm(nx, ny);
-                } else {
-                    *slot = winctl::cursor_pos_norm();
-                    if let Some((nx, ny)) = winctl::widget_center_norm() {
-                        winctl::warp_cursor_norm(nx, ny);
-                    }
-                }
-            });
-        }
+        // if self.cursor_warp_request.swap(false, Ordering::Relaxed) {
+        //     telemetry::event("hotkey.cursor_warp", serde_json::json!({}));
+        //     let cslot = self.prev_cursor.clone();
+        //     std::thread::spawn(move || {
+        //         let mut slot = cslot.lock().unwrap();
+        //         if let Some((nx, ny)) = slot.take() {
+        //             winctl::warp_cursor_norm(nx, ny);
+        //         } else {
+        //             *slot = winctl::cursor_pos_norm();
+        //             if let Some((nx, ny)) = winctl::widget_center_norm() {
+        //                 winctl::warp_cursor_norm(nx, ny);
+        //             }
+        //         }
+        //     });
+        // }
 
         if self.paste_code.swap(false, Ordering::Relaxed) {
             type_clipboard_code();
@@ -2452,6 +2613,19 @@ impl eframe::App for App {
                         term.ui(ui);
                     });
                 self.terminal_width = resp.response.rect.width();
+            }
+
+            if self.move_target == MoveTarget::Widget {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("move-target-outline"),
+                ));
+                painter.rect_stroke(
+                    ctx.screen_rect(),
+                    10,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232)),
+                    egui::StrokeKind::Inside,
+                );
             }
 
             let inner = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -2582,7 +2756,7 @@ fn section_impl<R>(
 
             let toggled = ui
                 .horizontal(|ui| {
-                    let icon = if *collapsed { "▸" } else { "▾" };
+                    let icon = if *collapsed { "⏵" } else { "⏷" };
                     let header = ui.add(
                         egui::Label::new(title_rich).sense(egui::Sense::click()),
                     );

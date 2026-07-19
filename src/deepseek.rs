@@ -5,21 +5,11 @@ use std::sync::{Arc, Mutex};
 
 pub type Slot = Arc<Mutex<Option<Result<String, String>>>>;
 
-const SYSTEM_PROMPT: &str = "У нас игра: я на техническом собеседовании, а ты — это я. \
-Текст, который я присылаю, — это распознанная речь интервьюера, то есть вопрос(ы), \
-на которые нужно ответить (расшифровка может быть неточной — восстанови смысл сам). \
-Отвечай на эти вопросы от первого лица, как будто отвечаю я сам вслух: \
-«я делал», «в моём опыте», «у меня был проект». Быстро и по делу, \
-максимально в контексте моего опыта из резюме ниже. \
-Если по опыту прямого ответа нет — всё равно отвечай от моего лица, по делу и кратко. \
-Не пересказывай и не комментируй вопрос, не говори о себе как об ассистенте, \
-не пиши мета-ремарок — только сам ответ, который я могу произнести.";
-
-pub fn ask(ctx: egui::Context, autopilot_dir: PathBuf, profile: String, question: String) -> Slot {
+pub fn ask(ctx: egui::Context, autopilot_dir: PathBuf, system: String, question: String) -> Slot {
     let slot: Slot = Arc::new(Mutex::new(None));
     let out = slot.clone();
     std::thread::spawn(move || {
-        let res = run(&autopilot_dir, &profile, &question);
+        let res = run(&autopilot_dir, &system, &question);
         if let Ok(mut g) = out.lock() {
             *g = Some(res);
         }
@@ -28,7 +18,7 @@ pub fn ask(ctx: egui::Context, autopilot_dir: PathBuf, profile: String, question
     slot
 }
 
-fn run(autopilot_dir: &Path, profile: &str, question: &str) -> Result<String, String> {
+fn run(autopilot_dir: &Path, system: &str, question: &str) -> Result<String, String> {
     let env = read_env(&autopilot_dir.join(".env"));
     let key = env.get("LLM_API_KEY").cloned().unwrap_or_default();
     if key.is_empty() || key == "EMPTY" {
@@ -42,19 +32,15 @@ fn run(autopilot_dir: &Path, profile: &str, question: &str) -> Result<String, St
         .get("LLM_MODEL")
         .cloned()
         .unwrap_or_else(|| "deepseek-chat".into());
-    let resume = profile_resume(autopilot_dir, profile).unwrap_or_default();
-
-    let system = if resume.is_empty() {
-        SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{SYSTEM_PROMPT}\n\nМоё резюме:\n{resume}")
-    };
+    let system = system.trim();
+    let mut messages = Vec::new();
+    if !system.is_empty() {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": question }));
     let payload = serde_json::json!({
         "model": model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": question }
-        ],
+        "messages": messages,
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
@@ -109,80 +95,4 @@ fn read_env(path: &Path) -> HashMap<String, String> {
         }
     }
     map
-}
-
-fn profile_resume(autopilot_dir: &Path, profile: &str) -> Option<String> {
-    let overlay = autopilot_dir
-        .join("config")
-        .join("profiles")
-        .join(format!("{profile}.yaml"));
-    if let Some(r) = read_block_scalar(&overlay, "profile") {
-        return Some(r);
-    }
-    read_block_scalar(&autopilot_dir.join("config").join("config.yaml"), "profile")
-}
-
-fn read_block_scalar(path: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    extract_block_scalar(&text, key)
-}
-
-fn extract_block_scalar(text: &str, key: &str) -> Option<String> {
-    let header = format!("{key}:");
-    let mut found = false;
-    let mut body: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if !found {
-            if line.starts_with(&header) && line[header.len()..].trim_start().starts_with('|') {
-                found = true;
-            }
-            continue;
-        }
-        if line.trim().is_empty() {
-            body.push(String::new());
-            continue;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            body.push(line.to_string());
-        } else {
-            break;
-        }
-    }
-    if !found {
-        return None;
-    }
-    let indent = body
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    let joined = body
-        .iter()
-        .map(|l| if l.len() >= indent { l[indent..].to_string() } else { l.clone() })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let trimmed = joined.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_block_scalar;
-
-    #[test]
-    fn pulls_block_scalar_and_dedents() {
-        let yaml = "contacts: |\n  один\nprofile: |\n  Иван Иванов — разработчик.\n\n  Опыт 10 лет.\ngroups: []\n";
-        let got = extract_block_scalar(yaml, "profile").unwrap();
-        assert_eq!(got, "Иван Иванов — разработчик.\n\nОпыт 10 лет.");
-    }
-
-    #[test]
-    fn missing_key_is_none() {
-        assert_eq!(extract_block_scalar("site: {}\n", "profile"), None);
-    }
 }

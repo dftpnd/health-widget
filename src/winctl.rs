@@ -103,6 +103,19 @@ pub fn move_web_by(dx: i32, dy: i32) -> bool {
     run_kwin_script(&body, "webmoveby")
 }
 
+pub fn move_chat_by(dx: i32, dy: i32) -> bool {
+    let body = for_captioned_window(
+        CHAT_CAPTION,
+        &format!(
+            "w.keepAbove = true; var g = w.frameGeometry; \
+             w.frameGeometry = {{ x: g.x + {dx}, y: g.y + {dy}, width: g.width, height: g.height }}; \
+             var g2 = w.frameGeometry; \
+             print(\"HWCH-GEOM \" + Math.round(g2.x) + \" \" + Math.round(g2.y));"
+        ),
+    );
+    run_kwin_script(&body, "chatmoveby")
+}
+
 pub fn parse_geom_line(line: &str) -> Option<GeomEvent> {
     if let Some((x, y)) = parse_pair_after(line, "HWWEB-GEOM ") {
         return Some(GeomEvent::Web(x, y));
@@ -199,6 +212,7 @@ pub fn ensure_dotoold() {
     }
 }
 
+#[allow(dead_code)]
 fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {
     if !run_kwin_script(body, tag) {
         return None;
@@ -217,6 +231,7 @@ fn read_two_floats(body: &str, tag: &str, marker: &str) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
+#[allow(dead_code)]
 pub fn widget_center_norm() -> Option<(f64, f64)> {
     let body = format!(
         "var s = workspace.virtualScreenSize;\n\
@@ -232,12 +247,14 @@ pub fn widget_center_norm() -> Option<(f64, f64)> {
     read_two_floats(&body, "wnorm", "HW-WNORM")
 }
 
+#[allow(dead_code)]
 pub fn cursor_pos_norm() -> Option<(f64, f64)> {
     let body = "var s = workspace.virtualScreenSize; \
                 print(\"HW-CNORM \" + (workspace.cursorPos.x / s.width) + \" \" + (workspace.cursorPos.y / s.height));";
     read_two_floats(body, "cnorm", "HW-CNORM")
 }
 
+#[allow(dead_code)]
 pub fn warp_cursor_norm(nx: f64, ny: f64) {
     let Some(dotoolc) = dotool_bin("dotoolc") else {
         return;

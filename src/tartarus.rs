@@ -1,7 +1,7 @@
 
 use egui::Context;
 use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode};
+use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -46,7 +46,7 @@ const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
 #[derive(Clone)]
 pub struct Handles {
     pub shot_request: Arc<AtomicBool>,
-    pub cursor_warp_request: Arc<AtomicBool>,
+    // pub cursor_warp_request: Arc<AtomicBool>,
     pub clear_mic: Arc<AtomicBool>,
     pub clear_zoom: Arc<AtomicBool>,
     pub copy_mic: Arc<AtomicBool>,
@@ -55,7 +55,8 @@ pub struct Handles {
     pub paste_code: Arc<AtomicBool>,
     pub move_dx: Arc<AtomicI32>,
     pub move_dy: Arc<AtomicI32>,
-    pub move_web: Arc<AtomicBool>,
+    pub move_next: Arc<AtomicBool>,
+    pub wheel: Arc<AtomicI32>,
     pub ctx: Context,
 }
 
@@ -131,10 +132,13 @@ fn serve(mut devs: Vec<Device>, handles: &Handles) {
             if re & libc::POLLIN == 0 {
                 continue;
             }
-            let events: Vec<(u16, i32)> = match devs[i].fetch_events() {
+            let events: Vec<(EventType, u16, i32)> = match devs[i].fetch_events() {
                 Ok(it) => it
-                    .filter(|ev| ev.event_type() == EventType::KEY)
-                    .map(|ev| (ev.code(), ev.value()))
+                    .filter(|ev| {
+                        ev.event_type() == EventType::KEY
+                            || ev.event_type() == EventType::RELATIVE
+                    })
+                    .map(|ev| (ev.event_type(), ev.code(), ev.value()))
                     .collect(),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -144,7 +148,14 @@ fn serve(mut devs: Vec<Device>, handles: &Handles) {
                     return;
                 }
             };
-            for (code, value) in events {
+            for (etype, code, value) in events {
+                if etype == EventType::RELATIVE {
+                    if code == RelativeAxisCode::REL_WHEEL.0 && value != 0 {
+                        handles.wheel.fetch_add(value, Ordering::Relaxed);
+                        handles.ctx.request_repaint();
+                    }
+                    continue;
+                }
                 handle_key(&mut ui, handles, code, value);
             }
         }
@@ -175,18 +186,13 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
         return;
     }
     if value == 1 {
-        if code == KeyCode::KEY_1.0 {
-            h.move_web.fetch_xor(true, Ordering::Relaxed);
-            h.ctx.request_repaint();
-            return;
-        }
         if code == KeyCode::KEY_5.0 {
             h.shot_request.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
         if code == KeyCode::KEY_SPACE.0 {
-            h.cursor_warp_request.store(true, Ordering::Relaxed);
+            h.move_next.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
@@ -220,8 +226,7 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
-    } else if matches!(code, c if c == KeyCode::KEY_1.0
-        || c == KeyCode::KEY_5.0
+    } else if matches!(code, c if c == KeyCode::KEY_5.0
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0

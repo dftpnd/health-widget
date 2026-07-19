@@ -15,6 +15,7 @@ pub struct Chat {
     messages: Vec<Msg>,
     pending: bool,
     input: String,
+    unstuck: bool,
 }
 
 impl Chat {
@@ -47,6 +48,15 @@ impl Chat {
     }
 
     pub fn ui_capped(&mut self, ui: &mut egui::Ui, max_height: f32) -> Option<String> {
+        self.ui_scrolled(ui, max_height, 0.0)
+    }
+
+    pub fn ui_scrolled(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_height: f32,
+        wheel: f32,
+    ) -> Option<String> {
         if self.messages.is_empty() && !self.pending {
             ui.label(
                 RichText::new("нет сообщений")
@@ -55,12 +65,19 @@ impl Chat {
                     .color(Color32::from_rgb(90, 96, 108)),
             );
         } else {
-            egui::ScrollArea::vertical()
+            if wheel > 0.0 {
+                self.unstuck = true;
+            }
+            let out = egui::ScrollArea::vertical()
                 .id_salt("chat_log")
                 .max_height(max_height)
                 .auto_shrink([false, true])
-                .stick_to_bottom(true)
+                .animated(false)
+                .stick_to_bottom(!self.unstuck)
                 .show(ui, |ui| {
+                    if wheel != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, wheel));
+                    }
                     ui.set_min_width(ui.available_width());
                     for msg in &self.messages {
                         let (who, color) = match msg.role {
@@ -88,6 +105,10 @@ impl Chat {
                         });
                     }
                 });
+            let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
+            if out.state.offset.y >= max - 4.0 {
+                self.unstuck = false;
+            }
         }
         self.input_row(ui)
     }
