@@ -111,7 +111,7 @@ def is_hallucination(text: str, no_speech_prob: float = 0.0,
         return True
     return False
 
-def flatten_words(segments):
+def flatten_words(segments) -> list[tuple[str, float, float]]:
     out = []
     for s in segments:
         if is_hallucination(
@@ -125,7 +125,7 @@ def flatten_words(segments):
             out.append((w.word.strip(), w.start, w.end))
     return out
 
-def cut_bytes(buf_len, committed_end, max_seconds):
+def cut_bytes(buf_len: int, committed_end: float | None, max_seconds: float) -> int:
     limit = int(max_seconds * SAMPLE_RATE) * 2
     if buf_len <= limit:
         return 0
@@ -165,21 +165,21 @@ FINAL_MAX_WORDS = 30
 def norm_word(w: str) -> str:
     return re.sub(r"[\W_]+", "", w.lower())
 
-def common_prefix(a, b) -> int:
+def common_prefix(a: list[tuple[str, float, float]], b: list[tuple[str, float, float]]) -> int:
     n = 0
     m = min(len(a), len(b))
     while n < m and norm_word(a[n][0]) == norm_word(b[n][0]):
         n += 1
     return n
 
-def advance(prev_words, committed, cur_words):
+def advance(prev_words: list[tuple[str, float, float]], committed: int, cur_words: list[tuple[str, float, float]]) -> tuple[int, list[str], str]:
     n = common_prefix(prev_words, cur_words)
     newly = [w for w, _s, _e in cur_words[committed:n]]
     committed = max(committed, n)
     partial = " ".join(w for w, _s, _e in cur_words[committed:])
     return committed, newly, partial
 
-def take_final(pending, limit=FINAL_MAX_WORDS):
+def take_final(pending: list[str], limit: int = FINAL_MAX_WORDS) -> tuple[str, list[str]]:
     last = -1
     for i, w in enumerate(pending):
         if w and w[-1] in SENT_END:
