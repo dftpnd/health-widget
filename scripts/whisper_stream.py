@@ -111,6 +111,20 @@ def is_hallucination(text: str, no_speech_prob: float = 0.0,
         return True
     return False
 
+def flatten_words(segments):
+    out = []
+    for s in segments:
+        if is_hallucination(
+            s.text,
+            getattr(s, "no_speech_prob", 0.0),
+            getattr(s, "avg_logprob", 0.0),
+            getattr(s, "compression_ratio", 0.0),
+        ):
+            continue
+        for w in (s.words or []):
+            out.append((w.word.strip(), w.start, w.end))
+    return out
+
 def load_hotwords(path: str) -> str:
     try:
         with open(path, encoding="utf-8") as f:

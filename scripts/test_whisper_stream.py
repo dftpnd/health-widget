@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace as NS
 from whisper_stream import (
     parse_hotwords,
     parse_corrections,
@@ -11,6 +12,7 @@ from whisper_stream import (
     common_prefix,
     advance,
     take_final,
+    flatten_words,
 )
 
 class TestTextsAgree(unittest.TestCase):
@@ -220,6 +222,40 @@ class TestTakeFinal(unittest.TestCase):
         out, rest = take_final([])
         self.assertEqual(out, "")
         self.assertEqual(rest, [])
+
+def seg(text, words, **kw):
+    return NS(
+        text=text,
+        words=[NS(word=w, start=s, end=e) for w, s, e in words],
+        no_speech_prob=kw.get("no_speech_prob", 0.0),
+        avg_logprob=kw.get("avg_logprob", 0.0),
+        compression_ratio=kw.get("compression_ratio", 1.0),
+    )
+
+class TestFlattenWords(unittest.TestCase):
+    def test_strips_and_flattens(self):
+        segs = [seg("привет мир", [(" привет", 0.0, 0.4), (" мир", 0.5, 0.9)])]
+        self.assertEqual(flatten_words(segs),
+                         [("привет", 0.0, 0.4), ("мир", 0.5, 0.9)])
+
+    def test_hallucinated_segment_dropped_entirely(self):
+        segs = [
+            seg("Продолжение следует...",
+                [(" Продолжение", 0.0, 0.5), (" следует...", 0.6, 1.0)]),
+            seg("реальная речь", [(" реальная", 1.2, 1.6), (" речь", 1.7, 2.0)]),
+        ]
+        self.assertEqual([w for w, _s, _e in flatten_words(segs)],
+                         ["реальная", "речь"])
+
+    def test_bad_metrics_dropped(self):
+        segs = [seg("любой текст", [(" любой", 0.0, 0.4)],
+                    no_speech_prob=0.9, avg_logprob=-0.8)]
+        self.assertEqual(flatten_words(segs), [])
+
+    def test_segment_without_words_skipped(self):
+        segs = [NS(text="пусто", words=None, no_speech_prob=0.0,
+                   avg_logprob=0.0, compression_ratio=1.0)]
+        self.assertEqual(flatten_words(segs), [])
 
 if __name__ == "__main__":
     unittest.main()
