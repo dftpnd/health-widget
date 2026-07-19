@@ -90,6 +90,19 @@ pub fn move_by(dx: i32, dy: i32) -> bool {
     run_kwin_script(&body, "moveby")
 }
 
+pub fn move_web_by(dx: i32, dy: i32) -> bool {
+    let body = for_captioned_window(
+        WEB_CAPTION,
+        &format!(
+            "w.keepAbove = true; var g = w.frameGeometry; \
+             w.frameGeometry = {{ x: g.x + {dx}, y: g.y + {dy}, width: g.width, height: g.height }}; \
+             var g2 = w.frameGeometry; \
+             print(\"HWWEB-GEOM \" + Math.round(g2.x) + \" \" + Math.round(g2.y));"
+        ),
+    );
+    run_kwin_script(&body, "webmoveby")
+}
+
 pub fn parse_geom_line(line: &str) -> Option<GeomEvent> {
     if let Some((x, y)) = parse_pair_after(line, "HWWEB-GEOM ") {
         return Some(GeomEvent::Web(x, y));

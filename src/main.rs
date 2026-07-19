@@ -145,6 +145,7 @@ struct WindowMove {
     dx: Arc<AtomicI32>,
     dy: Arc<AtomicI32>,
     busy: Arc<AtomicBool>,
+    web: Arc<AtomicBool>,
 }
 
 impl WindowMove {
@@ -153,6 +154,7 @@ impl WindowMove {
             dx: Arc::new(AtomicI32::new(0)),
             dy: Arc::new(AtomicI32::new(0)),
             busy: Arc::new(AtomicBool::new(false)),
+            web: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -271,6 +273,7 @@ impl App {
             paste_code: paste_code.clone(),
             move_dx: win_move.dx.clone(),
             move_dy: win_move.dy.clone(),
+            move_web: win_move.web.clone(),
             ctx: cc.egui_ctx.clone(),
         });
 
@@ -1524,9 +1527,14 @@ impl App {
             if cctx.input(|i| i.viewport().close_requested()) {
                 close = true;
             }
+            let stroke = if self.win_move.web.load(Ordering::Relaxed) {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232))
+            } else {
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78))
+            };
             let frame = egui::Frame::default()
                 .fill(bg)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .stroke(stroke)
                 .inner_margin(egui::Margin::same(8))
                 .corner_radius(10);
             egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
@@ -2190,9 +2198,14 @@ impl App {
             return;
         }
         let busy = self.win_move.busy.clone();
+        let web = self.win_move.web.load(Ordering::Relaxed);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            winctl::move_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
+            if web {
+                winctl::move_web_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
+            } else {
+                winctl::move_by(dx * WINDOW_MOVE_STEP, dy * WINDOW_MOVE_STEP);
+            }
             busy.store(false, Ordering::Relaxed);
             ctx.request_repaint();
         });

@@ -55,6 +55,7 @@ pub struct Handles {
     pub paste_code: Arc<AtomicBool>,
     pub move_dx: Arc<AtomicI32>,
     pub move_dy: Arc<AtomicI32>,
+    pub move_web: Arc<AtomicBool>,
     pub ctx: Context,
 }
 
@@ -174,6 +175,11 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
         return;
     }
     if value == 1 {
+        if code == KeyCode::KEY_1.0 {
+            h.move_web.fetch_xor(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
         if code == KeyCode::KEY_5.0 {
             h.shot_request.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
@@ -214,7 +220,8 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
-    } else if matches!(code, c if c == KeyCode::KEY_5.0
+    } else if matches!(code, c if c == KeyCode::KEY_1.0
+        || c == KeyCode::KEY_5.0
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0
