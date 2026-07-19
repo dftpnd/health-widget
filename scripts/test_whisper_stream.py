@@ -9,6 +9,7 @@ from whisper_stream import (
     texts_agree,
     norm_word,
     common_prefix,
+    advance,
 )
 
 class TestTextsAgree(unittest.TestCase):
@@ -158,6 +159,39 @@ class TestCommonPrefix(unittest.TestCase):
 
     def test_empty_side(self):
         self.assertEqual(common_prefix([], [("а", 0.0, 0.3)]), 0)
+
+class TestAdvance(unittest.TestCase):
+    def test_agreed_prefix_commits(self):
+        prev = [("запусти", 0.0, 0.5), ("кластер", 0.6, 1.0)]
+        cur = [("запусти", 0.0, 0.5), ("кластер", 0.6, 1.0), ("завтра", 1.1, 1.5)]
+        committed, newly, partial = advance(prev, 0, cur)
+        self.assertEqual(committed, 2)
+        self.assertEqual(newly, ["запусти", "кластер"])
+        self.assertEqual(partial, "завтра")
+
+    def test_already_committed_not_repeated(self):
+        prev = [("запусти", 0.0, 0.5), ("кластер", 0.6, 1.0), ("завтра", 1.1, 1.5)]
+        cur = [("запусти", 0.0, 0.5), ("кластер", 0.6, 1.0), ("завтра", 1.1, 1.5)]
+        committed, newly, partial = advance(prev, 2, cur)
+        self.assertEqual(committed, 3)
+        self.assertEqual(newly, ["завтра"])
+        self.assertEqual(partial, "")
+
+    def test_shifted_hypothesis_commits_nothing(self):
+        prev = [("шум", 0.0, 0.5)]
+        cur = [("совсем", 0.0, 0.4), ("другое", 0.5, 0.9)]
+        committed, newly, partial = advance(prev, 0, cur)
+        self.assertEqual(committed, 0)
+        self.assertEqual(newly, [])
+        self.assertEqual(partial, "совсем другое")
+
+    def test_rewrite_before_committed_ignored(self):
+        prev = [("раз", 0.0, 0.3), ("два", 0.4, 0.7)]
+        cur = [("уже", 0.0, 0.3), ("другой", 0.4, 0.7), ("текст", 0.8, 1.1)]
+        committed, newly, partial = advance(prev, 2, cur)
+        self.assertEqual(committed, 2)
+        self.assertEqual(newly, [])
+        self.assertEqual(partial, "текст")
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,13 @@ def common_prefix(a, b) -> int:
         n += 1
     return n
 
+def advance(prev_words, committed, cur_words):
+    n = common_prefix(prev_words, cur_words)
+    newly = [w for w, _s, _e in cur_words[committed:n]]
+    committed = max(committed, n)
+    partial = " ".join(w for w, _s, _e in cur_words[committed:])
+    return committed, newly, partial
+
 def _match_form(text: str) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
 
