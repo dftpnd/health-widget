@@ -125,6 +125,14 @@ def flatten_words(segments):
             out.append((w.word.strip(), w.start, w.end))
     return out
 
+def cut_bytes(buf_len, committed_end, max_seconds):
+    limit = int(max_seconds * SAMPLE_RATE) * 2
+    if buf_len <= limit:
+        return 0
+    if committed_end is None:
+        return buf_len - limit
+    return min(buf_len, int(committed_end * SAMPLE_RATE) * 2)
+
 def load_hotwords(path: str) -> str:
     try:
         with open(path, encoding="utf-8") as f:
@@ -146,6 +154,7 @@ SILENCE_RMS = 500.0
 SILENCE_TAIL = 0.6
 MIN_SPEECH = 0.3
 MAX_SEGMENT = 15.0
+MAX_BUFFER = 12.0
 STABILITY_MAX_SECONDS = 3.0
 STABILITY_MIN_SIMILARITY = 0.7
 PERTURB_PAD_SECONDS = 0.15

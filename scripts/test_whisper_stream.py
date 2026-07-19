@@ -13,6 +13,8 @@ from whisper_stream import (
     advance,
     take_final,
     flatten_words,
+    cut_bytes,
+    SAMPLE_RATE,
 )
 
 class TestTextsAgree(unittest.TestCase):
@@ -256,6 +258,22 @@ class TestFlattenWords(unittest.TestCase):
         segs = [NS(text="пусто", words=None, no_speech_prob=0.0,
                    avg_logprob=0.0, compression_ratio=1.0)]
         self.assertEqual(flatten_words(segs), [])
+
+class TestCutBytes(unittest.TestCase):
+    def test_under_limit_no_cut(self):
+        self.assertEqual(cut_bytes(10 * SAMPLE_RATE * 2, 5.0, 12.0), 0)
+
+    def test_cut_at_committed_word_end(self):
+        self.assertEqual(cut_bytes(13 * SAMPLE_RATE * 2, 6.5, 12.0),
+                         int(6.5 * SAMPLE_RATE) * 2)
+
+    def test_no_commits_keeps_tail(self):
+        self.assertEqual(cut_bytes(15 * SAMPLE_RATE * 2, None, 12.0),
+                         3 * SAMPLE_RATE * 2)
+
+    def test_committed_end_beyond_buffer_clamped(self):
+        self.assertEqual(cut_bytes(13 * SAMPLE_RATE * 2, 99.0, 12.0),
+                         13 * SAMPLE_RATE * 2)
 
 if __name__ == "__main__":
     unittest.main()
