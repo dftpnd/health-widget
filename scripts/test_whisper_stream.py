@@ -7,6 +7,8 @@ from whisper_stream import (
     load_corrections,
     is_hallucination,
     texts_agree,
+    norm_word,
+    common_prefix,
 )
 
 class TestTextsAgree(unittest.TestCase):
@@ -134,6 +136,28 @@ class TestLoaders(unittest.TestCase):
 
     def test_load_corrections_missing_file(self):
         self.assertEqual(load_corrections("/nonexistent/path/it_corrections.tsv"), [])
+
+class TestNormWord(unittest.TestCase):
+    def test_lower_and_strip_punct(self):
+        self.assertEqual(norm_word("Привет,"), "привет")
+        self.assertEqual(norm_word("мир."), "мир")
+
+    def test_only_punct_is_empty(self):
+        self.assertEqual(norm_word("—"), "")
+
+class TestCommonPrefix(unittest.TestCase):
+    def test_full_match_ignores_case_and_punct(self):
+        a = [("Привет,", 0.0, 0.4), ("мир", 0.5, 0.9)]
+        b = [("привет", 0.0, 0.4), ("мир.", 0.5, 0.9)]
+        self.assertEqual(common_prefix(a, b), 2)
+
+    def test_divergence_stops_prefix(self):
+        a = [("раз", 0.0, 0.3), ("два", 0.4, 0.7), ("три", 0.8, 1.1)]
+        b = [("раз", 0.0, 0.3), ("двадцать", 0.4, 0.7), ("три", 0.8, 1.1)]
+        self.assertEqual(common_prefix(a, b), 1)
+
+    def test_empty_side(self):
+        self.assertEqual(common_prefix([], [("а", 0.0, 0.3)]), 0)
 
 if __name__ == "__main__":
     unittest.main()

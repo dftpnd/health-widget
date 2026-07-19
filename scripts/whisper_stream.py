@@ -137,6 +137,16 @@ STABILITY_MIN_SIMILARITY = 0.7
 PERTURB_PAD_SECONDS = 0.15
 PERTURB_GAIN = 0.9
 
+def norm_word(w: str) -> str:
+    return re.sub(r"[\W_]+", "", w.lower())
+
+def common_prefix(a, b) -> int:
+    n = 0
+    m = min(len(a), len(b))
+    while n < m and norm_word(a[n][0]) == norm_word(b[n][0]):
+        n += 1
+    return n
+
 def _match_form(text: str) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
 
