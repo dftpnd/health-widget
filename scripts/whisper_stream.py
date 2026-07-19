@@ -136,6 +136,8 @@ STABILITY_MAX_SECONDS = 3.0
 STABILITY_MIN_SIMILARITY = 0.7
 PERTURB_PAD_SECONDS = 0.15
 PERTURB_GAIN = 0.9
+SENT_END = ".?!…"
+FINAL_MAX_WORDS = 30
 
 def norm_word(w: str) -> str:
     return re.sub(r"[\W_]+", "", w.lower())
@@ -153,6 +155,17 @@ def advance(prev_words, committed, cur_words):
     committed = max(committed, n)
     partial = " ".join(w for w, _s, _e in cur_words[committed:])
     return committed, newly, partial
+
+def take_final(pending, limit=FINAL_MAX_WORDS):
+    last = -1
+    for i, w in enumerate(pending):
+        if w and w[-1] in SENT_END:
+            last = i
+    if last >= 0:
+        return " ".join(pending[:last + 1]), pending[last + 1:]
+    if len(pending) >= limit:
+        return " ".join(pending), []
+    return "", pending
 
 def _match_form(text: str) -> str:
     return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())

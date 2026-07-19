@@ -10,6 +10,7 @@ from whisper_stream import (
     norm_word,
     common_prefix,
     advance,
+    take_final,
 )
 
 class TestTextsAgree(unittest.TestCase):
@@ -192,6 +193,33 @@ class TestAdvance(unittest.TestCase):
         self.assertEqual(committed, 2)
         self.assertEqual(newly, [])
         self.assertEqual(partial, "текст")
+
+class TestTakeFinal(unittest.TestCase):
+    def test_no_boundary_keeps_pending(self):
+        out, rest = take_final(["привет", "мир"])
+        self.assertEqual(out, "")
+        self.assertEqual(rest, ["привет", "мир"])
+
+    def test_cuts_at_last_sentence_end(self):
+        out, rest = take_final(["Привет.", "Как", "дела?", "Я"])
+        self.assertEqual(out, "Привет. Как дела?")
+        self.assertEqual(rest, ["Я"])
+
+    def test_ellipsis_is_boundary(self):
+        out, rest = take_final(["ну…", "и"])
+        self.assertEqual(out, "ну…")
+        self.assertEqual(rest, ["и"])
+
+    def test_word_limit_flushes_all(self):
+        words = ["слово"] * 30
+        out, rest = take_final(words)
+        self.assertEqual(out, " ".join(words))
+        self.assertEqual(rest, [])
+
+    def test_empty_pending(self):
+        out, rest = take_final([])
+        self.assertEqual(out, "")
+        self.assertEqual(rest, [])
 
 if __name__ == "__main__":
     unittest.main()
