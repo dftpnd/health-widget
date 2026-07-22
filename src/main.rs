@@ -21,6 +21,7 @@ mod pilot_notify;
 mod kwin_shot;
 mod prompts;
 mod recorder;
+mod screencast;
 mod screenshot;
 mod state;
 mod tartarus;
@@ -103,6 +104,7 @@ struct Shared {
 struct ActiveCall {
     id: i64,
     name: String,
+    screen: Option<screencast::ScreenRecorder>,
 }
 
 struct AudioState {
@@ -614,8 +616,26 @@ impl App {
             return;
         };
         telemetry::event("call.start", serde_json::json!({ "id": id, "name": name }));
-        self.active_call = Some(ActiveCall { id, name });
+        self.active_call = Some(ActiveCall { id, name, screen: None });
         self.reconcile_call_recording();
+        self.start_screen_recording();
+    }
+
+    fn start_screen_recording(&mut self) {
+        let Some(call) = &self.active_call else {
+            return;
+        };
+        let Some(dir) = transcript_log::call_dir(call.id) else {
+            return;
+        };
+        match screencast::ScreenRecorder::start(&dir) {
+            Ok(rec) => {
+                if let Some(call) = &mut self.active_call {
+                    call.screen = Some(rec);
+                }
+            }
+            Err(e) => telemetry::error("screencast.fail", &e),
+        }
     }
 
     fn end_call(&mut self) {
@@ -623,6 +643,9 @@ impl App {
             return;
         };
         telemetry::event("call.end", serde_json::json!({ "id": call.id, "name": call.name }));
+        if let Some(rec) = call.screen {
+            rec.stop();
+        }
         if let Some(mon) = &self.audio.mic {
             mon.stop_recording();
         }
@@ -918,6 +941,13 @@ impl App {
                 };
                 if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
                     toggle_pin = true;
+                }
+                if ui
+                    .button("📁")
+                    .on_hover_text("Открыть папку с записями колов (видео и звук)")
+                    .clicked()
+                {
+                    open_calls_dir();
                 }
                 if ui
                     .selectable_label(self.help_open, "❓")
@@ -1932,20 +1962,26 @@ impl App {
             .map(|z| z.silent_for())
             .filter(|d| *d >= Duration::from_secs(120))
             .map(|d| d.as_secs() / 60);
-        section_sized(ui, "🎙 Кол", min_height, |ui| {
+        section_sized(ui, "🎤 Кол", min_height, |ui| {
             ui.horizontal(|ui| {
                 let recording = active_name.is_some();
-                let (label, hint) = if recording {
+                let (glyph, hint) = if recording {
                     ("⏹ Завершить", "Остановить запись и сохранить кол")
                 } else {
-                    ("🔴 Кол", "Начать запись звонка: звук обоих каналов + текст")
+                    ("⏺ Кол", "Начать запись звонка: звук обоих каналов + текст")
                 };
+                let color = if recording {
+                    egui::Color32::from_rgb(210, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(230, 120, 120)
+                };
+                let label = egui::RichText::new(glyph).color(color);
                 if ui.button(label).on_hover_text(hint).clicked() {
                     call_toggle = true;
                 }
                 if let Some(n) = &active_name {
                     ui.label(
-                        egui::RichText::new(format!("● {n}"))
+                        egui::RichText::new(format!("⏺ {n}"))
                             .size(11.0)
                             .color(egui::Color32::from_rgb(230, 120, 120)),
                     );
@@ -2938,6 +2974,14 @@ fn call_name_now() -> String {
             )
         })
         .unwrap_or_else(|_| "кол".to_string())
+}
+
+fn open_calls_dir() {
+    let Some(dir) = transcript_log::calls_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
 }
 
 fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) -> String {

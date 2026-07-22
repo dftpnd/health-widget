@@ -257,12 +257,12 @@ fn db_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("health-widget").join("transcripts.db"))
 }
 
+pub fn calls_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("health-widget").join("calls"))
+}
+
 pub fn call_dir(call_id: i64) -> Option<PathBuf> {
-    dirs::data_dir().map(|d| {
-        d.join("health-widget")
-            .join("calls")
-            .join(call_id.to_string())
-    })
+    calls_dir().map(|d| d.join(call_id.to_string()))
 }
 
 #[cfg(test)]
