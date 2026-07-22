@@ -797,6 +797,7 @@ impl App {
         if !over_limit && !batch_done {
             return;
         }
+        self.autopilot.apply_idle.clear();
         let cur = self.autopilot.profile.clone();
         let next = self.next_eligible_profile(&cur);
         telemetry::event(
