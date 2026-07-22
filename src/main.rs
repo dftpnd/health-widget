@@ -125,6 +125,7 @@ struct AutopilotState {
     scan: Option<pilot_scan::ScanStatus>,
     scan_mtime: Option<std::time::SystemTime>,
     batch_baseline: i64,
+    apply_idle: HashSet<String>,
     notify_on: bool,
 }
 
@@ -502,6 +503,7 @@ impl App {
                 scan: None,
                 scan_mtime: None,
                 batch_baseline: 0,
+                apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
@@ -772,6 +774,16 @@ impl App {
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
     }
 
+    fn next_eligible_profile(&self, from: &str) -> Option<String> {
+        let order: Vec<&str> = PILOT_PROFILES.iter().map(|(k, _)| *k).collect();
+        next_eligible_in_order(&order, from, |key| {
+            let path = profile_stats_path(&self.cfg.autopilot_dir, key);
+            pilot_stats::load(&path)
+                .map(|s| s.daily_limit <= 0 || s.applied_today < s.daily_limit)
+                .unwrap_or(true)
+        })
+    }
+
     fn maybe_rotate_profile(&mut self) {
         if self.autopilot.want != Some(pilot::Phase::Apply) {
             return;
@@ -786,20 +798,7 @@ impl App {
             return;
         }
         let cur = self.autopilot.profile.clone();
-        let order: Vec<String> = PILOT_PROFILES.iter().map(|(k, _)| k.to_string()).collect();
-        let start = order.iter().position(|k| *k == cur).unwrap_or(0);
-        let n = order.len();
-        // Идём по кругу от следующего профиля; последний шаг (i == n) — снова cur,
-        // это позволяет продолжить тот же профиль новым батчем, если круг замкнулся
-        // и свободен только он сам.
-        let next = (1..=n).find_map(|i| {
-            let key = &order[(start + i) % n];
-            let path = profile_stats_path(&self.cfg.autopilot_dir, key);
-            let eligible = pilot_stats::load(&path)
-                .map(|s| s.daily_limit <= 0 || s.applied_today < s.daily_limit)
-                .unwrap_or(true);
-            eligible.then(|| key.clone())
-        });
+        let next = self.next_eligible_profile(&cur);
         telemetry::event(
             "pilot.rotate_profile",
             serde_json::json!({
