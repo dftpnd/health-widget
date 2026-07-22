@@ -85,6 +85,14 @@ fn decide_apply_chain(next: Option<&str>, apply_idle: &HashSet<String>) -> Apply
     }
 }
 
+fn next_chat_profile(order: &[&str], from: &str, chat_done: &HashSet<String>) -> Option<String> {
+    next_eligible_in_order(order, from, |key| !chat_done.contains(key))
+}
+
+fn enrich_window_over(now: Instant, until: Option<Instant>) -> bool {
+    until.is_some_and(|u| now >= u)
+}
+
 const TERMINAL_W: f32 = 340.0;
 const TOP_ROW_H: f32 = 64.0;
 
@@ -3372,8 +3380,12 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod apply_chain_tests {
-    use super::{decide_apply_chain, next_eligible_in_order, ApplyChain};
+    use super::{
+        decide_apply_chain, enrich_window_over, next_chat_profile, next_eligible_in_order,
+        ApplyChain,
+    };
     use std::collections::HashSet;
+    use std::time::{Duration, Instant};
 
     const ORDER: &[&str] = &["fullstack", "back", "llm"];
 
@@ -3434,5 +3446,32 @@ mod apply_chain_tests {
         idle.insert("fullstack".to_string());
         let next = next_eligible_in_order(&["fullstack"], "fullstack", |_| true);
         assert_eq!(decide_apply_chain(next.as_deref(), &idle), ApplyChain::Stop);
+    }
+
+    #[test]
+    fn chat_next_wraps_and_skips_done() {
+        let done: HashSet<String> = ["back".to_string()].into_iter().collect();
+        assert_eq!(
+            next_chat_profile(ORDER, "fullstack", &done).as_deref(),
+            Some("llm")
+        );
+    }
+
+    #[test]
+    fn chat_next_none_when_all_done() {
+        let done: HashSet<String> = ORDER.iter().map(|s| s.to_string()).collect();
+        assert_eq!(next_chat_profile(ORDER, "fullstack", &done), None);
+    }
+
+    #[test]
+    fn enrich_window_none_never_over() {
+        assert!(!enrich_window_over(Instant::now(), None));
+    }
+
+    #[test]
+    fn enrich_window_open_before_deadline_closed_after() {
+        let now = Instant::now();
+        assert!(!enrich_window_over(now, Some(now + Duration::from_secs(60))));
+        assert!(enrich_window_over(now, Some(now - Duration::from_secs(1))));
     }
 }
