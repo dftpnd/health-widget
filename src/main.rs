@@ -2,6 +2,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashSet;
 
 mod audio;
 mod avatar;
@@ -53,6 +54,35 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
 ];
 
 const APPLY_BATCH_SIZE: i64 = 42;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyChain {
+    Switch(String),
+    Stop,
+}
+
+fn next_eligible_in_order(
+    order: &[&str],
+    from: &str,
+    eligible: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let n = order.len();
+    if n == 0 {
+        return None;
+    }
+    let start = order.iter().position(|k| *k == from).unwrap_or(0);
+    (1..=n).find_map(|i| {
+        let key = order[(start + i) % n];
+        eligible(key).then(|| key.to_string())
+    })
+}
+
+fn decide_apply_chain(next: Option<&str>, apply_idle: &HashSet<String>) -> ApplyChain {
+    match next {
+        Some(n) if !apply_idle.contains(n) => ApplyChain::Switch(n.to_string()),
+        _ => ApplyChain::Stop,
+    }
+}
 
 const TERMINAL_W: f32 = 340.0;
 const TOP_ROW_H: f32 = 64.0;
@@ -3247,3 +3277,69 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[cfg(test)]
+mod apply_chain_tests {
+    use super::{decide_apply_chain, next_eligible_in_order, ApplyChain};
+    use std::collections::HashSet;
+
+    const ORDER: &[&str] = &["fullstack", "back", "llm"];
+
+    #[test]
+    fn next_wraps_to_following_profile() {
+        let next = next_eligible_in_order(ORDER, "fullstack", |_| true);
+        assert_eq!(next.as_deref(), Some("back"));
+    }
+
+    #[test]
+    fn next_skips_ineligible() {
+        let next = next_eligible_in_order(ORDER, "fullstack", |k| k != "back");
+        assert_eq!(next.as_deref(), Some("llm"));
+    }
+
+    #[test]
+    fn next_returns_self_when_only_self_eligible() {
+        let next = next_eligible_in_order(ORDER, "fullstack", |k| k == "fullstack");
+        assert_eq!(next.as_deref(), Some("fullstack"));
+    }
+
+    #[test]
+    fn next_none_when_all_ineligible() {
+        let next = next_eligible_in_order(ORDER, "fullstack", |_| false);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn next_none_on_empty_order() {
+        let next = next_eligible_in_order(&[], "fullstack", |_| true);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn decide_switch_when_next_fresh() {
+        let idle = HashSet::new();
+        assert_eq!(
+            decide_apply_chain(Some("back"), &idle),
+            ApplyChain::Switch("back".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_stop_when_next_none() {
+        let idle = HashSet::new();
+        assert_eq!(decide_apply_chain(None, &idle), ApplyChain::Stop);
+    }
+
+    #[test]
+    fn decide_stop_when_next_already_idle() {
+        let idle: HashSet<String> = ["back".to_string()].into_iter().collect();
+        assert_eq!(decide_apply_chain(Some("back"), &idle), ApplyChain::Stop);
+    }
+
+    #[test]
+    fn single_profile_exhausted_stops_after_one_exit() {
+        let mut idle = HashSet::new();
+        idle.insert("fullstack".to_string());
+        let next = next_eligible_in_order(&["fullstack"], "fullstack", |_| true);
+        assert_eq!(decide_apply_chain(next.as_deref(), &idle), ApplyChain::Stop);
+    }
+}
