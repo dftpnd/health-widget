@@ -860,11 +860,72 @@ impl App {
                 self.reconcile_pilot();
             }
             None => {
-                self.autopilot.want = None;
-                self.autopilot.status =
-                    "все профили исчерпали дневной лимит откликов".to_string();
+                if self.autopilot.cycle {
+                    self.enter_chat_lap();
+                } else {
+                    self.autopilot.want = None;
+                    self.autopilot.status =
+                        "все профили исчерпали дневной лимит откликов".to_string();
+                    self.reconcile_pilot();
+                }
+            }
+        }
+    }
+
+    fn enter_apply_lap(&mut self) {
+        self.autopilot.chat_done.clear();
+        self.autopilot.enrich_until = None;
+        self.autopilot.batch_baseline = self
+            .autopilot
+            .stats
+            .as_ref()
+            .map(|s| s.applied_today)
+            .unwrap_or(0);
+        self.autopilot.apply_idle.clear();
+        self.autopilot.want = Some(pilot::Phase::Apply);
+        self.autopilot.status = "🔄 цикл: отклики".to_string();
+        self.reconcile_pilot();
+    }
+
+    fn enter_chat_lap(&mut self) {
+        self.autopilot.chat_done.clear();
+        self.autopilot.want = Some(pilot::Phase::Chat);
+        self.autopilot.status = "🔄 цикл: чаты".to_string();
+        self.reconcile_pilot();
+    }
+
+    fn enter_scan(&mut self) {
+        self.autopilot.want = Some(pilot::Phase::ScanAll);
+        self.autopilot.status = "🔄 цикл: скан".to_string();
+        self.reconcile_pilot();
+    }
+
+    fn advance_chat(&mut self) {
+        let cur = self.autopilot.profile.clone();
+        self.autopilot.chat_done.insert(cur.clone());
+        let order: Vec<&str> = PILOT_PROFILES.iter().map(|(k, _)| *k).collect();
+        match next_chat_profile(&order, &cur, &self.autopilot.chat_done) {
+            Some(next) => {
+                self.autopilot.profile = next;
+                self.autopilot.scan_mtime = None;
+                self.autopilot.stats = None;
+                self.autopilot.stats_mtime = None;
                 self.reconcile_pilot();
             }
+            None => self.enter_scan(),
+        }
+    }
+
+    fn maybe_end_enrich_window(&mut self) {
+        if !self.autopilot.cycle || self.autopilot.want != Some(pilot::Phase::Enrich) {
+            return;
+        }
+        if enrich_window_over(Instant::now(), self.autopilot.enrich_until) {
+            telemetry::event(
+                "pilot.enrich_window",
+                serde_json::json!({ "reason": "timeout" }),
+            );
+            self.enter_apply_lap();
         }
     }
 
@@ -2644,6 +2705,7 @@ impl eframe::App for App {
 
         self.maybe_reload();
         self.maybe_rotate_profile();
+        self.maybe_end_enrich_window();
 
         self.wheel_ticks = self.win_move.wheel.swap(0, Ordering::Relaxed);
 
@@ -2713,6 +2775,9 @@ impl eframe::App for App {
                 self.autopilot.want = Some(pilot::Phase::Enrich);
                 self.reconcile_pilot();
                 if self.autopilot.proc.is_some() {
+                    if self.autopilot.cycle {
+                        self.autopilot.enrich_until = Some(Instant::now() + ENRICH_WINDOW);
+                    }
                     self.autopilot.status = "скан завершён — дообогащаю пул".to_string();
                 }
             } else if finished == Some(pilot::Phase::Apply)
@@ -2758,11 +2823,19 @@ impl eframe::App for App {
                         self.reconcile_pilot();
                     }
                     ApplyChain::Stop => {
-                        self.autopilot.want = None;
-                        self.autopilot.status =
-                            "все аккаунты обработали пул откликов".to_string();
+                        if self.autopilot.cycle {
+                            self.enter_chat_lap();
+                        } else {
+                            self.autopilot.want = None;
+                            self.autopilot.status =
+                                "все аккаунты обработали пул откликов".to_string();
+                        }
                     }
                 }
+            } else if finished == Some(pilot::Phase::Chat) && self.autopilot.cycle {
+                self.advance_chat();
+            } else if finished == Some(pilot::Phase::Enrich) && self.autopilot.cycle {
+                self.enter_apply_lap();
             } else {
                 self.autopilot.want = None;
                 let msg = match finished {
