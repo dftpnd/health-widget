@@ -2141,6 +2141,7 @@ impl App {
             let mut new_want: Option<Option<Phase>> = None;
             let mut new_profile: Option<String> = None;
             let mut toggle_pause = false;
+            let mut toggle_cycle = false;
             let running = self.autopilot.want.is_some();
             let paused = self.autopilot.proc.as_ref().is_some_and(|p| p.is_paused());
             let status = if paused {
@@ -2176,6 +2177,18 @@ impl App {
                                 }
                             }
                         });
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.autopilot.cycle, "🔄 Цикл")
+                        .on_hover_text(
+                            "Непрерывно: отклики по всем аккаунтам → чаты по всем \
+                             аккаунтам → скан → дообогащение (до 2ч), затем заново",
+                        )
+                        .clicked()
+                    {
+                        toggle_cycle = true;
+                    }
                 });
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -2446,6 +2459,8 @@ impl App {
                 }
             }
             if let Some(w) = new_want {
+                self.autopilot.cycle = false;
+                self.autopilot.enrich_until = None;
                 if w == Some(Phase::Apply) {
                     self.autopilot.batch_baseline =
                         self.autopilot.stats.as_ref().map(|s| s.applied_today).unwrap_or(0);
@@ -2453,6 +2468,18 @@ impl App {
                 }
                 self.autopilot.want = w;
                 self.reconcile_pilot();
+            }
+            if toggle_cycle {
+                if self.autopilot.cycle {
+                    self.autopilot.cycle = false;
+                    self.autopilot.want = None;
+                    self.autopilot.enrich_until = None;
+                    self.autopilot.status = "цикл выключен".to_string();
+                    self.reconcile_pilot();
+                } else {
+                    self.autopilot.cycle = true;
+                    self.enter_apply_lap();
+                }
             }
             if toggle_pause {
                 if let Some(p) = self.autopilot.proc.as_mut() {
