@@ -55,6 +55,7 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
 ];
 
 const APPLY_BATCH_SIZE: i64 = 42;
+const ENRICH_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ApplyChain {
@@ -137,6 +138,9 @@ struct AutopilotState {
     batch_baseline: i64,
     apply_idle: HashSet<String>,
     notify_on: bool,
+    cycle: bool,
+    chat_done: HashSet<String>,
+    enrich_until: Option<Instant>,
 }
 
 struct ShotState {
@@ -515,6 +519,9 @@ impl App {
                 batch_baseline: 0,
                 apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
+                cycle: false,
+                chat_done: HashSet::new(),
+                enrich_until: None,
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
