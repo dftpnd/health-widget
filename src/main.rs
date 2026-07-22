@@ -2336,6 +2336,7 @@ impl App {
                 if w == Some(Phase::Apply) {
                     self.autopilot.batch_baseline =
                         self.autopilot.stats.as_ref().map(|s| s.applied_today).unwrap_or(0);
+                    self.autopilot.apply_idle.clear();
                 }
                 self.autopilot.want = w;
                 self.reconcile_pilot();
@@ -2661,6 +2662,54 @@ impl eframe::App for App {
                 self.reconcile_pilot();
                 if self.autopilot.proc.is_some() {
                     self.autopilot.status = "скан завершён — дообогащаю пул".to_string();
+                }
+            } else if finished == Some(pilot::Phase::Apply)
+                && self.autopilot.want == Some(pilot::Phase::Apply)
+            {
+                let cur = self.autopilot.profile.clone();
+                let made = self
+                    .autopilot
+                    .stats
+                    .as_ref()
+                    .map(|s| s.applied_today - self.autopilot.batch_baseline)
+                    .unwrap_or(0);
+                if made > 0 {
+                    self.autopilot.apply_idle.clear();
+                } else {
+                    self.autopilot.apply_idle.insert(cur.clone());
+                }
+                let next = self.next_eligible_profile(&cur);
+                let decision = decide_apply_chain(next.as_deref(), &self.autopilot.apply_idle);
+                let reason = match (&decision, next.is_none()) {
+                    (ApplyChain::Stop, true) => "all_limited",
+                    (ApplyChain::Stop, false) => "idle_lap",
+                    (ApplyChain::Switch(_), _) => "switch",
+                };
+                telemetry::event(
+                    "pilot.apply_chain",
+                    serde_json::json!({
+                        "from": cur,
+                        "made": made,
+                        "next": next,
+                        "reason": reason,
+                    }),
+                );
+                match decision {
+                    ApplyChain::Switch(next_profile) => {
+                        let path = profile_stats_path(&self.cfg.autopilot_dir, &next_profile);
+                        self.autopilot.batch_baseline =
+                            pilot_stats::load(&path).map(|s| s.applied_today).unwrap_or(0);
+                        self.autopilot.profile = next_profile;
+                        self.autopilot.scan_mtime = None;
+                        self.autopilot.stats = None;
+                        self.autopilot.stats_mtime = None;
+                        self.reconcile_pilot();
+                    }
+                    ApplyChain::Stop => {
+                        self.autopilot.want = None;
+                        self.autopilot.status =
+                            "все аккаунты обработали пул откликов".to_string();
+                    }
                 }
             } else {
                 self.autopilot.want = None;
