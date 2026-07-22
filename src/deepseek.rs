@@ -5,11 +5,60 @@ use std::sync::{Arc, Mutex};
 
 pub type Slot = Arc<Mutex<Option<Result<String, String>>>>;
 
-pub fn ask(ctx: egui::Context, autopilot_dir: PathBuf, system: String, question: String) -> Slot {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    DeepSeek,
+    OpenAi,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "DS",
+            Provider::OpenAi => "OAI",
+        }
+    }
+
+    pub fn toggled(self) -> Provider {
+        match self {
+            Provider::DeepSeek => Provider::OpenAi,
+            Provider::OpenAi => Provider::DeepSeek,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "deepseek",
+            Provider::OpenAi => "openai",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Provider {
+        if s == "openai" {
+            Provider::OpenAi
+        } else {
+            Provider::DeepSeek
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn ask(
+    ctx: egui::Context,
+    autopilot_dir: PathBuf,
+    provider: Provider,
+    system: String,
+    history: Vec<(bool, String)>,
+) -> Slot {
     let slot: Slot = Arc::new(Mutex::new(None));
     let out = slot.clone();
     std::thread::spawn(move || {
-        let res = run(&autopilot_dir, &system, &question);
+        let res = run(&autopilot_dir, provider, &system, &history);
         if let Ok(mut g) = out.lock() {
             *g = Some(res);
         }
@@ -18,26 +67,52 @@ pub fn ask(ctx: egui::Context, autopilot_dir: PathBuf, system: String, question:
     slot
 }
 
-fn run(autopilot_dir: &Path, system: &str, question: &str) -> Result<String, String> {
+fn run(
+    autopilot_dir: &Path,
+    provider: Provider,
+    system: &str,
+    history: &[(bool, String)],
+) -> Result<String, String> {
     let env = read_env(&autopilot_dir.join(".env"));
-    let key = env.get("LLM_API_KEY").cloned().unwrap_or_default();
+    let (key_var, base_var, model_var, default_base, default_model, provider_name) = match provider {
+        Provider::DeepSeek => (
+            "LLM_API_KEY",
+            "LLM_BASE_URL",
+            "LLM_MODEL",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            "DeepSeek",
+        ),
+        Provider::OpenAi => (
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+            "OpenAI",
+        ),
+    };
+    let key = env.get(key_var).cloned().unwrap_or_default();
     if key.is_empty() || key == "EMPTY" {
-        return Err("нет LLM_API_KEY в .env автопилота".into());
+        return Err(format!("нет {key_var} в .env автопилота"));
     }
     let base = env
-        .get("LLM_BASE_URL")
+        .get(base_var)
         .cloned()
-        .unwrap_or_else(|| "https://api.deepseek.com/v1".into());
+        .unwrap_or_else(|| default_base.to_string());
     let model = env
-        .get("LLM_MODEL")
+        .get(model_var)
         .cloned()
-        .unwrap_or_else(|| "deepseek-chat".into());
+        .unwrap_or_else(|| default_model.to_string());
     let system = system.trim();
     let mut messages = Vec::new();
     if !system.is_empty() {
         messages.push(serde_json::json!({ "role": "system", "content": system }));
     }
-    messages.push(serde_json::json!({ "role": "user", "content": question }));
+    for (is_user, text) in history {
+        let role = if *is_user { "user" } else { "assistant" };
+        messages.push(serde_json::json!({ "role": role, "content": text }));
+    }
     let payload = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -67,7 +142,7 @@ fn run(autopilot_dir: &Path, system: &str, question: &str) -> Result<String, Str
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
     {
-        return Err(format!("DeepSeek: {msg}"));
+        return Err(format!("{provider_name}: {msg}"));
     }
     body.get("choices")
         .and_then(|c| c.get(0))
@@ -76,7 +151,7 @@ fn run(autopilot_dir: &Path, system: &str, question: &str) -> Result<String, Str
         .and_then(|c| c.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "пустой ответ DeepSeek".to_string())
+        .ok_or_else(|| format!("пустой ответ {provider_name}"))
 }
 
 fn read_env(path: &Path) -> HashMap<String, String> {

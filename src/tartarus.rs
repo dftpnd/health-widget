@@ -17,9 +17,6 @@ const EV_SYN: u16 = 0;
 
 const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
     (KeyCode::KEY_1, &[KeyCode::KEY_F13]),
-    (KeyCode::KEY_2, &[KeyCode::KEY_F14]),
-    (KeyCode::KEY_3, &[KeyCode::KEY_F15]),
-    (KeyCode::KEY_4, &[KeyCode::KEY_F16]),
     (KeyCode::KEY_5, &[KeyCode::KEY_F17]),
     (KeyCode::KEY_TAB, &[KeyCode::KEY_F18]),
     (KeyCode::KEY_Q, &[KeyCode::KEY_F19]),
@@ -47,12 +44,12 @@ const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
 pub struct Handles {
     pub shot_request: Arc<AtomicBool>,
     // pub cursor_warp_request: Arc<AtomicBool>,
-    pub clear_mic: Arc<AtomicBool>,
-    pub clear_zoom: Arc<AtomicBool>,
-    pub copy_mic: Arc<AtomicBool>,
-    pub copy_zoom: Arc<AtomicBool>,
+    pub send_mic: Arc<AtomicBool>,
+    pub send_zoom: Arc<AtomicBool>,
+    pub send_mic_p2: Arc<AtomicBool>,
     pub clear_chat: Arc<AtomicBool>,
     pub paste_code: Arc<AtomicBool>,
+    pub switch_provider: Arc<AtomicBool>,
     pub move_dx: Arc<AtomicI32>,
     pub move_dy: Arc<AtomicI32>,
     pub move_next: Arc<AtomicBool>,
@@ -197,22 +194,17 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             return;
         }
         if code == KeyCode::KEY_2.0 {
-            h.clear_mic.store(true, Ordering::Relaxed);
+            h.send_mic.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
         if code == KeyCode::KEY_Q.0 {
-            h.clear_zoom.store(true, Ordering::Relaxed);
+            h.send_zoom.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
         if code == KeyCode::KEY_3.0 {
-            h.copy_mic.store(true, Ordering::Relaxed);
-            h.ctx.request_repaint();
-            return;
-        }
-        if code == KeyCode::KEY_W.0 {
-            h.copy_zoom.store(true, Ordering::Relaxed);
+            h.send_mic_p2.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
             return;
         }
@@ -226,14 +218,19 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
+        if code == KeyCode::KEY_4.0 {
+            h.switch_provider.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
     } else if matches!(code, c if c == KeyCode::KEY_5.0
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0
-        || c == KeyCode::KEY_3.0
-        || c == KeyCode::KEY_W.0
         || c == KeyCode::KEY_A.0
-        || c == KeyCode::KEY_R.0)
+        || c == KeyCode::KEY_R.0
+        || c == KeyCode::KEY_4.0
+        || c == KeyCode::KEY_3.0)
     {
         return;
     }

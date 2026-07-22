@@ -31,6 +31,7 @@ pub struct Feeder {
     prev: f32,
     out: Vec<u8>,
     dead: bool,
+    channel: &'static str,
 }
 
 impl Feeder {
@@ -54,8 +55,14 @@ impl Feeder {
         self.pos -= len;
         self.prev = s[s.len() - 1];
 
-        if !self.out.is_empty() && self.stdin.write_all(&self.out).is_err() {
-            self.dead = true;
+        if !self.out.is_empty() {
+            if let Err(e) = self.stdin.write_all(&self.out) {
+                self.dead = true;
+                crate::telemetry::event(
+                    "stt.feed.dead",
+                    serde_json::json!({ "channel": self.channel, "err": e.to_string() }),
+                );
+            }
         }
     }
 }
@@ -88,9 +95,26 @@ impl Transcriber {
             .arg(&model)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .ok()?;
+
+        let pid = child.id();
+        if let Some(errout) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(errout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.trim().is_empty() => crate::telemetry::event(
+                            "stt.stderr",
+                            serde_json::json!({ "channel": channel, "pid": pid, "line": l }),
+                        ),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
@@ -102,10 +126,14 @@ impl Transcriber {
             let fresh = fresh.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
+                let mut reason = "eof";
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
-                        Err(_) => break,
+                        Err(_) => {
+                            reason = "read_err";
+                            break;
+                        }
                     };
                     let v: serde_json::Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
@@ -132,6 +160,10 @@ impl Transcriber {
                         }
                     }
                 }
+                crate::telemetry::event(
+                    "stt.reader.end",
+                    serde_json::json!({ "channel": channel, "reason": reason }),
+                );
             });
         }
 
@@ -142,6 +174,7 @@ impl Transcriber {
             prev: 0.0,
             out: Vec::with_capacity(4096),
             dead: false,
+            channel,
         };
         crate::telemetry::event(
             "stt.start",

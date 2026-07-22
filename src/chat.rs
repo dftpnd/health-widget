@@ -37,6 +37,13 @@ impl Chat {
         self.pending = pending;
     }
 
+    pub fn history(&self) -> Vec<(bool, String)> {
+        self.messages
+            .iter()
+            .map(|m| (matches!(m.role, Role::Me), m.text.clone()))
+            .collect()
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
         self.pending = false;

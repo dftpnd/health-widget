@@ -2,6 +2,7 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::path::Path;
@@ -147,9 +148,51 @@ pub fn list_programs() -> Vec<Device> {
     res
 }
 
+fn spawn_pw_record(
+    target: Option<&str>,
+    capture_sink: bool,
+    channel: &'static str,
+) -> Option<(Child, std::process::ChildStdout)> {
+    let mut cmd = Command::new("pw-record");
+    cmd.args(record_args(target, capture_sink));
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::telemetry::error("audio.fail", &format!("{channel}: {e}"));
+            return None;
+        }
+    };
+
+    let pid = child.id();
+    crate::telemetry::event(
+        "audio.pw_record.spawn",
+        serde_json::json!({ "channel": channel, "pid": pid, "target": target, "sink_monitor": capture_sink }),
+    );
+
+    if let Some(errout) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(errout);
+            for line in std::io::BufRead::lines(reader) {
+                match line {
+                    Ok(l) if !l.trim().is_empty() => crate::telemetry::event(
+                        "audio.pw_record.stderr",
+                        serde_json::json!({ "channel": channel, "pid": pid, "line": l }),
+                    ),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    let stdout = child.stdout.take()?;
+    Some((child, stdout))
+}
+
 pub struct AudioMonitor {
     samples: Arc<Mutex<VecDeque<f32>>>,
-    child: Child,
+    shutdown: Arc<AtomicBool>,
+    current_child: Arc<Mutex<Option<Child>>>,
     transcriber: Option<Transcriber>,
     recorder: Arc<Mutex<Option<WavRecorder>>>,
     channel: &'static str,
@@ -178,21 +221,10 @@ impl AudioMonitor {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Option<Self> {
-        let mut cmd = Command::new("pw-record");
-        cmd.args(record_args(target, capture_sink));
-        let mut child = match cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                crate::telemetry::error("audio.fail", &format!("{channel}: {e}"));
-                return None;
-            }
-        };
+        let target_owned = target.map(|s| s.to_string());
+        let (first_child, first_stdout) =
+            spawn_pw_record(target_owned.as_deref(), capture_sink, channel)?;
 
-        let mut stdout = child.stdout.take()?;
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(CAP)));
         let buf = samples.clone();
 
@@ -202,54 +234,138 @@ impl AudioMonitor {
         let last_signal = Arc::new(Mutex::new(std::time::Instant::now()));
         let sig = last_signal.clone();
 
-        let (transcriber, mut feeder) = match Transcriber::start(RATE_HZ, channel, log) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let current_child = Arc::new(Mutex::new(Some(first_child)));
+
+        let (transcriber, feeder) = match Transcriber::start(RATE_HZ, channel, log) {
             Some((t, f)) => (Some(t), Some(f)),
             None => (None, None),
         };
 
+        let sd = shutdown.clone();
+        let cc = current_child.clone();
         std::thread::spawn(move || {
+            let mut feeder = feeder;
             let mut acc: Vec<u8> = Vec::with_capacity(8192);
             let mut raw = [0u8; 4096];
             let mut batch: Vec<f32> = Vec::with_capacity(2048);
+            let mut pending: Option<std::process::ChildStdout> = Some(first_stdout);
             loop {
-                match stdout.read(&mut raw) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        acc.extend_from_slice(&raw[..n]);
-                        let full = acc.len() / 4 * 4;
-                        if full == 0 {
+                if sd.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut stdout = match pending.take() {
+                    Some(s) => s,
+                    None => match spawn_pw_record(target_owned.as_deref(), capture_sink, channel) {
+                        Some((child, out)) => {
+                            if let Ok(mut g) = cc.lock() {
+                                if let Some(mut old) = g.replace(child) {
+                                    let _ = old.wait();
+                                }
+                            }
+                            if sd.load(Ordering::Relaxed) {
+                                if let Ok(mut g) = cc.lock() {
+                                    if let Some(mut c) = g.take() {
+                                        let _ = c.kill();
+                                        let _ = c.wait();
+                                    }
+                                }
+                                break;
+                            }
+                            out
+                        }
+                        None => {
+                            if sd.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(2));
                             continue;
                         }
-                        batch.clear();
-                        let mut i = 0;
-                        while i < full {
-                            batch.push(f32::from_le_bytes([acc[i], acc[i + 1], acc[i + 2], acc[i + 3]]));
-                            i += 4;
+                    },
+                };
+
+                let mut total_bytes: u64 = 0;
+                let mut got_first = false;
+                let reason;
+                loop {
+                    match stdout.read(&mut raw) {
+                        Ok(0) => {
+                            reason = "eof".to_string();
+                            break;
                         }
-                        if has_signal(&batch) {
-                            if let Ok(mut t) = sig.lock() {
-                                *t = std::time::Instant::now();
+                        Err(e) => {
+                            reason = format!("read_err: {e}");
+                            break;
+                        }
+                        Ok(n) => {
+                            total_bytes += n as u64;
+                            if !got_first {
+                                got_first = true;
+                                crate::telemetry::event(
+                                    "audio.capture.first_bytes",
+                                    serde_json::json!({ "channel": channel, "bytes": n }),
+                                );
                             }
-                        }
-                        if let Ok(mut g) = buf.lock() {
-                            for &v in &batch {
-                                if g.len() >= CAP {
-                                    g.pop_front();
+                            acc.extend_from_slice(&raw[..n]);
+                            let full = acc.len() / 4 * 4;
+                            if full == 0 {
+                                continue;
+                            }
+                            batch.clear();
+                            let mut i = 0;
+                            while i < full {
+                                batch.push(f32::from_le_bytes([acc[i], acc[i + 1], acc[i + 2], acc[i + 3]]));
+                                i += 4;
+                            }
+                            if has_signal(&batch) {
+                                if let Ok(mut t) = sig.lock() {
+                                    *t = std::time::Instant::now();
                                 }
-                                g.push_back(v);
                             }
-                        }
-                        if let Some(f) = feeder.as_mut() {
-                            f.feed(&batch);
-                        }
-                        if let Ok(mut r) = rec.lock() {
-                            if let Some(w) = r.as_mut() {
-                                w.write(&batch);
+                            if let Ok(mut g) = buf.lock() {
+                                for &v in &batch {
+                                    if g.len() >= CAP {
+                                        g.pop_front();
+                                    }
+                                    g.push_back(v);
+                                }
                             }
+                            if let Some(f) = feeder.as_mut() {
+                                f.feed(&batch);
+                            }
+                            if let Ok(mut r) = rec.lock() {
+                                if let Some(w) = r.as_mut() {
+                                    w.write(&batch);
+                                }
+                            }
+                            acc.drain(..full);
                         }
-                        acc.drain(..full);
                     }
                 }
+                if let Ok(mut g) = cc.lock() {
+                    if let Some(mut c) = g.take() {
+                        let _ = c.wait();
+                    }
+                }
+                crate::telemetry::event(
+                    "audio.capture.end",
+                    serde_json::json!({
+                        "channel": channel,
+                        "reason": reason,
+                        "total_bytes": total_bytes,
+                        "got_first": got_first,
+                    }),
+                );
+                acc.clear();
+                if sd.load(Ordering::Relaxed) {
+                    break;
+                }
+                crate::telemetry::event(
+                    "audio.capture.restart",
+                    serde_json::json!({ "channel": channel, "after": reason }),
+                );
+                let backoff = if got_first { 300 } else { 2000 };
+                std::thread::sleep(std::time::Duration::from_millis(backoff));
             }
         });
 
@@ -257,7 +373,15 @@ impl AudioMonitor {
             "audio.start",
             serde_json::json!({ "channel": channel, "target": target, "sink_monitor": capture_sink }),
         );
-        Some(Self { samples, child, transcriber, recorder, channel, last_signal })
+        Some(Self {
+            samples,
+            shutdown,
+            current_child,
+            transcriber,
+            recorder,
+            channel,
+            last_signal,
+        })
     }
 
     pub fn silent_for(&self) -> std::time::Duration {
@@ -318,8 +442,13 @@ impl AudioMonitor {
 impl Drop for AudioMonitor {
     fn drop(&mut self) {
         crate::telemetry::event("audio.stop", serde_json::json!({ "channel": self.channel }));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Ok(mut g) = self.current_child.lock() {
+            if let Some(mut c) = g.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
     }
 }
 

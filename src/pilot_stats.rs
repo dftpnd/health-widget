@@ -10,6 +10,8 @@ pub struct PilotStats {
     #[serde(default)]
     pub applied_today: i64,
     #[serde(default)]
+    pub daily_limit: i64,
+    #[serde(default)]
     pub chats_acted: i64,
 }
 

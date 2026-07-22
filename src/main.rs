@@ -18,6 +18,7 @@ mod pilot_scan;
 mod pilot_stats;
 mod pilot_notify;
 mod kwin_shot;
+mod prompts;
 mod recorder;
 mod screenshot;
 mod state;
@@ -48,17 +49,10 @@ const WEB_WIN_H: f32 = 320.0;
 const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
     ("back", "Backend"),
-    ("bulat", "Булат"),
+    ("llm", "LLM"),
 ];
 
-const PILOT_STRICTNESS: &[(&str, &str, f32)] = &[
-    ("strict", "Строго", 0.55),
-    ("medium", "Средне", 0.50),
-    ("any", "Любые", 0.0),
-    ("fresh", "🆕 Свежие", 0.0),
-];
-const PILOT_FRESH_KEY: &str = "fresh";
-const DEFAULT_STRICTNESS: &str = "medium";
+const APPLY_BATCH_SIZE: i64 = 42;
 
 const TERMINAL_W: f32 = 340.0;
 const TOP_ROW_H: f32 = 64.0;
@@ -95,12 +89,12 @@ struct AutopilotState {
     proc: Option<pilot::Pilot>,
     want: Option<pilot::Phase>,
     profile: String,
-    strictness: String,
     status: String,
     stats: Option<pilot_stats::PilotStats>,
     stats_mtime: Option<std::time::SystemTime>,
     scan: Option<pilot_scan::ScanStatus>,
     scan_mtime: Option<std::time::SystemTime>,
+    batch_baseline: i64,
     notify_on: bool,
 }
 
@@ -119,20 +113,18 @@ struct AvatarState {
 
 #[derive(Clone)]
 struct TranscriptKeys {
-    clear_mic: Arc<AtomicBool>,
-    clear_zoom: Arc<AtomicBool>,
-    copy_mic: Arc<AtomicBool>,
-    copy_zoom: Arc<AtomicBool>,
+    send_mic: Arc<AtomicBool>,
+    send_zoom: Arc<AtomicBool>,
+    send_mic_p2: Arc<AtomicBool>,
     clear_chat: Arc<AtomicBool>,
 }
 
 impl TranscriptKeys {
     fn new() -> Self {
         Self {
-            clear_mic: Arc::new(AtomicBool::new(false)),
-            clear_zoom: Arc::new(AtomicBool::new(false)),
-            copy_mic: Arc::new(AtomicBool::new(false)),
-            copy_zoom: Arc::new(AtomicBool::new(false)),
+            send_mic: Arc::new(AtomicBool::new(false)),
+            send_zoom: Arc::new(AtomicBool::new(false)),
+            send_mic_p2: Arc::new(AtomicBool::new(false)),
             clear_chat: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -188,6 +180,7 @@ struct App {
     shot: ShotState,
     // cursor_warp_request: Arc<AtomicBool>,
     paste_code: Arc<AtomicBool>,
+    switch_provider: Arc<AtomicBool>,
     // prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     transcript_keys: TranscriptKeys,
     win_move: WindowMove,
@@ -202,9 +195,11 @@ struct App {
     chat: chat::Chat,
     chat_collapsed: bool,
     deepseek: Option<deepseek::Slot>,
-    system_prompt: String,
-    prompt_draft: String,
+    prompts: prompts::Prompts,
+    prompt_draft_1: String,
+    prompt_draft_2: String,
     prompt_open: bool,
+    llm_provider: deepseek::Provider,
     help_open: bool,
     clipboard_preview: Arc<std::sync::Mutex<String>>,
     clip_open: bool,
@@ -234,10 +229,6 @@ impl App {
             .pilot_profile
             .clone()
             .unwrap_or_else(|| "fullstack".to_string());
-        let pilot_strictness = st
-            .pilot_strictness
-            .clone()
-            .unwrap_or_else(|| DEFAULT_STRICTNESS.to_string());
 
         let shot_status: Arc<std::sync::Mutex<screenshot::ShotStatus>> =
             Arc::new(std::sync::Mutex::new(screenshot::ShotStatus::Idle));
@@ -245,6 +236,7 @@ impl App {
 
         // let cursor_warp_request = Arc::new(AtomicBool::new(false));
         let paste_code = Arc::new(AtomicBool::new(false));
+        let switch_provider = Arc::new(AtomicBool::new(false));
         let transcript_keys = TranscriptKeys::new();
         let win_move = WindowMove::new();
 
@@ -282,12 +274,12 @@ impl App {
         tartarus::spawn(tartarus::Handles {
             shot_request: shot_request.clone(),
             // cursor_warp_request: cursor_warp_request.clone(),
-            clear_mic: transcript_keys.clear_mic.clone(),
-            clear_zoom: transcript_keys.clear_zoom.clone(),
-            copy_mic: transcript_keys.copy_mic.clone(),
-            copy_zoom: transcript_keys.copy_zoom.clone(),
+            send_mic: transcript_keys.send_mic.clone(),
+            send_zoom: transcript_keys.send_zoom.clone(),
+            send_mic_p2: transcript_keys.send_mic_p2.clone(),
             clear_chat: transcript_keys.clear_chat.clone(),
             paste_code: paste_code.clone(),
+            switch_provider: switch_provider.clone(),
             move_dx: win_move.dx.clone(),
             move_dy: win_move.dy.clone(),
             move_next: win_move.next.clone(),
@@ -474,12 +466,12 @@ impl App {
                 proc: None,
                 want: None,
                 profile: pilot_profile,
-                strictness: pilot_strictness,
                 status: String::new(),
                 stats: None,
                 stats_mtime: None,
                 scan: None,
                 scan_mtime: None,
+                batch_baseline: 0,
                 notify_on: pilot_notify_on,
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
@@ -494,6 +486,7 @@ impl App {
             },
             // cursor_warp_request,
             paste_code,
+            switch_provider,
             // prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             transcript_keys,
             win_move,
@@ -508,9 +501,15 @@ impl App {
             chat: chat::Chat::default(),
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
-            system_prompt: String::new(),
-            prompt_draft: String::new(),
+            prompts: prompts::load(),
+            prompt_draft_1: String::new(),
+            prompt_draft_2: String::new(),
             prompt_open: false,
+            llm_provider: st
+                .llm_provider
+                .as_deref()
+                .map(deepseek::Provider::from_str)
+                .unwrap_or(deepseek::Provider::DeepSeek),
             help_open: false,
             clipboard_preview,
             clip_open: st.clip_open,
@@ -625,18 +624,6 @@ impl App {
         }
     }
 
-    fn pilot_min_sim(&self) -> f32 {
-        PILOT_STRICTNESS
-            .iter()
-            .find(|(k, _, _)| *k == self.autopilot.strictness)
-            .map(|(_, _, v)| *v)
-            .unwrap_or(0.0)
-    }
-
-    fn pilot_apply_fresh(&self) -> bool {
-        self.autopilot.strictness == PILOT_FRESH_KEY
-    }
-
     fn reconcile_pilot(&mut self) {
         let desired = match self.autopilot.want.clone() {
             None => {
@@ -652,10 +639,7 @@ impl App {
         let same_phase = self.autopilot.proc.as_ref().map(|p| p.phase()) == Some(&desired);
         let same_profile =
             self.autopilot.proc.as_ref().map(|p| p.profile()) == Some(Some(self.autopilot.profile.as_str()));
-        let same_sim = self.autopilot.proc.as_ref().map(|p| p.min_sim()) == Some(self.pilot_min_sim());
-        let same_order =
-            self.autopilot.proc.as_ref().map(|p| p.apply_fresh()) == Some(self.pilot_apply_fresh());
-        if same_phase && same_profile && same_sim && same_order {
+        if same_phase && same_profile {
             return;
         }
         self.autopilot.proc = None;
@@ -664,8 +648,6 @@ impl App {
             &self.cfg.autopilot_bin,
             desired,
             Some(self.autopilot.profile.as_str()),
-            Some(self.pilot_min_sim()),
-            self.pilot_apply_fresh(),
         );
         if self.autopilot.proc.is_none() {
             self.autopilot.want = None;
@@ -713,7 +695,7 @@ impl App {
             zoom_on: self.audio.zoom.is_some(),
             pinned: self.pinned,
             pilot_profile: Some(self.autopilot.profile.clone()),
-            pilot_strictness: Some(self.autopilot.strictness.clone()),
+            llm_provider: Some(self.llm_provider.to_string()),
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             scopes_collapsed: self.scopes_collapsed,
@@ -758,6 +740,64 @@ impl App {
         }
         self.autopilot.notify_on =
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
+    }
+
+    fn maybe_rotate_profile(&mut self) {
+        if self.autopilot.want != Some(pilot::Phase::Apply) {
+            return;
+        }
+        let Some(stats) = &self.autopilot.stats else {
+            return;
+        };
+        let over_limit = stats.daily_limit > 0 && stats.applied_today >= stats.daily_limit;
+        let batch_done =
+            stats.applied_today - self.autopilot.batch_baseline >= APPLY_BATCH_SIZE;
+        if !over_limit && !batch_done {
+            return;
+        }
+        let cur = self.autopilot.profile.clone();
+        let order: Vec<String> = PILOT_PROFILES.iter().map(|(k, _)| k.to_string()).collect();
+        let start = order.iter().position(|k| *k == cur).unwrap_or(0);
+        let n = order.len();
+        // Идём по кругу от следующего профиля; последний шаг (i == n) — снова cur,
+        // это позволяет продолжить тот же профиль новым батчем, если круг замкнулся
+        // и свободен только он сам.
+        let next = (1..=n).find_map(|i| {
+            let key = &order[(start + i) % n];
+            let path = profile_stats_path(&self.cfg.autopilot_dir, key);
+            let eligible = pilot_stats::load(&path)
+                .map(|s| s.daily_limit <= 0 || s.applied_today < s.daily_limit)
+                .unwrap_or(true);
+            eligible.then(|| key.clone())
+        });
+        telemetry::event(
+            "pilot.rotate_profile",
+            serde_json::json!({
+                "from": cur,
+                "applied_today": stats.applied_today,
+                "daily_limit": stats.daily_limit,
+                "reason": if over_limit { "daily_limit" } else { "batch" },
+                "next": next,
+            }),
+        );
+        match next {
+            Some(next) => {
+                let path = profile_stats_path(&self.cfg.autopilot_dir, &next);
+                self.autopilot.batch_baseline =
+                    pilot_stats::load(&path).map(|s| s.applied_today).unwrap_or(0);
+                self.autopilot.profile = next;
+                self.autopilot.scan_mtime = None;
+                self.autopilot.stats = None;
+                self.autopilot.stats_mtime = None;
+                self.reconcile_pilot();
+            }
+            None => {
+                self.autopilot.want = None;
+                self.autopilot.status =
+                    "все профили исчерпали дневной лимит откликов".to_string();
+                self.reconcile_pilot();
+            }
+        }
     }
 
     fn show_shot_overlay(&mut self, ctx: &egui::Context) {
@@ -880,9 +920,22 @@ impl App {
                 {
                     self.prompt_open = !self.prompt_open;
                     if self.prompt_open {
-                        self.prompt_draft = self.system_prompt.clone();
+                        self.prompt_draft_1 = self.prompts.prompt_1.clone();
+                        self.prompt_draft_2 = self.prompts.prompt_2.clone();
                     }
                 }
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 1.0;
+                    for p in [deepseek::Provider::DeepSeek, deepseek::Provider::OpenAi] {
+                        if ui
+                            .selectable_label(self.llm_provider == p, p.label())
+                            .on_hover_text(format!("LLM для чата: {p}"))
+                            .clicked()
+                        {
+                            self.llm_provider = p;
+                        }
+                    }
+                });
                 if let Some(e) = &self.webmic_error {
                     ui.label(
                         egui::RichText::new(format!("✖ {e}"))
@@ -965,7 +1018,7 @@ impl App {
         let modal = egui::Modal::new(egui::Id::new("prompt_editor")).show(ctx, |ui| {
             ui.set_max_width(420.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("📝 Системный промпт").size(15.0).strong().color(accent));
+                ui.label(egui::RichText::new("📝 Системные промпты").size(15.0).strong().color(accent));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("✕").clicked() {
                         self.prompt_open = false;
@@ -973,26 +1026,44 @@ impl App {
                 });
             });
             ui.add_space(6.0);
-            egui::ScrollArea::vertical()
-                .id_salt("prompt_editor_scroll")
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.prompt_draft)
-                            .hint_text("вставь сюда промпт для чата…")
-                            .font(egui::FontId::proportional(13.0))
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(10),
-                    );
+            for (slot, label, draft) in [
+                (1u8, "Промпт 1", &mut self.prompt_draft_1),
+                (2u8, "Промпт 2", &mut self.prompt_draft_2),
+            ] {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.prompts.active == slot, format!("● {label}"))
+                        .on_hover_text("Использовать этот промпт в чате")
+                        .clicked()
+                    {
+                        self.prompts.active = slot;
+                        prompts::save(&self.prompts);
+                    }
                 });
-            ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("prompt_editor_scroll_{slot}"))
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(draft)
+                                .hint_text("вставь сюда промпт для чата…")
+                                .font(egui::FontId::proportional(13.0))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(6),
+                        );
+                    });
+                ui.add_space(6.0);
+            }
             ui.horizontal(|ui| {
                 if ui.button("💾 Сохранить").clicked() {
-                    self.system_prompt = self.prompt_draft.clone();
+                    self.prompts.prompt_1 = self.prompt_draft_1.clone();
+                    self.prompts.prompt_2 = self.prompt_draft_2.clone();
+                    prompts::save(&self.prompts);
                     self.prompt_open = false;
                 }
-                let saved = self.prompt_draft == self.system_prompt;
-                if saved && !self.system_prompt.trim().is_empty() {
+                let saved = self.prompt_draft_1 == self.prompts.prompt_1
+                    && self.prompt_draft_2 == self.prompts.prompt_2;
+                if saved && !self.prompts.active_text().trim().is_empty() {
                     ui.label(
                         egui::RichText::new("✔ применён")
                             .size(10.0)
@@ -1002,7 +1073,7 @@ impl App {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Пусто — вопрос уходит в модель без системного промпта. Живёт до перезапуска виджета.")
+                egui::RichText::new("Пусто — вопрос уходит в модель без системного промпта. Хранится в ~/.health-widget-prompts.json, переживает перезапуск виджета.")
                     .size(10.0)
                     .italics()
                     .color(egui::Color32::from_rgb(120, 126, 138)),
@@ -1016,10 +1087,9 @@ impl App {
     fn draw_keys_help(&mut self, ctx: &egui::Context) {
         let binds: &[(&str, &str)] = &[
             ("02", "🧹 Очистить транскрипт микрофона"),
-            ("03", "📤 Копировать микрофон + отправить в чат"),
+            ("04", "🔀 Свитч LLM для чата: DeepSeek ↔ OpenAI"),
             ("05", "📷 Скриншот"),
             ("07", "🧹 Очистить транскрипт зума"),
-            ("08", "📤 Копировать зум + отправить в чат"),
             ("10", "⌨ Печатать код из буфера в позиции курсора"),
             ("12", "🗑 Очистить чат"),
             ("20", "🎛 Цель D-pad: виджет → веб-мик → чат"),
@@ -1928,7 +1998,6 @@ impl App {
             use pilot::Phase;
             let mut new_want: Option<Option<Phase>> = None;
             let mut new_profile: Option<String> = None;
-            let mut new_strictness: Option<String> = None;
             let mut toggle_pause = false;
             let running = self.autopilot.want.is_some();
             let paused = self.autopilot.proc.as_ref().is_some_and(|p| p.is_paused());
@@ -2091,31 +2160,6 @@ impl App {
                 });
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("🎯 Отклик на:").size(11.0))
-                        .on_hover_text(
-                            "Порог соответствия вакансии твоему резюме (косинус \
-                             эмбеддингов). Ниже порога — не откликаемся.",
-                        );
-                    for (key, label, thr) in PILOT_STRICTNESS {
-                        let active = self.autopilot.strictness == *key;
-                        let hint = if *key == PILOT_FRESH_KEY {
-                            "Без порога — самые свежие вакансии пула по дате публикации"
-                                .to_string()
-                        } else if *thr > 0.0 {
-                            format!("Порог ≥ {thr:.2} — только достаточно близкие вакансии")
-                        } else {
-                            "Без порога — откликаться на весь пул (по убыванию похожести)"
-                                .to_string()
-                        };
-                        if ui
-                            .selectable_label(active, *label)
-                            .on_hover_text(hint)
-                            .clicked()
-                            && !active
-                        {
-                            new_strictness = Some((*key).to_string());
-                        }
-                    }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -2125,8 +2169,11 @@ impl App {
                             } else {
                                 (
                                     "▶ Начать",
-                                    "Начать отклики по соответствию резюме \
-                                     (с выбранной строгостью)",
+                                    "Начать отклики по соответствию резюме: \
+                                     свежее и более релевантное (по навыкам и \
+                                     заголовку) — впереди. Каждые 42 отклика \
+                                     переключается на другой профиль по кругу, \
+                                     пока не упрутся все дневные лимиты.",
                                 )
                             };
                             if ui.button(lbl).on_hover_text(hint).clicked() {
@@ -2256,13 +2303,11 @@ impl App {
                     self.reconcile_pilot();
                 }
             }
-            if let Some(s) = new_strictness {
-                self.autopilot.strictness = s;
-                if self.autopilot.want == Some(Phase::Apply) {
-                    self.reconcile_pilot();
-                }
-            }
             if let Some(w) = new_want {
+                if w == Some(Phase::Apply) {
+                    self.autopilot.batch_baseline =
+                        self.autopilot.stats.as_ref().map(|s| s.applied_today).unwrap_or(0);
+                }
                 self.autopilot.want = w;
                 self.reconcile_pilot();
             }
@@ -2279,40 +2324,39 @@ impl App {
     }
 
     fn process_transcript_keys(&mut self, ctx: &egui::Context) {
-        if self.transcript_keys.clear_mic.swap(false, Ordering::Relaxed) {
-            if let Some(mon) = &self.audio.mic {
-                mon.clear_transcript();
-            }
-        }
-        if self.transcript_keys.clear_zoom.swap(false, Ordering::Relaxed) {
-            if let Some(mon) = &self.audio.zoom {
-                mon.clear_transcript();
-            }
-        }
-        if self.transcript_keys.copy_mic.swap(false, Ordering::Relaxed) {
-            let txt = self.audio.mic.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-            if let Some(txt) = txt {
-                if !txt.is_empty() {
-                    telemetry::event("keys.copy", serde_json::json!({ "channel": CH_MIC, "len": txt.len() }));
-                    clip::set_async(txt.clone());
-                    self.start_deepseek(ctx.clone(), txt);
-                }
-            }
-        }
-        if self.transcript_keys.copy_zoom.swap(false, Ordering::Relaxed) {
-            let txt = self.audio.zoom.as_ref().and_then(|m| m.transcript()).map(|(f, _)| f);
-            if let Some(txt) = txt {
-                if !txt.is_empty() {
-                    telemetry::event("keys.copy", serde_json::json!({ "channel": CH_ZOOM, "len": txt.len() }));
-                    clip::set_async(txt.clone());
-                    self.start_deepseek(ctx.clone(), txt);
-                }
-            }
-        }
         if self.transcript_keys.clear_chat.swap(false, Ordering::Relaxed) {
             self.chat.clear();
             self.deepseek = None;
         }
+        if self.transcript_keys.send_mic.swap(false, Ordering::Relaxed) {
+            self.chat.clear();
+            self.deepseek = None;
+            self.send_transcript(ctx.clone(), true, self.prompts.prompt_1.clone());
+        }
+        if self.transcript_keys.send_zoom.swap(false, Ordering::Relaxed) {
+            self.chat.clear();
+            self.deepseek = None;
+            self.send_transcript(ctx.clone(), false, self.prompts.prompt_1.clone());
+        }
+        if self.transcript_keys.send_mic_p2.swap(false, Ordering::Relaxed) {
+            self.send_transcript(ctx.clone(), true, self.prompts.prompt_2.clone());
+        }
+    }
+
+    fn send_transcript(&mut self, ctx: egui::Context, mic: bool, prompt: String) {
+        let mon = if mic { &self.audio.mic } else { &self.audio.zoom };
+        let text = mon
+            .as_ref()
+            .and_then(|m| m.transcript())
+            .map(|(finals, _)| finals.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(m) = mon {
+            m.clear_transcript();
+        }
+        self.start_deepseek_with_prompt(ctx, prompt, text);
     }
 
     fn move_target_available(&self, target: MoveTarget) -> bool {
@@ -2429,6 +2473,11 @@ impl App {
     }
 
     fn start_deepseek(&mut self, ctx: egui::Context, question: String) {
+        let prompt = self.prompts.active_text().to_string();
+        self.start_deepseek_with_prompt(ctx, prompt, question);
+    }
+
+    fn start_deepseek_with_prompt(&mut self, ctx: egui::Context, prompt: String, question: String) {
         let q = question.trim().to_string();
         if q.is_empty() || self.deepseek.is_some() {
             return;
@@ -2437,14 +2486,15 @@ impl App {
             "chat.ask",
             serde_json::json!({ "len": q.len(), "profile": self.autopilot.profile }),
         );
-        self.chat.push_user(q.clone());
+        self.chat.push_user(q);
         self.chat.set_pending(true);
         self.chat_collapsed = false;
         self.deepseek = Some(deepseek::ask(
             ctx,
             self.cfg.autopilot_dir.clone(),
-            self.system_prompt.clone(),
-            q,
+            self.llm_provider,
+            prompt,
+            self.chat.history(),
         ));
     }
 
@@ -2511,6 +2561,7 @@ impl eframe::App for App {
         }
 
         self.maybe_reload();
+        self.maybe_rotate_profile();
 
         self.wheel_ticks = self.win_move.wheel.swap(0, Ordering::Relaxed);
 
@@ -2556,6 +2607,14 @@ impl eframe::App for App {
 
         if self.paste_code.swap(false, Ordering::Relaxed) {
             type_clipboard_code();
+        }
+
+        if self.switch_provider.swap(false, Ordering::Relaxed) {
+            self.llm_provider = self.llm_provider.toggled();
+            telemetry::event(
+                "hotkey.switch_provider",
+                serde_json::json!({ "provider": self.llm_provider.to_string() }),
+            );
         }
 
         if self.autopilot.proc.as_mut().is_some_and(|p| !p.alive()) {

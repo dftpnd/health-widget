@@ -19,7 +19,7 @@ pub struct State {
     #[serde(default)]
     pub pilot_profile: Option<String>,
     #[serde(default)]
-    pub pilot_strictness: Option<String>,
+    pub llm_provider: Option<String>,
     #[serde(default, alias = "chat_width")]
     pub terminal_width: Option<f32>,
     #[serde(default)]
