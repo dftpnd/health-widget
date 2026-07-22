@@ -141,6 +141,7 @@ struct AutopilotState {
     cycle: bool,
     chat_done: HashSet<String>,
     enrich_until: Option<Instant>,
+    applies_exhausted: bool,
 }
 
 struct ShotState {
@@ -522,6 +523,7 @@ impl App {
                 cycle: false,
                 chat_done: HashSet::new(),
                 enrich_until: None,
+                applies_exhausted: false,
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
@@ -720,6 +722,9 @@ impl App {
             Some(self.autopilot.profile.as_str()),
         );
         if self.autopilot.proc.is_none() {
+            self.autopilot.cycle = false;
+            self.autopilot.applies_exhausted = false;
+            self.autopilot.enrich_until = None;
             self.autopilot.want = None;
             self.autopilot.status = "не удалось запустить автопилот".to_string();
             telemetry::error("pilot.fail", "не удалось запустить автопилот");
@@ -861,6 +866,7 @@ impl App {
             }
             None => {
                 if self.autopilot.cycle {
+                    self.autopilot.applies_exhausted = true;
                     self.enter_chat_lap();
                 } else {
                     self.autopilot.want = None;
@@ -872,8 +878,23 @@ impl App {
         }
     }
 
+    fn end_cycle_for_today(&mut self) {
+        self.autopilot.cycle = false;
+        self.autopilot.applies_exhausted = false;
+        self.autopilot.chat_done.clear();
+        self.autopilot.enrich_until = None;
+        self.autopilot.want = None;
+        self.autopilot.status = "на сегодня всё — все аккаунты в дневном лимите".to_string();
+        telemetry::event(
+            "pilot.cycle_done",
+            serde_json::json!({ "reason": "all_limited" }),
+        );
+        self.reconcile_pilot();
+    }
+
     fn enter_apply_lap(&mut self) {
         self.autopilot.chat_done.clear();
+        self.autopilot.applies_exhausted = false;
         self.autopilot.enrich_until = None;
         self.autopilot.batch_baseline = self
             .autopilot
@@ -2183,7 +2204,9 @@ impl App {
                         .selectable_label(self.autopilot.cycle, "🔄 Цикл")
                         .on_hover_text(
                             "Непрерывно: отклики по всем аккаунтам → чаты по всем \
-                             аккаунтам → скан → дообогащение (до 2ч), затем заново",
+                             аккаунтам → скан → дообогащение (до 2ч), затем заново. \
+                             Когда все аккаунты упрутся в дневной лимит — финальное \
+                             дообогащение пула и стоп до завтра",
                         )
                         .clicked()
                     {
@@ -2458,8 +2481,10 @@ impl App {
                     self.reconcile_pilot();
                 }
             }
+            let had_new_want = new_want.is_some();
             if let Some(w) = new_want {
                 self.autopilot.cycle = false;
+                self.autopilot.applies_exhausted = false;
                 self.autopilot.enrich_until = None;
                 if w == Some(Phase::Apply) {
                     self.autopilot.batch_baseline =
@@ -2469,9 +2494,10 @@ impl App {
                 self.autopilot.want = w;
                 self.reconcile_pilot();
             }
-            if toggle_cycle {
+            if toggle_cycle && !had_new_want {
                 if self.autopilot.cycle {
                     self.autopilot.cycle = false;
+                    self.autopilot.applies_exhausted = false;
                     self.autopilot.want = None;
                     self.autopilot.enrich_until = None;
                     self.autopilot.status = "цикл выключен".to_string();
@@ -2802,10 +2828,14 @@ impl eframe::App for App {
                 self.autopilot.want = Some(pilot::Phase::Enrich);
                 self.reconcile_pilot();
                 if self.autopilot.proc.is_some() {
-                    if self.autopilot.cycle {
+                    if self.autopilot.cycle && !self.autopilot.applies_exhausted {
                         self.autopilot.enrich_until = Some(Instant::now() + ENRICH_WINDOW);
                     }
-                    self.autopilot.status = "скан завершён — дообогащаю пул".to_string();
+                    self.autopilot.status = if self.autopilot.applies_exhausted {
+                        "лимиты исчерпаны — дообогащаю пул напоследок".to_string()
+                    } else {
+                        "скан завершён — дообогащаю пул".to_string()
+                    };
                 }
             } else if finished == Some(pilot::Phase::Apply)
                 && self.autopilot.want == Some(pilot::Phase::Apply)
@@ -2851,6 +2881,9 @@ impl eframe::App for App {
                     }
                     ApplyChain::Stop => {
                         if self.autopilot.cycle {
+                            if reason == "all_limited" {
+                                self.autopilot.applies_exhausted = true;
+                            }
                             self.enter_chat_lap();
                         } else {
                             self.autopilot.want = None;
@@ -2862,7 +2895,11 @@ impl eframe::App for App {
             } else if finished == Some(pilot::Phase::Chat) && self.autopilot.cycle {
                 self.advance_chat();
             } else if finished == Some(pilot::Phase::Enrich) && self.autopilot.cycle {
-                self.enter_apply_lap();
+                if self.autopilot.applies_exhausted {
+                    self.end_cycle_for_today();
+                } else {
+                    self.enter_apply_lap();
+                }
             } else {
                 self.autopilot.want = None;
                 let msg = match finished {

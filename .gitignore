@@ -9,3 +9,6 @@ tmp/
 widget.log
 web/node_modules/
 web/dist/
+
+# Рантайм-данные автопилота (логи, снапшоты статуса)
+data/
