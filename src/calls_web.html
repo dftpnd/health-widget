@@ -38,7 +38,7 @@ fetch('/api/calls').then(r => r.json()).then(rows => {
   }
   for (const row of rows) {
     const li = document.createElement('li');
-    li.textContent = '#' + row.id + ' · ' + row.name;
+    li.textContent = row.name === '#' + row.id ? '#' + row.id : '#' + row.id + ' · ' + row.name;
     const meta = document.createElement('span');
     meta.className = 'meta';
     meta.textContent = [row.started, mb(row.size)].filter(Boolean).join(' · ');

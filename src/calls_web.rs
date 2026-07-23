@@ -362,10 +362,15 @@ mod tests {
         ]);
         assert_eq!(missing, "404");
 
-        let junk = curl(&[
-            "-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}/video/../etc/passwd"),
+        let encoded_traversal = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}/video/%2E%2E%2Fetc%2Fpasswd"),
         ]);
-        assert_eq!(junk, "404");
+        assert_eq!(encoded_traversal, "404");
+
+        let non_numeric_id = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}/video/7abc"),
+        ]);
+        assert_eq!(non_numeric_id, "404");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
