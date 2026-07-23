@@ -30,6 +30,7 @@ mod terminal;
 mod transcribe;
 mod transcript_log;
 mod mux;
+mod calls_web;
 mod webmic;
 mod winctl;
 
