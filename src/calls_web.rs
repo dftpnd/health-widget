@@ -1,7 +1,20 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::transcript_log::CallMeta;
+
+pub const PORT: u16 = 8788;
+
+const PAGE: &str = include_str!("calls_web.html");
+
+#[derive(Clone)]
+pub enum WebStatus {
+    Idle,
+    Running,
+    Failed(String),
+}
 
 type MetaSource = fn() -> HashMap<i64, CallMeta>;
 
@@ -100,6 +113,115 @@ fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
+pub fn open(status: Arc<Mutex<WebStatus>>, ctx: egui::Context) {
+    let running = matches!(&*status.lock().unwrap(), WebStatus::Running);
+    if !running {
+        let Some(root) = crate::transcript_log::calls_dir() else {
+            *status.lock().unwrap() = WebStatus::Failed("нет папки колов".to_string());
+            ctx.request_repaint();
+            return;
+        };
+        match tiny_http::Server::http(("127.0.0.1", PORT)) {
+            Ok(server) => {
+                std::thread::spawn(move || {
+                    serve_loop(server, root, crate::transcript_log::call_meta)
+                });
+                *status.lock().unwrap() = WebStatus::Running;
+                crate::telemetry::event("calls_web.start", serde_json::json!({ "port": PORT }));
+            }
+            Err(e) => {
+                crate::telemetry::error("calls_web.bind", &e.to_string());
+                *status.lock().unwrap() = WebStatus::Failed(format!("порт {PORT} занят"));
+                ctx.request_repaint();
+                return;
+            }
+        }
+        ctx.request_repaint();
+    }
+    let _ = std::process::Command::new("xdg-open")
+        .arg(format!("http://127.0.0.1:{PORT}/"))
+        .spawn();
+}
+
+fn serve_loop(server: tiny_http::Server, root: PathBuf, meta: MetaSource) {
+    for req in server.incoming_requests() {
+        handle(req, &root, meta);
+    }
+}
+
+fn handle(req: tiny_http::Request, root: &Path, meta: MetaSource) {
+    let path = req.url().split('?').next().unwrap_or("/").to_string();
+    if path == "/" {
+        let resp = tiny_http::Response::from_string(PAGE).with_header(
+            tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap(),
+        );
+        let _ = req.respond(resp);
+        return;
+    }
+    if path == "/api/calls" {
+        let body = rows_json(&scan_calls(root, &meta()));
+        let resp = tiny_http::Response::from_string(body).with_header(
+            tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+        );
+        let _ = req.respond(resp);
+        return;
+    }
+    if let Some(rest) = path.strip_prefix("/video/") {
+        if let Ok(id) = rest.parse::<i64>() {
+            respond_video(req, &root.join(id.to_string()).join("combined.mp4"));
+            return;
+        }
+    }
+    let _ = req.respond(tiny_http::Response::empty(404));
+}
+
+fn respond_video(req: tiny_http::Request, path: &Path) {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        let _ = req.respond(tiny_http::Response::empty(404));
+        return;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let ctype = tiny_http::Header::from_bytes("Content-Type", "video/mp4").unwrap();
+    let accept = tiny_http::Header::from_bytes("Accept-Ranges", "bytes").unwrap();
+    let spec = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| h.value.as_str().to_string());
+    let Some(spec) = spec else {
+        let resp = tiny_http::Response::from_file(file)
+            .with_header(ctype)
+            .with_header(accept);
+        let _ = req.respond(resp);
+        return;
+    };
+    let Some((start, end)) = parse_range(&spec, len) else {
+        let resp = tiny_http::Response::empty(416).with_header(
+            tiny_http::Header::from_bytes("Content-Range", format!("bytes */{len}")).unwrap(),
+        );
+        let _ = req.respond(resp);
+        return;
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        let _ = req.respond(tiny_http::Response::empty(500));
+        return;
+    }
+    let count = end - start + 1;
+    let crange = tiny_http::Header::from_bytes(
+        "Content-Range",
+        format!("bytes {start}-{end}/{len}"),
+    )
+    .unwrap();
+    let resp = tiny_http::Response::new(
+        tiny_http::StatusCode(206),
+        vec![ctype, accept, crange],
+        file.take(count),
+        Some(count as usize),
+        None,
+    );
+    let _ = req.respond(resp);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +298,75 @@ mod tests {
         assert_eq!(v[0]["name"], "Кол");
         assert_eq!(v[0]["size"], 50331648u64);
         assert_eq!(v[0]["ended"], "");
+    }
+
+    fn no_meta() -> HashMap<i64, CallMeta> {
+        HashMap::new()
+    }
+
+    fn curl(args: &[&str]) -> String {
+        let out = std::process::Command::new("curl")
+            .args(args)
+            .output()
+            .expect("curl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn server_serves_page_list_and_ranged_video() {
+        let tmp = std::env::temp_dir().join(format!("hw-web-srv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("7")).unwrap();
+        let body: Vec<u8> = (0..1000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        std::fs::write(tmp.join("7").join("combined.mp4"), &body).unwrap();
+
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let root = tmp.clone();
+        std::thread::spawn(move || serve_loop(server, root, no_meta));
+
+        let base = format!("http://127.0.0.1:{port}");
+
+        let page = curl(&["-s", &base]);
+        assert!(page.contains("<video"), "страница: {page}");
+
+        let json = curl(&["-s", &format!("{base}/api/calls")]);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["id"], 7);
+        assert_eq!(v[0]["size"], 1000);
+        assert_eq!(v[0]["name"], "#7");
+
+        let code = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "-H", "Range: bytes=0-9", &format!("{base}/video/7"),
+        ]);
+        assert_eq!(code, "206");
+
+        let chunk = curl(&["-s", "-H", "Range: bytes=0-9", &format!("{base}/video/7")]);
+        assert_eq!(chunk.as_bytes(), &body[..10]);
+
+        let whole = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}:%{size_download}",
+            &format!("{base}/video/7"),
+        ]);
+        assert_eq!(whole, "200:1000");
+
+        let unsat = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "-H", "Range: bytes=99999-", &format!("{base}/video/7"),
+        ]);
+        assert_eq!(unsat, "416");
+
+        let missing = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}/video/999"),
+        ]);
+        assert_eq!(missing, "404");
+
+        let junk = curl(&[
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}/video/../etc/passwd"),
+        ]);
+        assert_eq!(junk, "404");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

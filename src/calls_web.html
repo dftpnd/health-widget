@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Колы</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; height: 100vh; display: flex; background: #14161a; color: #d8dbe0;
+         font: 14px/1.4 system-ui, sans-serif; }
+  aside { width: 300px; flex: none; overflow-y: auto; border-right: 1px solid #262a31; }
+  h1 { margin: 0; padding: 14px 16px; font-size: 12px; letter-spacing: .08em;
+       text-transform: uppercase; color: #7d8492; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 10px 16px; cursor: pointer; border-left: 3px solid transparent; }
+  li:hover { background: #1b1e24; }
+  li.active { background: #1f2530; border-left-color: #6aa7ff; }
+  .meta { display: block; margin-top: 2px; font-size: 12px; color: #7d8492; }
+  .empty { padding: 0 16px; font-size: 13px; color: #7d8492; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  video { width: 100%; max-height: 100%; background: #000; border-radius: 6px; }
+</style>
+</head>
+<body>
+<aside><h1>Колы</h1><ul id="list"></ul><p id="empty" class="empty" hidden></p></aside>
+<main><video id="player" controls preload="metadata"></video></main>
+<script>
+const list = document.getElementById('list');
+const empty = document.getElementById('empty');
+const player = document.getElementById('player');
+const mb = b => (b / 1048576).toFixed(1).replace('.', ',') + ' МБ';
+
+fetch('/api/calls').then(r => r.json()).then(rows => {
+  if (!rows.length) {
+    empty.textContent = 'нечего смотреть — склей колы кнопкой 🎬 в виджете';
+    empty.hidden = false;
+    return;
+  }
+  for (const row of rows) {
+    const li = document.createElement('li');
+    li.textContent = '#' + row.id + ' · ' + row.name;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = [row.started, mb(row.size)].filter(Boolean).join(' · ');
+    li.append(meta);
+    li.onclick = () => {
+      for (const el of list.children) el.classList.remove('active');
+      li.classList.add('active');
+      player.src = '/video/' + row.id;
+      player.play();
+    };
+    list.append(li);
+  }
+});
+</script>
+</body>
+</html>
