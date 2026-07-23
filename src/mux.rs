@@ -143,6 +143,7 @@ fn glue_dir(dir: &Path) -> Result<(), String> {
     if has_audio {
         cmd.args(["-c:a", "aac"]);
     }
+    cmd.args(["-f", "mp4"]);
     cmd.arg(&part);
 
     let output = cmd.output().map_err(|_| "нет ffmpeg".to_string())?;

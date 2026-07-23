@@ -60,9 +60,8 @@ impl FrameCapture {
     pub fn start(dir: &Path) -> FrameCapture {
         let frames_dir = dir.join("frames");
         let _ = std::fs::create_dir_all(&frames_dir);
-        let (w_lg, h_lg, scale) = geometry();
-        let target_lg = (TARGET_OUT_WIDTH as f64 / scale) as u32;
-        let (x, y, w, h) = band(w_lg, h_lg, target_lg);
+        let (w_lg, h_lg, _) = geometry();
+        let (x, y, w, h) = band(w_lg, h_lg, TARGET_OUT_WIDTH);
         let stopping = Arc::new(AtomicBool::new(false));
         let flag = stopping.clone();
         let handle = std::thread::spawn(move || {
