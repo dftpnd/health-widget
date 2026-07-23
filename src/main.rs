@@ -229,6 +229,7 @@ struct App {
     prev_state: state::State,
     stable_since: Instant,
     shot: ShotState,
+    glue: Arc<std::sync::Mutex<mux::GlueStatus>>,
     // cursor_warp_request: Arc<AtomicBool>,
     paste_code: Arc<AtomicBool>,
     switch_provider: Arc<AtomicBool>,
@@ -542,6 +543,7 @@ impl App {
                 active: false,
                 points: Vec::new(),
             },
+            glue: Arc::new(std::sync::Mutex::new(mux::GlueStatus::Idle)),
             // cursor_warp_request,
             paste_code,
             switch_provider,
@@ -2074,6 +2076,7 @@ impl App {
     fn draw_call(&mut self, ui: &mut egui::Ui, min_height: f32) {
         self.reconcile_call_recording();
         let mut call_toggle = false;
+        let mut glue_go = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
         let zoom_silent_min = self
             .active_call
@@ -2107,6 +2110,42 @@ impl App {
                     );
                 }
             });
+            let glue_line = {
+                use mux::GlueStatus::*;
+                match &*self.glue.lock().unwrap() {
+                    Idle => None,
+                    Working { done, total } => Some((
+                        format!("⧗ склеиваю {}/{}…", done + 1, total),
+                        egui::Color32::from_rgb(210, 200, 120),
+                    )),
+                    Done(0) => Some((
+                        "нечего склеивать".to_string(),
+                        egui::Color32::GRAY,
+                    )),
+                    Done(n) => Some((
+                        format!("✔ склеено {n}"),
+                        egui::Color32::from_rgb(120, 200, 120),
+                    )),
+                    Failed(e) => Some((
+                        format!("✖ {e}"),
+                        egui::Color32::from_rgb(230, 120, 120),
+                    )),
+                }
+            };
+            let glue_busy =
+                matches!(&*self.glue.lock().unwrap(), mux::GlueStatus::Working { .. });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!glue_busy, egui::Button::new("🎬 Склеить"))
+                    .on_hover_text("Склеить все ещё не склеенные колы: свод аудио + видео в combined.mp4")
+                    .clicked()
+                {
+                    glue_go = true;
+                }
+                if let Some((text, color)) = &glue_line {
+                    ui.label(egui::RichText::new(text).size(11.0).color(*color));
+                }
+            });
             if let Some(m) = zoom_silent_min {
                 ui.label(
                     egui::RichText::new(format!("⚠ телемост молчит {m} мин"))
@@ -2121,6 +2160,10 @@ impl App {
             } else {
                 self.start_call();
             }
+        }
+        if glue_go {
+            let active_id = self.active_call.as_ref().map(|c| c.id);
+            mux::glue_all(active_id, self.glue.clone(), ui.ctx().clone());
         }
     }
 
