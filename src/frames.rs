@@ -1,3 +1,7 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 pub const TARGET_OUT_WIDTH: u32 = 2500;
 
 const FALLBACK_W_LG: u32 = 4096;
@@ -45,6 +49,52 @@ fn kscreen_logical() -> Option<(u32, u32, f64)> {
         }
     }
     None
+}
+
+pub struct FrameCapture {
+    stopping: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameCapture {
+    pub fn start(dir: &Path) -> FrameCapture {
+        let frames_dir = dir.join("frames");
+        let _ = std::fs::create_dir_all(&frames_dir);
+        let (w_lg, h_lg, scale) = geometry();
+        let target_lg = (TARGET_OUT_WIDTH as f64 / scale) as u32;
+        let (x, y, w, h) = band(w_lg, h_lg, target_lg);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let flag = stopping.clone();
+        let handle = std::thread::spawn(move || {
+            let period = std::time::Duration::from_secs(1);
+            let mut n: u64 = 1;
+            while !flag.load(Ordering::Relaxed) {
+                let started = std::time::Instant::now();
+                match crate::kwin_shot::capture_area(x, y, w, h) {
+                    Ok(img) => {
+                        let path = frames_dir.join(format!("{n:06}.jpg"));
+                        let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+                        if rgb.save(&path).is_ok() {
+                            n += 1;
+                        }
+                    }
+                    Err(e) => crate::telemetry::error("frames.fail", &e),
+                }
+                let spent = started.elapsed();
+                if spent < period {
+                    std::thread::sleep(period - spent);
+                }
+            }
+        });
+        FrameCapture { stopping, handle: Some(handle) }
+    }
+
+    pub fn stop(mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 #[cfg(test)]
