@@ -12,6 +12,7 @@ mod config;
 mod data;
 mod deepseek;
 mod detect;
+mod frames;
 mod hr_reply;
 mod instance;
 mod pilot;
