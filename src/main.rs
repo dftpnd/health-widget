@@ -22,7 +22,6 @@ mod pilot_notify;
 mod kwin_shot;
 mod prompts;
 mod recorder;
-mod screencast;
 mod screenshot;
 mod state;
 mod tartarus;
@@ -116,7 +115,7 @@ struct Shared {
 struct ActiveCall {
     id: i64,
     name: String,
-    screen: Option<screencast::ScreenRecorder>,
+    frames: Option<frames::FrameCapture>,
 }
 
 struct AudioState {
@@ -643,25 +642,21 @@ impl App {
             return;
         };
         telemetry::event("call.start", serde_json::json!({ "id": id, "name": name }));
-        self.active_call = Some(ActiveCall { id, name, screen: None });
+        self.active_call = Some(ActiveCall { id, name, frames: None });
         self.reconcile_call_recording();
-        self.start_screen_recording();
+        self.start_frame_capture();
     }
 
-    fn start_screen_recording(&mut self) {
+    fn start_frame_capture(&mut self) {
         let Some(call) = &self.active_call else {
             return;
         };
         let Some(dir) = transcript_log::call_dir(call.id) else {
             return;
         };
-        match screencast::ScreenRecorder::start(&dir) {
-            Ok(rec) => {
-                if let Some(call) = &mut self.active_call {
-                    call.screen = Some(rec);
-                }
-            }
-            Err(e) => telemetry::error("screencast.fail", &e),
+        let capture = frames::FrameCapture::start(&dir);
+        if let Some(call) = &mut self.active_call {
+            call.frames = Some(capture);
         }
     }
 
@@ -670,8 +665,8 @@ impl App {
             return;
         };
         telemetry::event("call.end", serde_json::json!({ "id": call.id, "name": call.name }));
-        if let Some(rec) = call.screen {
-            rec.stop();
+        if let Some(capture) = call.frames {
+            capture.stop();
         }
         if let Some(mon) = &self.audio.mic {
             mon.stop_recording();
@@ -3537,28 +3532,6 @@ fn main() -> eframe::Result<()> {
             if active { "АКТИВЕН (виджет спрятался бы)" } else { "не обнаружен" }
         );
         std::process::exit(if active { 0 } else { 1 });
-    }
-
-    if std::env::args().nth(1).as_deref() == Some("--screencast-test") {
-        let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
-        let dir = std::env::temp_dir().join("hw-screencast-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        match screencast::ScreenRecorder::start(&dir) {
-            Ok(rec) => {
-                eprintln!("cast стартовал, пишу {secs}s в {}", dir.display());
-                std::thread::sleep(std::time::Duration::from_secs(secs));
-                rec.stop();
-                let mkv = dir.join("screen.mkv");
-                let sz = std::fs::metadata(&mkv).map(|m| m.len()).unwrap_or(0);
-                eprintln!("screen.mkv = {sz} байт");
-                eprintln!("--- gst.log ---\n{}", std::fs::read_to_string(dir.join("screen.gst.log")).unwrap_or_default());
-                std::process::exit(if sz > 0 { 0 } else { 1 });
-            }
-            Err(e) => {
-                eprintln!("старт не удался: {e}");
-                std::process::exit(2);
-            }
-        }
     }
 
     if let Some(arg @ ("--telemetry" | "--telemetry-today")) =
