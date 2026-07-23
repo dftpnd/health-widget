@@ -1,4 +1,5 @@
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -259,6 +260,41 @@ fn db_path() -> Option<PathBuf> {
 
 pub fn calls_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("health-widget").join("calls"))
+}
+
+pub struct CallMeta {
+    pub name: String,
+    pub started: String,
+    pub ended: String,
+}
+
+pub fn call_meta() -> HashMap<i64, CallMeta> {
+    let mut out = HashMap::new();
+    let Some(path) = db_path() else {
+        return out;
+    };
+    let Ok(conn) = Connection::open(path) else {
+        return out;
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT id, name, started_at, COALESCE(ended_at, '') FROM calls")
+    else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    }) else {
+        return out;
+    };
+    for (id, name, started, ended) in rows.flatten() {
+        out.insert(id, CallMeta { name, started, ended });
+    }
+    out
 }
 
 pub fn call_dir(call_id: i64) -> Option<PathBuf> {
