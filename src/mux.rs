@@ -106,7 +106,9 @@ fn glue_dir(dir: &Path) -> Result<(), String> {
     let single = if has_mic { &mic } else { &zoom };
 
     if has_video {
-        cmd.args(["-framerate", "1"]).arg("-i").arg(frames.join("%06d.jpg"));
+        cmd.args(["-framerate", "1", "-pattern_type", "glob"])
+            .arg("-i")
+            .arg(frames.join("*.jpg"));
     }
     if has_audio {
         if both {

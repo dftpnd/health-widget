@@ -67,22 +67,33 @@ impl FrameCapture {
         let flag = stopping.clone();
         let handle = std::thread::spawn(move || {
             let period = std::time::Duration::from_secs(1);
+            let slice = std::time::Duration::from_millis(100);
             let mut n: u64 = 1;
+            let mut fail_count: u64 = 0;
+            let mut report_fail = |e: &str| {
+                fail_count += 1;
+                if fail_count == 1 || fail_count % 60 == 0 {
+                    crate::telemetry::error("frames.fail", e);
+                }
+            };
             while !flag.load(Ordering::Relaxed) {
                 let started = std::time::Instant::now();
                 match crate::kwin_shot::capture_area(x, y, w, h) {
                     Ok(img) => {
                         let path = frames_dir.join(format!("{n:06}.jpg"));
                         let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
-                        if rgb.save(&path).is_ok() {
-                            n += 1;
+                        match rgb.save(&path) {
+                            Ok(()) => n += 1,
+                            Err(e) => report_fail(&e.to_string()),
                         }
                     }
-                    Err(e) => crate::telemetry::error("frames.fail", &e),
+                    Err(e) => report_fail(&e),
                 }
-                let spent = started.elapsed();
-                if spent < period {
-                    std::thread::sleep(period - spent);
+                let mut spent = started.elapsed();
+                while spent < period && !flag.load(Ordering::Relaxed) {
+                    let remaining = period - spent;
+                    std::thread::sleep(remaining.min(slice));
+                    spent = started.elapsed();
                 }
             }
         });
