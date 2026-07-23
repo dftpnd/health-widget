@@ -139,6 +139,7 @@ struct AutopilotState {
     apply_idle: HashSet<String>,
     notify_on: bool,
     cycle: bool,
+    chat_lap: bool,
     chat_done: HashSet<String>,
     enrich_until: Option<Instant>,
     applies_exhausted: bool,
@@ -162,6 +163,7 @@ struct TranscriptKeys {
     send_mic: Arc<AtomicBool>,
     send_zoom: Arc<AtomicBool>,
     send_mic_p2: Arc<AtomicBool>,
+    send_zoom_p2: Arc<AtomicBool>,
     clear_chat: Arc<AtomicBool>,
 }
 
@@ -171,6 +173,7 @@ impl TranscriptKeys {
             send_mic: Arc::new(AtomicBool::new(false)),
             send_zoom: Arc::new(AtomicBool::new(false)),
             send_mic_p2: Arc::new(AtomicBool::new(false)),
+            send_zoom_p2: Arc::new(AtomicBool::new(false)),
             clear_chat: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -323,6 +326,7 @@ impl App {
             send_mic: transcript_keys.send_mic.clone(),
             send_zoom: transcript_keys.send_zoom.clone(),
             send_mic_p2: transcript_keys.send_mic_p2.clone(),
+            send_zoom_p2: transcript_keys.send_zoom_p2.clone(),
             clear_chat: transcript_keys.clear_chat.clone(),
             paste_code: paste_code.clone(),
             switch_provider: switch_provider.clone(),
@@ -521,6 +525,7 @@ impl App {
                 apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
                 cycle: false,
+                chat_lap: false,
                 chat_done: HashSet::new(),
                 enrich_until: None,
                 applies_exhausted: false,
@@ -723,6 +728,7 @@ impl App {
         );
         if self.autopilot.proc.is_none() {
             self.autopilot.cycle = false;
+            self.autopilot.chat_lap = false;
             self.autopilot.applies_exhausted = false;
             self.autopilot.enrich_until = None;
             self.autopilot.want = None;
@@ -921,6 +927,15 @@ impl App {
         self.reconcile_pilot();
     }
 
+    fn end_chat_lap(&mut self) {
+        self.autopilot.chat_lap = false;
+        self.autopilot.chat_done.clear();
+        self.autopilot.want = None;
+        self.autopilot.status = "чаты обработаны по всем аккаунтам".to_string();
+        telemetry::event("pilot.chat_lap_done", serde_json::json!({}));
+        self.reconcile_pilot();
+    }
+
     fn advance_chat(&mut self) {
         let cur = self.autopilot.profile.clone();
         self.autopilot.chat_done.insert(cur.clone());
@@ -933,7 +948,13 @@ impl App {
                 self.autopilot.stats_mtime = None;
                 self.reconcile_pilot();
             }
-            None => self.enter_scan(),
+            None => {
+                if self.autopilot.cycle {
+                    self.enter_scan();
+                } else {
+                    self.end_chat_lap();
+                }
+            }
         }
     }
 
@@ -2217,7 +2238,10 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui
                         .selectable_label(self.autopilot.want == Some(Phase::Chat), "💬 Чат")
-                        .on_hover_text("Автопилот: вести чаты с работодателями")
+                        .on_hover_text(
+                            "Автопилот: пройтись по чатам всех аккаунтов один раз \
+                             (без откликов), ответить где надо и остановиться",
+                        )
                         .clicked()
                     {
                         new_want = Some(if self.autopilot.want == Some(Phase::Chat) {
@@ -2486,6 +2510,10 @@ impl App {
                 self.autopilot.cycle = false;
                 self.autopilot.applies_exhausted = false;
                 self.autopilot.enrich_until = None;
+                self.autopilot.chat_lap = w == Some(Phase::Chat);
+                if w == Some(Phase::Chat) {
+                    self.autopilot.chat_done.clear();
+                }
                 if w == Some(Phase::Apply) {
                     self.autopilot.batch_baseline =
                         self.autopilot.stats.as_ref().map(|s| s.applied_today).unwrap_or(0);
@@ -2495,6 +2523,7 @@ impl App {
                 self.reconcile_pilot();
             }
             if toggle_cycle && !had_new_want {
+                self.autopilot.chat_lap = false;
                 if self.autopilot.cycle {
                     self.autopilot.cycle = false;
                     self.autopilot.applies_exhausted = false;
@@ -2536,6 +2565,9 @@ impl App {
         }
         if self.transcript_keys.send_mic_p2.swap(false, Ordering::Relaxed) {
             self.send_transcript(ctx.clone(), true, self.prompts.prompt_2.clone());
+        }
+        if self.transcript_keys.send_zoom_p2.swap(false, Ordering::Relaxed) {
+            self.send_transcript(ctx.clone(), false, self.prompts.prompt_2.clone());
         }
     }
 
@@ -2892,7 +2924,9 @@ impl eframe::App for App {
                         }
                     }
                 }
-            } else if finished == Some(pilot::Phase::Chat) && self.autopilot.cycle {
+            } else if finished == Some(pilot::Phase::Chat)
+                && (self.autopilot.cycle || self.autopilot.chat_lap)
+            {
                 self.advance_chat();
             } else if finished == Some(pilot::Phase::Enrich) && self.autopilot.cycle {
                 if self.autopilot.applies_exhausted {

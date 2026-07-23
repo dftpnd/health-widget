@@ -57,6 +57,13 @@ pub fn list_mics() -> Vec<Device> {
     text.split("Source #").skip(1).filter_map(parse_mic).collect()
 }
 
+fn jabra_target() -> Option<String> {
+    list_mics()
+        .into_iter()
+        .find(|d| d.target.to_lowercase().contains("jabra") || d.label.to_lowercase().contains("jabra"))
+        .map(|d| d.target)
+}
+
 fn parse_mic(block: &str) -> Option<Device> {
     let mut name = None;
     let mut desc = None;
@@ -221,7 +228,10 @@ impl AudioMonitor {
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
     ) -> Option<Self> {
-        let target_owned = target.map(|s| s.to_string());
+        let target_owned = match (target, capture_sink) {
+            (None, false) => jabra_target(),
+            _ => target.map(|s| s.to_string()),
+        };
         let (first_child, first_stdout) =
             spawn_pw_record(target_owned.as_deref(), capture_sink, channel)?;
 

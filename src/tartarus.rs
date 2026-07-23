@@ -20,7 +20,6 @@ const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
     (KeyCode::KEY_5, &[KeyCode::KEY_F17]),
     (KeyCode::KEY_TAB, &[KeyCode::KEY_F18]),
     (KeyCode::KEY_Q, &[KeyCode::KEY_F19]),
-    (KeyCode::KEY_W, &[KeyCode::KEY_F20]),
     (KeyCode::KEY_E, &[KeyCode::KEY_F21]),
     (KeyCode::KEY_R, &[KeyCode::KEY_F22]),
     (KeyCode::KEY_CAPSLOCK, &[KeyCode::KEY_F23]),
@@ -47,6 +46,7 @@ pub struct Handles {
     pub send_mic: Arc<AtomicBool>,
     pub send_zoom: Arc<AtomicBool>,
     pub send_mic_p2: Arc<AtomicBool>,
+    pub send_zoom_p2: Arc<AtomicBool>,
     pub clear_chat: Arc<AtomicBool>,
     pub paste_code: Arc<AtomicBool>,
     pub switch_provider: Arc<AtomicBool>,
@@ -183,6 +183,11 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
         return;
     }
     if value == 1 {
+        if code == KeyCode::KEY_W.0 {
+            h.send_zoom_p2.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
         if code == KeyCode::KEY_5.0 {
             h.shot_request.store(true, Ordering::Relaxed);
             h.ctx.request_repaint();
@@ -227,6 +232,7 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0
+        || c == KeyCode::KEY_W.0
         || c == KeyCode::KEY_A.0
         || c == KeyCode::KEY_R.0
         || c == KeyCode::KEY_4.0
