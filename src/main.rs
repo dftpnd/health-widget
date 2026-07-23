@@ -231,6 +231,7 @@ struct App {
     stable_since: Instant,
     shot: ShotState,
     glue: Arc<std::sync::Mutex<mux::GlueStatus>>,
+    calls_web: Arc<std::sync::Mutex<calls_web::WebStatus>>,
     // cursor_warp_request: Arc<AtomicBool>,
     paste_code: Arc<AtomicBool>,
     switch_provider: Arc<AtomicBool>,
@@ -545,6 +546,7 @@ impl App {
                 points: Vec::new(),
             },
             glue: Arc::new(std::sync::Mutex::new(mux::GlueStatus::Idle)),
+            calls_web: Arc::new(std::sync::Mutex::new(calls_web::WebStatus::Idle)),
             // cursor_warp_request,
             paste_code,
             switch_provider,
@@ -2074,6 +2076,7 @@ impl App {
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let mut glue_go = false;
+        let mut web_go = false;
         let active_name = self.active_call.as_ref().map(|c| c.name.clone());
         let zoom_silent_min = self
             .active_call
@@ -2135,6 +2138,20 @@ impl App {
             };
             let glue_busy =
                 matches!(&*self.glue.lock().unwrap(), mux::GlueStatus::Working { .. });
+            let web_line = {
+                use calls_web::WebStatus::*;
+                match &*self.calls_web.lock().unwrap() {
+                    Idle => None,
+                    Running => Some((
+                        format!("▶ 127.0.0.1:{}", calls_web::PORT),
+                        egui::Color32::from_rgb(120, 200, 120),
+                    )),
+                    Failed(e) => Some((
+                        format!("✖ {e}"),
+                        egui::Color32::from_rgb(230, 120, 120),
+                    )),
+                }
+            };
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!glue_busy, egui::Button::new("🎬 Склеить"))
@@ -2144,6 +2161,18 @@ impl App {
                     glue_go = true;
                 }
                 if let Some((text, color)) = &glue_line {
+                    ui.label(egui::RichText::new(text).size(11.0).color(*color));
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("📺 Колы")
+                    .on_hover_text("Открыть склеенные колы в браузере")
+                    .clicked()
+                {
+                    web_go = true;
+                }
+                if let Some((text, color)) = &web_line {
                     ui.label(egui::RichText::new(text).size(11.0).color(*color));
                 }
             });
@@ -2166,6 +2195,9 @@ impl App {
             *self.glue.lock().unwrap() = mux::GlueStatus::Working { done: 0, total: 0 };
             let active_id = self.active_call.as_ref().map(|c| c.id);
             mux::glue_all(active_id, self.glue.clone(), ui.ctx().clone());
+        }
+        if web_go {
+            calls_web::open(self.calls_web.clone(), ui.ctx().clone());
         }
     }
 
