@@ -2114,6 +2114,10 @@ impl App {
                 use mux::GlueStatus::*;
                 match &*self.glue.lock().unwrap() {
                     Idle => None,
+                    Working { total: 0, .. } => Some((
+                        "⧗ склеиваю…".to_string(),
+                        egui::Color32::from_rgb(210, 200, 120),
+                    )),
                     Working { done, total } => Some((
                         format!("⧗ склеиваю {}/{}…", done + 1, total),
                         egui::Color32::from_rgb(210, 200, 120),
@@ -2162,6 +2166,7 @@ impl App {
             }
         }
         if glue_go {
+            *self.glue.lock().unwrap() = mux::GlueStatus::Working { done: 0, total: 0 };
             let active_id = self.active_call.as_ref().map(|c| c.id);
             mux::glue_all(active_id, self.glue.clone(), ui.ctx().clone());
         }
