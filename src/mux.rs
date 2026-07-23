@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub enum GlueStatus {
@@ -13,6 +14,30 @@ pub fn pending(active_id: Option<i64>) -> Vec<PathBuf> {
         Some(root) => select_pending(&root, active_id),
         None => Vec::new(),
     }
+}
+
+pub fn glue_all(active_id: Option<i64>, status: Arc<Mutex<GlueStatus>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let dirs = pending(active_id);
+        let total = dirs.len();
+        let set = |s: GlueStatus| {
+            *status.lock().unwrap() = s;
+            ctx.request_repaint();
+        };
+        if total == 0 {
+            return set(GlueStatus::Done(0));
+        }
+        let mut done = 0usize;
+        for (i, dir) in dirs.iter().enumerate() {
+            set(GlueStatus::Working { done: i, total });
+            match glue_dir(dir) {
+                Ok(()) => done += 1,
+                Err(e) if e == "нет ffmpeg" => return set(GlueStatus::Failed(e)),
+                Err(e) => crate::telemetry::error("mux.fail", &e),
+            }
+        }
+        set(GlueStatus::Done(done));
+    });
 }
 
 fn select_pending(root: &Path, active_id: Option<i64>) -> Vec<PathBuf> {
