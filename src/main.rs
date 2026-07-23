@@ -29,6 +29,7 @@ mod telemetry;
 mod terminal;
 mod transcribe;
 mod transcript_log;
+mod mux;
 mod webmic;
 mod winctl;
 
