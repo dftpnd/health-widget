@@ -49,6 +49,65 @@ fn select_pending(root: &Path, active_id: Option<i64>) -> Vec<PathBuf> {
     out.into_iter().map(|(_, p)| p).collect()
 }
 
+fn glue_dir(dir: &Path) -> Result<(), String> {
+    let mic = dir.join("mic.wav");
+    let zoom = dir.join("zoom.wav");
+    let screen = dir.join("screen.mkv");
+    let out = dir.join("combined.mp4");
+    let part = dir.join("combined.mp4.part");
+
+    let has_mic = mic.exists();
+    let has_zoom = zoom.exists();
+    let has_video = std::fs::metadata(&screen).map(|m| m.len() > 0).unwrap_or(false);
+
+    if !has_mic && !has_zoom {
+        return Err("нет аудиодорожек".into());
+    }
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+
+    let both = has_mic && has_zoom;
+    let single = if has_mic { &mic } else { &zoom };
+
+    if has_video {
+        cmd.arg("-i").arg(&screen);
+    }
+    if both {
+        cmd.arg("-i").arg(&mic).arg("-i").arg(&zoom);
+    } else {
+        cmd.arg("-i").arg(single);
+    }
+
+    if both {
+        let a = if has_video { "[1:a][2:a]" } else { "[0:a][1:a]" };
+        cmd.arg("-filter_complex")
+            .arg(format!("{a}amix=inputs=2:normalize=0[a]"));
+    }
+
+    if has_video {
+        cmd.arg("-map").arg("0:v");
+        cmd.arg("-map").arg(if both { "[a]" } else { "1:a" });
+        cmd.args(["-c:v", "copy"]);
+    } else {
+        cmd.arg("-map").arg(if both { "[a]" } else { "0:a" });
+    }
+    cmd.args(["-c:a", "aac"]);
+    cmd.arg(&part);
+
+    let output = cmd
+        .output()
+        .map_err(|_| "нет ffmpeg".to_string())?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&part);
+        let err = String::from_utf8_lossy(&output.stderr);
+        let tail = err.lines().last().unwrap_or("ffmpeg упал").to_string();
+        return Err(tail);
+    }
+
+    std::fs::rename(&part, &out).map_err(|e| format!("rename: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
