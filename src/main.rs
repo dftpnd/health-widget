@@ -52,6 +52,7 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
     ("back", "Backend"),
     ("llm", "LLM"),
+    ("analyst", "Системный аналитик"),
 ];
 
 const APPLY_BATCH_SIZE: i64 = 42;
