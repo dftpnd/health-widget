@@ -3538,6 +3538,28 @@ fn main() -> eframe::Result<()> {
         std::process::exit(if active { 0 } else { 1 });
     }
 
+    if std::env::args().nth(1).as_deref() == Some("--screencast-test") {
+        let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let dir = std::env::temp_dir().join("hw-screencast-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        match screencast::ScreenRecorder::start(&dir) {
+            Ok(rec) => {
+                eprintln!("cast стартовал, пишу {secs}s в {}", dir.display());
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                rec.stop();
+                let mkv = dir.join("screen.mkv");
+                let sz = std::fs::metadata(&mkv).map(|m| m.len()).unwrap_or(0);
+                eprintln!("screen.mkv = {sz} байт");
+                eprintln!("--- gst.log ---\n{}", std::fs::read_to_string(dir.join("screen.gst.log")).unwrap_or_default());
+                std::process::exit(if sz > 0 { 0 } else { 1 });
+            }
+            Err(e) => {
+                eprintln!("старт не удался: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(arg @ ("--telemetry" | "--telemetry-today")) =
         std::env::args().nth(1).as_deref()
     {

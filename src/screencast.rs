@@ -40,7 +40,10 @@ impl ScreenRecorder {
         let fd = remote.as_raw_fd();
         clear_cloexec(fd);
 
-        let child = spawn_gst(fd, start.node, &path)?;
+        let mut child = spawn_gst(fd, start.node, &path)?;
+        if let Some(err) = died_early(&mut child, &path) {
+            return Err(err);
+        }
         telemetry_ok(&path, start.node);
         Ok(Self { child, _remote: remote, path })
     }
@@ -230,6 +233,24 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
+fn died_early(child: &mut Child, path: &Path) -> Option<String> {
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let exited = matches!(child.try_wait(), Ok(Some(_)));
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if !exited && bytes > 0 {
+        return None;
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let tail = std::fs::read_to_string(path.with_extension("gst.log"))
+        .ok()
+        .and_then(|s| s.lines().rev().find(|l| !l.trim().is_empty()).map(str::to_string))
+        .unwrap_or_default();
+    Some(format!("запись экрана не пошла (mkv {bytes}Б): {tail}"))
+}
+
 fn spawn_gst(fd: i32, node: u32, path: &Path) -> Result<Child, String> {
     if which("gst-launch-1.0").is_none() {
         return Err("нет gst-launch-1.0".into());
@@ -296,12 +317,18 @@ fn spawn_gst(fd: i32, node: u32, path: &Path) -> Result<Child, String> {
     }
 
     let log = path.with_extension("gst.log");
-    let sink = std::fs::File::create(&log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    let (out, err) = match std::fs::File::create(&log) {
+        Ok(f) => match f.try_clone() {
+            Ok(f2) => (Stdio::from(f), Stdio::from(f2)),
+            Err(_) => (Stdio::null(), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
     Command::new("gst-launch-1.0")
         .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(sink)
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| format!("gst spawn: {e}"))
 }
