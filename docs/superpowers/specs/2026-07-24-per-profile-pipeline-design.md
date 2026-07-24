@@ -136,6 +136,19 @@ CREATE INDEX IF NOT EXISTS events_profile_ts ON events(profile, ts);
 `applied`/`reply` дублируют выводимое из `applications`/`chats`, но единый лог даёт ровный
 разрез «за ход (since)» без спец-логики на каждый счётчик.
 
+### profile_meta — снимок топ-N для лёгкого summary
+
+```sql
+CREATE TABLE profile_meta(
+  profile  TEXT PRIMARY KEY,
+  top_json TEXT,          -- JSON-массив топ-N заголовков ранжирования
+  updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
+```
+
+Тяжёлая apply-фаза (`ListingHunter`, где embedder уже загружен) после ранжирования
+пишет топ-N заголовков сюда. `summary` только читает `top_json` — без encode/torch.
+
 ### Дата последнего скана профиля
 
 Выводим из `SELECT MAX(found_at) FROM queue WHERE profile = ?` (отдельная таблица не
@@ -183,7 +196,9 @@ site:
   - `groups`: `[{name, new}]` — новые (`enriched=0 AND unavailable=0`) по группам профиля;
   - `unenriched`: остаток необогащённых профиля;
   - `last_scan_date`: `MAX(found_at)` профиля;
-  - `top`: топ-N (5) заголовков ранжирования профиля (свежесть × релевантность);
+  - `top`: топ-N (5) заголовков ранжирования профиля (свежесть × релевантность),
+    из **персистентного снимка** (см. ниже — ранжирование требует encode/torch, а
+    `summary` лёгкий, поэтому снимок пишет тяжёлая apply-фаза, а `summary` его читает);
   - `applied_today`, `daily_limit` — для дневного лимита (как сейчас).
 - Виджет захватывает stdout по таймеру (≈ раз в 2–3 с), кэширует, парсит через serde.
 - Удаляем запись `scan.json`/`stats-<profile>.json` в питоне и подкоманду `scan-status`;
