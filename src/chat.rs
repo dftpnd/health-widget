@@ -1,4 +1,5 @@
-use egui::{Color32, RichText};
+use crate::theme::Palette;
+use egui::RichText;
 
 pub enum Role {
     Me,
@@ -50,16 +51,17 @@ impl Chat {
         self.input.clear();
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        self.ui_capped(ui, 360.0)
+    pub fn ui(&mut self, p: Palette, ui: &mut egui::Ui) -> Option<String> {
+        self.ui_capped(p, ui, 360.0)
     }
 
-    pub fn ui_capped(&mut self, ui: &mut egui::Ui, max_height: f32) -> Option<String> {
-        self.ui_scrolled(ui, max_height, 0.0)
+    pub fn ui_capped(&mut self, p: Palette, ui: &mut egui::Ui, max_height: f32) -> Option<String> {
+        self.ui_scrolled(p, ui, max_height, 0.0)
     }
 
     pub fn ui_scrolled(
         &mut self,
+        p: Palette,
         ui: &mut egui::Ui,
         max_height: f32,
         wheel: f32,
@@ -69,7 +71,7 @@ impl Chat {
                 RichText::new("нет сообщений")
                     .size(16.0)
                     .italics()
-                    .color(Color32::from_rgb(90, 96, 108)),
+                    .color(p.dim),
             );
         } else {
             if wheel > 0.0 {
@@ -88,8 +90,8 @@ impl Chat {
                     ui.set_min_width(ui.available_width());
                     for msg in &self.messages {
                         let (who, color) = match msg.role {
-                            Role::Me => ("я", Color32::from_rgb(120, 210, 150)),
-                            Role::Bot => ("бот", Color32::from_rgb(130, 180, 250)),
+                            Role::Me => ("я", p.ok),
+                            Role::Bot => ("бот", p.info),
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
@@ -97,7 +99,7 @@ impl Chat {
                             ui.label(
                                 RichText::new(&msg.text)
                                     .size(22.0)
-                                    .color(Color32::from_rgb(205, 210, 220)),
+                                    .color(p.text),
                             );
                         });
                     }
@@ -107,7 +109,7 @@ impl Chat {
                             ui.label(
                                 RichText::new("думаю…")
                                     .size(16.0)
-                                    .color(Color32::from_rgb(140, 146, 158)),
+                                    .color(p.muted),
                             );
                         });
                     }

@@ -24,6 +24,7 @@ mod recorder;
 mod screenshot;
 mod state;
 mod tartarus;
+mod theme;
 mod telemetry;
 mod terminal;
 mod transcribe;
@@ -218,6 +219,8 @@ struct App {
     audio: AudioState,
     avatar: AvatarState,
     pinned: bool,
+    theme: theme::Theme,
+    palette: theme::Palette,
     autopilot: AutopilotState,
     hr_reply: Arc<std::sync::Mutex<hr_reply::HrReplyState>>,
     last_saved: state::State,
@@ -481,6 +484,13 @@ impl App {
 
         let pilot_notify_on = pilot_notify::read_enabled(&cfg.autopilot_dir.join("data"));
 
+        let theme = st
+            .theme
+            .as_deref()
+            .map(theme::Theme::from_label)
+            .unwrap_or(theme::Theme::Dark);
+        let palette = theme.palette(cfg.bg_alpha);
+
         let mut app = Self {
             cfg,
             shared,
@@ -556,6 +566,8 @@ impl App {
                 .as_deref()
                 .map(deepseek::Provider::from_str)
                 .unwrap_or(deepseek::Provider::DeepSeek),
+            theme,
+            palette,
             help_open: false,
             clipboard_preview,
             clip_open: st.clip_open,
@@ -770,6 +782,7 @@ impl App {
             pinned: self.pinned,
             pilot_profile: Some(self.autopilot.profile.clone()),
             llm_provider: Some(self.llm_provider.to_string()),
+            theme: Some(self.theme.label().to_string()),
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             scopes_collapsed: self.scopes_collapsed,
@@ -1048,9 +1061,11 @@ impl App {
         }
     }
     fn draw_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = self.palette;
         let title = self.metrics.title.clone();
         let pinned = self.pinned;
         let mut toggle_pin = false;
+        let mut toggle_theme = false;
         let mut toggle_terminal = false;
         let mut toggle_webmic = false;
         let mut do_restart = false;
@@ -1060,7 +1075,7 @@ impl App {
                     egui::RichText::new(t)
                         .size(15.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(180, 200, 255)),
+                        .color(p.accent),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1071,6 +1086,13 @@ impl App {
                 };
                 if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
                     toggle_pin = true;
+                }
+                if ui
+                    .button(self.theme.icon())
+                    .on_hover_text(self.theme.hint())
+                    .clicked()
+                {
+                    toggle_theme = true;
                 }
                 if ui
                     .button("📁")
@@ -1131,7 +1153,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("✖ {e}"))
                             .size(10.0)
-                            .color(egui::Color32::from_rgb(230, 120, 120)),
+                            .color(p.err),
                     );
                 }
                 if ui
@@ -1155,7 +1177,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .size(10.0)
-                        .color(egui::Color32::from_rgb(90, 96, 108)),
+                        .color(p.dim),
                 )
                 .on_hover_text(format!(
                     "health-widget v{}\ncommit {}\nсборка {}",
@@ -1168,6 +1190,9 @@ impl App {
         if toggle_pin {
             self.pinned = !self.pinned;
             winctl::set_keep_above(self.pinned);
+        }
+        if toggle_theme {
+            self.theme = self.theme.toggled();
         }
         if toggle_terminal {
             self.terminal_open = !self.terminal_open;
@@ -1205,6 +1230,7 @@ impl App {
     }
 
     fn draw_hr_reply_button(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
         let state = self.hr_reply.lock().unwrap().clone();
         let running = matches!(state, hr_reply::HrReplyState::Running);
         match state {
@@ -1215,14 +1241,14 @@ impl App {
                 ui.label(
                     egui::RichText::new("✓")
                         .size(13.0)
-                        .color(egui::Color32::from_rgb(120, 210, 150)),
+                        .color(p.ok),
                 );
             }
             hr_reply::HrReplyState::Error(e) => {
                 ui.label(
                     egui::RichText::new("✖")
                         .size(13.0)
-                        .color(egui::Color32::from_rgb(230, 120, 120)),
+                        .color(p.err),
                 )
                 .on_hover_text(e);
             }
@@ -1253,7 +1279,8 @@ impl App {
     }
 
     fn draw_prompt_editor(&mut self, ctx: &egui::Context) {
-        let accent = egui::Color32::from_rgb(180, 200, 255);
+        let p = self.palette;
+        let accent = p.accent;
         let modal = egui::Modal::new(egui::Id::new("prompt_editor")).show(ctx, |ui| {
             ui.set_max_width(420.0);
             ui.horizontal(|ui| {
@@ -1306,7 +1333,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("✔ применён")
                             .size(10.0)
-                            .color(egui::Color32::from_rgb(120, 210, 150)),
+                            .color(p.ok),
                     );
                 }
             });
@@ -1315,7 +1342,7 @@ impl App {
                 egui::RichText::new("Пусто — вопрос уходит в модель без системного промпта. Хранится в ~/.health-widget-prompts.json, переживает перезапуск виджета.")
                     .size(10.0)
                     .italics()
-                    .color(egui::Color32::from_rgb(120, 126, 138)),
+                    .color(p.muted),
             );
         });
         if modal.should_close() {
@@ -1335,7 +1362,8 @@ impl App {
             ("D-pad", "🕹 Двигать выбранное окно по экрану"),
             ("Колесо", "🖱 Скролл выбранного окна (чат / веб-мик)"),
         ];
-        let accent = egui::Color32::from_rgb(180, 200, 255);
+        let p = self.palette;
+        let accent = p.accent;
         let modal = egui::Modal::new(egui::Id::new("keys_help")).show(ctx, |ui| {
             ui.set_max_width(340.0);
             ui.horizontal(|ui| {
@@ -1363,7 +1391,7 @@ impl App {
                 egui::RichText::new("Остальные клавиши шлют F13–F24 / Ctrl+F13–F21 как глобальные хоткеи.")
                     .size(10.0)
                     .italics()
-                    .color(egui::Color32::from_rgb(120, 126, 138)),
+                    .color(p.muted),
             );
         });
         if modal.should_close() {
@@ -1385,7 +1413,7 @@ impl App {
         let mut refresh = false;
         let mut refresh_mic = false;
 
-        section_sized(ui, "🎧 Звук и транскрипция", min_height, |ui| {
+        section_sized(self.palette, ui, "🎧 Звук и транскрипция", min_height, |ui| {
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(mic_on, "🎤")
@@ -1498,14 +1526,15 @@ impl App {
     }
 
     fn draw_avatar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        section(ui, "🐼 Виртуальная камера", |ui| {
+        let p = self.palette;
+        section(self.palette, ui, "🐼 Виртуальная камера", |ui| {
             let on = self.avatar.cam.as_ref().is_some_and(|c| c.is_running());
             let label = if on { "🐼 Камера: в эфире" } else { "🐼 Камера" };
             if ui.button(label).clicked() {
                 self.toggle_avatar();
             }
             if let Some(err) = &self.avatar.error {
-                ui.colored_label(egui::Color32::RED, err);
+                ui.colored_label(p.err, err);
             }
             let frame = self.avatar.cam.as_ref().and_then(|cam| cam.last_frame());
             if let Some((w, h, rgba)) = frame {
@@ -1554,7 +1583,7 @@ impl App {
     }
 
     fn draw_clipboard(&mut self, ui: &mut egui::Ui) {
-        section(ui, "📋 Буфер", |ui| {
+        section(self.palette, ui, "📋 Буфер", |ui| {
             let label = if self.clip_open {
                 "📋 Скрыть панель"
             } else {
@@ -1654,7 +1683,8 @@ impl App {
             .with_resizable(false)
             .with_inner_size([380.0, 72.0]);
         let id = egui::ViewportId::from_hash_of("hw-clip-panel");
-        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let p = self.palette;
+        let bg = p.bg;
         let mut close = false;
 
         ctx.show_viewport_immediate(id, vb, |cctx, _class| {
@@ -1663,7 +1693,7 @@ impl App {
             }
             let frame = egui::Frame::default()
                 .fill(bg)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+                .stroke(egui::Stroke::new(1.0, p.border))
                 .inner_margin(egui::Margin::same(8))
                 .corner_radius(10);
             let inner = egui::CentralPanel::default().frame(frame).show(cctx, |ui| {
@@ -1680,7 +1710,7 @@ impl App {
                         egui::RichText::new("📋 Буфер")
                             .size(10.5)
                             .strong()
-                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                            .color(p.muted),
                     );
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1750,7 +1780,8 @@ impl App {
             .with_inner_size([self.chat_spawn_size.x, self.chat_spawn_size.y])
             .with_min_inner_size([300.0, 240.0]);
         let id = egui::ViewportId::from_hash_of("hw-chat-panel");
-        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let p = self.palette;
+        let bg = p.bg;
         let mut close = false;
         let mut submitted = None;
 
@@ -1759,9 +1790,9 @@ impl App {
                 close = true;
             }
             let stroke = if self.move_target == MoveTarget::Chat {
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232))
+                egui::Stroke::new(2.0, p.focus)
             } else {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78))
+                egui::Stroke::new(1.0, p.border)
             };
             let frame = egui::Frame::default()
                 .fill(bg)
@@ -1789,7 +1820,7 @@ impl App {
                         egui::RichText::new("💬 Чат")
                             .size(10.5)
                             .strong()
-                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                            .color(p.muted),
                     );
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1801,8 +1832,8 @@ impl App {
                     );
                 });
                 let log_height = (ui.available_height() - 56.0).max(80.0);
-                submitted = self.chat.ui_scrolled(ui, log_height, wheel);
-                draw_resize_grip(ui, cctx, grip_rect);
+                submitted = self.chat.ui_scrolled(p, ui, log_height, wheel);
+                draw_resize_grip(p, ui, cctx, grip_rect);
             });
             self.chat_size = cctx.screen_rect().size();
         });
@@ -1934,7 +1965,8 @@ impl App {
             .with_inner_size([self.web_spawn_size.x, self.web_spawn_size.y])
             .with_min_inner_size([320.0, 280.0]);
         let id = egui::ViewportId::from_hash_of("hw-web-panel");
-        let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+        let p = self.palette;
+        let bg = p.bg;
         let mut close = false;
 
         ctx.show_viewport_immediate(id, vb, |cctx, _class| {
@@ -1948,9 +1980,9 @@ impl App {
                 close = true;
             }
             let stroke = if self.move_target == MoveTarget::Web {
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232))
+                egui::Stroke::new(2.0, p.focus)
             } else {
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78))
+                egui::Stroke::new(1.0, p.border)
             };
             let frame = egui::Frame::default()
                 .fill(bg)
@@ -1978,7 +2010,7 @@ impl App {
                         egui::RichText::new("🌐 Веб-микрофон")
                             .size(10.5)
                             .strong()
-                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                            .color(p.muted),
                     );
                     let (dot, status) = if active {
                         ("🟢", "клиент говорит")
@@ -1990,7 +2022,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{dot} {status}"))
                             .size(10.0)
-                            .color(egui::Color32::from_rgb(140, 146, 158)),
+                            .color(p.muted),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").clicked() {
@@ -2003,7 +2035,7 @@ impl App {
                     egui::RichText::new("🗣 Речь")
                         .size(10.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(120, 130, 150)),
+                        .color(p.muted),
                 );
                 let speech_out = egui::ScrollArea::vertical()
                     .id_salt("web-speech")
@@ -2021,14 +2053,14 @@ impl App {
                                 egui::RichText::new("говори на странице — текст появится тут")
                                     .size(12.0)
                                     .italics()
-                                    .color(egui::Color32::from_rgb(90, 96, 108)),
+                                    .color(p.dim),
                             );
                         }
                         for l in &lines {
                             ui.label(
                                 egui::RichText::new(l)
                                     .size(16.0)
-                                    .color(egui::Color32::from_rgb(205, 210, 220)),
+                                    .color(p.text),
                             );
                         }
                         if !partial.is_empty() {
@@ -2036,7 +2068,7 @@ impl App {
                                 egui::RichText::new(&partial)
                                     .size(16.0)
                                     .italics()
-                                    .color(egui::Color32::from_rgb(130, 136, 148)),
+                                    .color(p.muted),
                             );
                         }
                     });
@@ -2050,7 +2082,7 @@ impl App {
                     egui::RichText::new("📥 Присланное")
                         .size(10.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(120, 130, 150)),
+                        .color(p.muted),
                 );
                 let posts_out = egui::ScrollArea::vertical()
                     .id_salt("web-posts")
@@ -2068,14 +2100,14 @@ impl App {
                                 egui::RichText::new("пришли текст или картинку со страницы")
                                     .size(12.0)
                                     .italics()
-                                    .color(egui::Color32::from_rgb(90, 96, 108)),
+                                    .color(p.dim),
                             );
                         }
-                        for p in &posts {
+                        for post in &posts {
                             let glow = self
                                 .web_fresh_posts
                                 .iter()
-                                .find(|(id, _)| *id == p.id())
+                                .find(|(id, _)| *id == post.id())
                                 .map(|(_, t)| {
                                     1.0 - t.elapsed().as_secs_f32()
                                         / WEB_FRESH_GLOW.as_secs_f32()
@@ -2096,12 +2128,12 @@ impl App {
                                     .inner_margin(egui::Margin::same(4)),
                                 None => egui::Frame::default(),
                             };
-                            frame.show(ui, |ui| match p {
+                            frame.show(ui, |ui| match post {
                                 Snap::Text(_, t) => {
                                     ui.label(
                                         egui::RichText::new(t)
                                             .size(15.0)
-                                            .color(egui::Color32::from_rgb(205, 210, 220)),
+                                            .color(p.text),
                                     );
                                 }
                                 Snap::Image(id) => {
@@ -2119,7 +2151,7 @@ impl App {
                 if posts_out.state.offset.y >= posts_max - 4.0 {
                     self.web_posts_unstuck = false;
                 }
-                draw_resize_grip(ui, cctx, grip_rect);
+                draw_resize_grip(p, ui, cctx, grip_rect);
             });
             self.web_size = cctx.screen_rect().size();
         });
@@ -2131,6 +2163,7 @@ impl App {
     }
 
     fn draw_call(&mut self, ui: &mut egui::Ui, min_height: f32) {
+        let p = self.palette;
         self.reconcile_call_recording();
         let mut call_toggle = false;
         let mut glue_go = false;
@@ -2143,7 +2176,7 @@ impl App {
             .map(|z| z.silent_for())
             .filter(|d| *d >= Duration::from_secs(120))
             .map(|d| d.as_secs() / 60);
-        section_sized(ui, "🎤 Кол", min_height, |ui| {
+        section_sized(p, ui, "🎤 Кол", min_height, |ui| {
             ui.horizontal(|ui| {
                 let recording = active_name.is_some();
                 let (glyph, hint) = if recording {
@@ -2152,9 +2185,9 @@ impl App {
                     ("⏺ Кол", "Начать запись звонка: звук обоих каналов + текст")
                 };
                 let color = if recording {
-                    egui::Color32::from_rgb(210, 200, 120)
+                    p.warn
                 } else {
-                    egui::Color32::from_rgb(230, 120, 120)
+                    p.err
                 };
                 let label = egui::RichText::new(glyph).color(color);
                 if ui.button(label).on_hover_text(hint).clicked() {
@@ -2164,7 +2197,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("⏺ {n}"))
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(230, 120, 120)),
+                            .color(p.err),
                     );
                 }
             });
@@ -2174,23 +2207,23 @@ impl App {
                     Idle => None,
                     Working { total: 0, .. } => Some((
                         "⧗ склеиваю…".to_string(),
-                        egui::Color32::from_rgb(210, 200, 120),
+                        p.warn,
                     )),
                     Working { done, total } => Some((
                         format!("⧗ склеиваю {}/{}…", done + 1, total),
-                        egui::Color32::from_rgb(210, 200, 120),
+                        p.warn,
                     )),
                     Done(0) => Some((
                         "нечего склеивать".to_string(),
-                        egui::Color32::GRAY,
+                        p.muted,
                     )),
                     Done(n) => Some((
                         format!("✔ склеено {n}"),
-                        egui::Color32::from_rgb(120, 200, 120),
+                        p.ok,
                     )),
                     Failed(e) => Some((
                         format!("✖ {e}"),
-                        egui::Color32::from_rgb(230, 120, 120),
+                        p.err,
                     )),
                 }
             };
@@ -2202,11 +2235,11 @@ impl App {
                     Idle => None,
                     Running => Some((
                         format!("▶ 127.0.0.1:{}", calls_web::PORT),
-                        egui::Color32::from_rgb(120, 200, 120),
+                        p.ok,
                     )),
                     Failed(e) => Some((
                         format!("✖ {e}"),
-                        egui::Color32::from_rgb(230, 120, 120),
+                        p.err,
                     )),
                 }
             };
@@ -2236,7 +2269,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!("⚠ телемост молчит {m} мин"))
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(230, 120, 120)),
+                        .color(p.err),
                 );
             }
         });
@@ -2258,6 +2291,7 @@ impl App {
     }
 
     fn draw_screen(&mut self, ui: &mut egui::Ui, min_height: f32) {
+        let p = self.palette;
         let mut shoot = false;
         let shot_line = {
             use screenshot::ShotStatus::*;
@@ -2265,29 +2299,29 @@ impl App {
                 Idle => None,
                 Marking => Some((
                     "⧗ кликни две точки…".to_string(),
-                    egui::Color32::from_rgb(210, 200, 120),
+                    p.warn,
                 )),
                 Working => Some((
                     "⧗ режу…".to_string(),
-                    egui::Color32::from_rgb(210, 200, 120),
+                    p.warn,
                 )),
-                Saved(p) => {
-                    let name = std::path::Path::new(p)
+                Saved(path) => {
+                    let name = std::path::Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("сохранено");
                     Some((
                         format!("✔ {name}"),
-                        egui::Color32::from_rgb(120, 200, 120),
+                        p.ok,
                     ))
                 }
-                Cancelled => Some(("отменено".to_string(), egui::Color32::GRAY)),
+                Cancelled => Some(("отменено".to_string(), p.muted)),
                 Failed(e) => {
-                    Some((format!("✖ {e}"), egui::Color32::from_rgb(230, 120, 120)))
+                    Some((format!("✖ {e}"), p.err))
                 }
             }
         };
-        section_sized(ui, "📸 Скрин", min_height, |ui| {
+        section_sized(p, ui, "📸 Скрин", min_height, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -2313,6 +2347,7 @@ impl App {
     }
 
     fn draw_autopilot(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         if self.cfg.autopilot_bin.exists() {
             use pilot::Phase;
             let mut new_want: Option<Option<Phase>> = None;
@@ -2330,7 +2365,7 @@ impl App {
                     .unwrap_or_else(|| self.autopilot.status.clone())
             };
             let mut ap_collapsed = self.autopilot_collapsed;
-            section_collapsible(ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
+            section_collapsible(pal, ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
                         "Профиль автопилота: аккаунт браузера, резюме и контакты",
@@ -2550,14 +2585,14 @@ impl App {
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(10.0),
-                            color: egui::Color32::from_rgb(120, 128, 140),
+                            color: pal.muted,
                             ..Default::default()
                         },
                     );
                     ui.label(job);
                 }
                 if let Some(s) = &self.autopilot.summary {
-                    let color = egui::Color32::from_rgb(150, 160, 175);
+                    let color = pal.muted;
                     ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new(format!(
@@ -2741,15 +2776,16 @@ impl App {
     }
 
     fn draw_scopes(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
         if self.audio.mic.is_some() || self.audio.zoom.is_some() {
             let mut picked: Option<String> = None;
             let mut clear_mic = false;
             let mut clear_zoom = false;
             let mut collapsed = self.scopes_collapsed;
-            section_collapsible(ui, "📈 Осциллограммы", &mut collapsed, |ui| {
+            section_collapsible(p, ui, "📈 Осциллограммы", &mut collapsed, |ui| {
                 if let Some(mon) = &self.audio.mic {
                     mon.snapshot(&mut self.audio.scope);
-                    let color = egui::Color32::from_rgb(120, 210, 150);
+                    let color = p.ok;
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
@@ -2760,13 +2796,13 @@ impl App {
                             }
                         });
                     });
-                    draw_scope(ui, &self.audio.scope, color);
-                    picked = draw_transcript(ui, mon.transcript(), color, "mic")
+                    draw_scope(p, ui, &self.audio.scope, color);
+                    picked = draw_transcript(p, ui, mon.transcript(), color, "mic")
                         .or(picked.take());
                 }
                 if let Some(mon) = &self.audio.zoom {
                     mon.snapshot(&mut self.audio.scope);
-                    let color = egui::Color32::from_rgb(130, 180, 250);
+                    let color = p.info;
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(
@@ -2778,8 +2814,8 @@ impl App {
                             }
                         });
                     });
-                    draw_scope(ui, &self.audio.scope, color);
-                    picked = draw_transcript(ui, mon.transcript(), color, "zoom")
+                    draw_scope(p, ui, &self.audio.scope, color);
+                    picked = draw_transcript(p, ui, mon.transcript(), color, "zoom")
                         .or(picked.take());
                 }
             });
@@ -2842,8 +2878,9 @@ impl App {
     }
 
     fn draw_chat(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
         let chat_open = self.chat_open;
-        let inner = section_collapsible(ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
+        let inner = section_collapsible(p, ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
             let label = if chat_open {
                 "💬 Прикрепить"
             } else {
@@ -2857,7 +2894,7 @@ impl App {
                 ui.weak("чат в отдельном окне");
                 None
             } else {
-                self.chat.ui(ui)
+                self.chat.ui(p, ui)
             };
             (toggle, submitted)
         });
@@ -2887,6 +2924,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+
+        self.palette = self.theme.palette(self.cfg.bg_alpha);
+        ctx.set_visuals(self.theme.egui_visuals());
 
         self.maybe_reload();
         self.maybe_rotate_profile();
@@ -3014,7 +3054,8 @@ impl eframe::App for App {
         }
 
         if want_visible {
-            let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, self.cfg.bg_alpha);
+            let p = self.palette;
+            let bg = p.bg;
             let frame = egui::Frame::default()
                 .fill(bg)
                 .inner_margin(egui::Margin::same(MARGIN as i8))
@@ -3042,7 +3083,7 @@ impl eframe::App for App {
                 painter.rect_stroke(
                     ctx.screen_rect(),
                     10,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(26, 115, 232)),
+                    egui::Stroke::new(2.0, p.focus),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -3088,7 +3129,7 @@ impl eframe::App for App {
 
                 self.draw_chat(ui);
 
-                draw_resize_grip(ui, ctx, grip_rect);
+                draw_resize_grip(p, ui, ctx, grip_rect);
 
                 ui.min_rect().size()
             });
@@ -3119,42 +3160,46 @@ impl eframe::App for App {
 }
 
 fn section<R>(
+    p: theme::Palette,
     ui: &mut egui::Ui,
     title: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, None, None, add_contents)
+    section_impl(p, ui, title, None, None, add_contents)
 }
 
 fn section_sized<R>(
+    p: theme::Palette,
     ui: &mut egui::Ui,
     title: &str,
     min_height: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, None, Some(min_height), add_contents)
+    section_impl(p, ui, title, None, Some(min_height), add_contents)
 }
 
 fn section_collapsible<R>(
+    p: theme::Palette,
     ui: &mut egui::Ui,
     title: &str,
     collapsed: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_impl(ui, title, Some(collapsed), None, add_contents)
+    section_impl(p, ui, title, Some(collapsed), None, add_contents)
 }
 
 fn section_impl<R>(
+    p: theme::Palette,
     ui: &mut egui::Ui,
     title: &str,
     collapsed: Option<&mut bool>,
     min_height: Option<f32>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    let title_color = egui::Color32::from_rgb(120, 130, 150);
+    let title_color = p.muted;
     egui::Frame::default()
-        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 63, 78)))
+        .fill(p.card)
+        .stroke(egui::Stroke::new(1.0, p.border))
         .inner_margin(egui::Margin::same(8))
         .corner_radius(8)
         .show(ui, |ui| {
@@ -3240,11 +3285,11 @@ fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) 
     }
 }
 
-fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
+fn draw_scope(p: theme::Palette, ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 12, 16));
+    painter.rect_filled(rect, 4.0, p.panel);
 
     if samples.len() < 2 {
         return;
@@ -3264,11 +3309,12 @@ fn draw_scope(ui: &mut egui::Ui, samples: &[f32], color: egui::Color32) {
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
     painter.line_segment(
         [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
-        egui::Stroke::new(0.5, egui::Color32::from_rgb(40, 44, 52)),
+        egui::Stroke::new(0.5, p.grid),
     );
 }
 
 fn draw_transcript(
+    p: theme::Palette,
     ui: &mut egui::Ui,
     data: Option<(String, String)>,
     color: egui::Color32,
@@ -3291,7 +3337,7 @@ fn draw_transcript(
                     egui::RichText::new("… слушаю")
                         .size(11.0)
                         .italics()
-                        .color(egui::Color32::from_rgb(90, 96, 108)),
+                        .color(p.dim),
                 );
                 return None;
             }
@@ -3330,7 +3376,7 @@ fn draw_transcript(
                     egui::RichText::new(&partial)
                         .italics()
                         .size(20.0)
-                        .color(egui::Color32::from_rgb(140, 146, 158)),
+                        .color(p.muted),
                 );
             }
             picked
@@ -3354,7 +3400,7 @@ fn transcript_job(text: &str, color: egui::Color32, wrap: f32) -> egui::text::La
     job
 }
 
-fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
+fn draw_resize_grip(p: theme::Palette, ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
     let resp = ui.interact(
         grip,
         ui.id().with("resize-grip"),
@@ -3370,9 +3416,9 @@ fn draw_resize_grip(ui: &mut egui::Ui, ctx: &egui::Context, grip: egui::Rect) {
     }
 
     let color = if resp.hovered() {
-        egui::Color32::from_rgb(180, 200, 255)
+        p.accent
     } else {
-        egui::Color32::from_rgb(120, 128, 140)
+        p.muted
     };
     let painter = ui.painter_at(grip);
     for i in 1..=3 {
