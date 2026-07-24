@@ -598,6 +598,7 @@ impl App {
         };
         app.toggle_avatar();
         if app.cfg.autopilot_bin.exists() {
+            kill_stray_pilots(&app.cfg.autopilot_bin);
             app.begin_turn();
         } else {
             app.autopilot.cycle = false;
@@ -1218,6 +1219,7 @@ impl App {
             self.toggle_webmic();
         }
         if do_restart {
+            self.autopilot.proc = None;
             rebuild_and_restart();
         }
         if self.help_open {
@@ -3431,6 +3433,13 @@ fn draw_resize_grip(p: theme::Palette, ui: &mut egui::Ui, ctx: &egui::Context, g
             egui::Stroke::new(1.5, color),
         );
     }
+}
+
+fn kill_stray_pilots(bin: &std::path::Path) {
+    let pattern = format!("{} run", bin.display());
+    let _ = std::process::Command::new("pkill")
+        .args(["-TERM", "-f", &pattern])
+        .status();
 }
 
 fn rebuild_and_restart() {
