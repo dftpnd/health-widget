@@ -57,7 +57,7 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
     ("analyst", "Системный аналитик"),
 ];
 
-const APPLY_BATCH_SIZE: i64 = 42;
+const APPLY_BATCH_SIZE: i64 = 27;
 const ENRICH_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -498,7 +498,7 @@ impl App {
 
         let pilot_notify_on = pilot_notify::read_enabled(&cfg.autopilot_dir.join("data"));
 
-        Self {
+        let mut app = Self {
             cfg,
             shared,
             metrics,
@@ -529,7 +529,7 @@ impl App {
                 batch_baseline: 0,
                 apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
-                cycle: false,
+                cycle: true,
                 chat_lap: false,
                 chat_done: HashSet::new(),
                 enrich_until: None,
@@ -600,7 +600,14 @@ impl App {
             web_textures: std::collections::HashMap::new(),
             web_last_post_id: 0,
             web_fresh_posts: Vec::new(),
+        };
+        app.toggle_avatar();
+        if app.cfg.autopilot_bin.exists() {
+            app.enter_apply_lap();
+        } else {
+            app.autopilot.cycle = false;
         }
+        app
     }
 
     fn toggle_avatar(&mut self) {
@@ -1105,6 +1112,7 @@ impl App {
                         self.prompt_draft_2 = self.prompts.prompt_2.clone();
                     }
                 }
+                self.draw_hr_reply_button(ui);
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
                     for p in [deepseek::Provider::DeepSeek, deepseek::Provider::OpenAi] {
@@ -1192,6 +1200,54 @@ impl App {
             self.draw_prompt_editor(ctx);
         }
         ui.add_space(2.0);
+    }
+
+    fn draw_hr_reply_button(&mut self, ui: &mut egui::Ui) {
+        let state = self.hr_reply.lock().unwrap().clone();
+        let running = matches!(state, hr_reply::HrReplyState::Running);
+        match state {
+            hr_reply::HrReplyState::Running => {
+                ui.add(egui::Spinner::new().size(14.0));
+            }
+            hr_reply::HrReplyState::Done => {
+                ui.label(
+                    egui::RichText::new("✓")
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(120, 210, 150)),
+                );
+            }
+            hr_reply::HrReplyState::Error(e) => {
+                ui.label(
+                    egui::RichText::new("✖")
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(230, 120, 120)),
+                )
+                .on_hover_text(e);
+            }
+            hr_reply::HrReplyState::Idle => {}
+        }
+        ui.add_enabled_ui(!running, |ui| {
+            ui.menu_button("✍️", |ui| {
+                for (key, label) in PILOT_PROFILES {
+                    if ui.button(*label).clicked() {
+                        hr_reply::start(
+                            self.hr_reply.clone(),
+                            ui.ctx().clone(),
+                            self.cfg.autopilot_dir.clone(),
+                            self.cfg.autopilot_bin.clone(),
+                            (*key).to_string(),
+                        );
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "Черновик ответа рекрутёру: берёт текст из буфера, \
+                 отвечает через LLM от лица выбранного профиля и кладёт \
+                 ответ обратно в буфер",
+            );
+        });
     }
 
     fn draw_prompt_editor(&mut self, ctx: &egui::Context) {
@@ -2389,56 +2445,6 @@ impl App {
                 });
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let running = matches!(
-                        &*self.hr_reply.lock().unwrap(),
-                        hr_reply::HrReplyState::Running
-                    );
-                    ui.add_enabled_ui(!running, |ui| {
-                        ui.menu_button("✍️ Ответить HR", |ui| {
-                            for (key, label) in PILOT_PROFILES {
-                                if ui.button(*label).clicked() {
-                                    hr_reply::start(
-                                        self.hr_reply.clone(),
-                                        ui.ctx().clone(),
-                                        self.cfg.autopilot_dir.clone(),
-                                        self.cfg.autopilot_bin.clone(),
-                                        (*key).to_string(),
-                                    );
-                                    ui.close_menu();
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "Черновик ответа рекрутёру: берёт текст из буфера, \
-                             отвечает через LLM от лица выбранного профиля и кладёт \
-                             ответ обратно в буфер",
-                        );
-                    });
-                    match &*self.hr_reply.lock().unwrap() {
-                        hr_reply::HrReplyState::Running => {
-                            ui.add(egui::Spinner::new().size(14.0));
-                            ui.label(egui::RichText::new("думаю…").size(11.0));
-                        }
-                        hr_reply::HrReplyState::Done => {
-                            ui.label(
-                                egui::RichText::new("✓ ответ в буфере")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(120, 210, 150)),
-                            );
-                        }
-                        hr_reply::HrReplyState::Error(e) => {
-                            ui.label(
-                                egui::RichText::new(e.clone())
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(230, 120, 120)),
-                            );
-                        }
-                        _ => {}
-                    }
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -2450,7 +2456,7 @@ impl App {
                                     "▶ Начать",
                                     "Начать отклики по соответствию резюме: \
                                      свежее и более релевантное (по навыкам и \
-                                     заголовку) — впереди. Каждые 42 отклика \
+                                     заголовку) — впереди. Каждые 27 откликов \
                                      переключается на другой профиль по кругу, \
                                      пока не упрутся все дневные лимиты.",
                                 )
@@ -2510,33 +2516,31 @@ impl App {
                 }
                 if let Some(scan) = &self.autopilot.scan {
                     let enrich_active = self.autopilot.want == Some(Phase::Enrich);
-                    if enrich_active || scan.unenriched > 0 {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    enrich_active,
-                                    format!("✨ Дообогатить ({})", scan.unenriched),
-                                )
-                                .on_hover_text(
-                                    "Открыть необогащённые вакансии пула и сохранить \
-                                     полное описание, дату публикации и вектор \
-                                     (точный подбор под резюме). Повторно — стоп; \
-                                     по завершении гаснет сама.",
-                                )
-                                .clicked()
-                            {
-                                new_want = Some(if enrich_active {
-                                    None
-                                } else {
-                                    Some(Phase::Enrich)
-                                });
-                            }
-                            if enrich_active {
-                                ui.add(egui::Spinner::new().size(14.0));
-                            }
-                        });
-                    }
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(
+                                enrich_active,
+                                format!("✨ Дообогатить ({})", scan.unenriched),
+                            )
+                            .on_hover_text(
+                                "Открыть необогащённые вакансии пула и сохранить \
+                                 полное описание, дату публикации и вектор \
+                                 (точный подбор под резюме). Повторно — стоп; \
+                                 по завершении гаснет сама.",
+                            )
+                            .clicked()
+                        {
+                            new_want = Some(if enrich_active {
+                                None
+                            } else {
+                                Some(Phase::Enrich)
+                            });
+                        }
+                        if enrich_active {
+                            ui.add(egui::Spinner::new().size(14.0));
+                        }
+                    });
                 }
                 if !status.is_empty() {
                     let mut job = egui::text::LayoutJob::default();

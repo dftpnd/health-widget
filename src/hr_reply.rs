@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub enum HrReplyState {
     Idle,
     Running,
