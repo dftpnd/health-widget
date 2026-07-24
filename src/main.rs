@@ -2160,17 +2160,15 @@ impl App {
                 {
                     glue_go = true;
                 }
-                if let Some((text, color)) = &glue_line {
-                    ui.label(egui::RichText::new(text).size(11.0).color(*color));
-                }
-            });
-            ui.horizontal(|ui| {
                 if ui
                     .button("📺 Колы")
                     .on_hover_text("Открыть склеенные колы в браузере")
                     .clicked()
                 {
                     web_go = true;
+                }
+                if let Some((text, color)) = &glue_line {
+                    ui.label(egui::RichText::new(text).size(11.0).color(*color));
                 }
                 if let Some((text, color)) = &web_line {
                     ui.label(egui::RichText::new(text).size(11.0).color(*color));
