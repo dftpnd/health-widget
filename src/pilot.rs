@@ -158,17 +158,6 @@ impl Drop for Pilot {
     }
 }
 
-pub fn refresh_scan_status(dir: &Path, bin: &Path, profile: &str) {
-    let _ = Command::new(bin)
-        .arg("scan-status")
-        .args(["--profile", profile])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 #[cfg(test)]
 impl Pilot {
     fn pid(&self) -> u32 {

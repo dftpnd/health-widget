@@ -16,8 +16,7 @@ mod frames;
 mod hr_reply;
 mod instance;
 mod pilot;
-mod pilot_scan;
-mod pilot_stats;
+mod pilot_summary;
 mod pilot_notify;
 mod kwin_shot;
 mod prompts;
@@ -57,14 +56,10 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
     ("analyst", "Системный аналитик"),
 ];
 
-const APPLY_BATCH_SIZE: i64 = 27;
+const APPLY_TARGET: i64 = 27;
+const CHAT_REPLY_CAP: i64 = 40;
+const CHAT_TIME_CAP: Duration = Duration::from_secs(30 * 60);
 const ENRICH_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
-
-#[derive(Debug, PartialEq, Eq)]
-enum ApplyChain {
-    Switch(String),
-    Stop,
-}
 
 fn next_eligible_in_order(
     order: &[&str],
@@ -82,29 +77,28 @@ fn next_eligible_in_order(
     })
 }
 
-fn decide_apply_chain(next: Option<&str>, apply_idle: &HashSet<String>) -> ApplyChain {
-    match next {
-        Some(n) if !apply_idle.contains(n) => ApplyChain::Switch(n.to_string()),
-        _ => ApplyChain::Stop,
-    }
-}
-
 fn next_chat_profile(order: &[&str], from: &str, chat_done: &HashSet<String>) -> Option<String> {
     next_eligible_in_order(order, from, |key| !chat_done.contains(key))
+}
+
+fn apply_part_done(applied_in_turn: i64, pool_exhausted: bool) -> bool {
+    pool_exhausted || applied_in_turn >= APPLY_TARGET
+}
+
+fn chat_part_done(replied_in_turn: i64, chats_empty: bool, chat_elapsed: Duration) -> bool {
+    chats_empty || replied_in_turn >= CHAT_REPLY_CAP || chat_elapsed >= CHAT_TIME_CAP
 }
 
 fn enrich_window_over(now: Instant, until: Option<Instant>) -> bool {
     until.is_some_and(|u| now >= u)
 }
 
+fn today_local() -> String {
+    telemetry::now_local()[..10].to_string()
+}
+
 const TERMINAL_W: f32 = 340.0;
 const TOP_ROW_H: f32 = 64.0;
-
-fn profile_stats_path(autopilot_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
-    autopilot_dir
-        .join("data")
-        .join(format!("stats-{profile}.json"))
-}
 
 struct Shared {
     user_visible: AtomicBool,
@@ -134,11 +128,11 @@ struct AutopilotState {
     want: Option<pilot::Phase>,
     profile: String,
     status: String,
-    stats: Option<pilot_stats::PilotStats>,
-    stats_mtime: Option<std::time::SystemTime>,
-    scan: Option<pilot_scan::ScanStatus>,
-    scan_mtime: Option<std::time::SystemTime>,
-    batch_baseline: i64,
+    summary: Option<pilot_summary::Summary>,
+    summary_next: Instant,
+    turn_since: Option<String>,
+    turn_start: Option<Instant>,
+    chat_started_at: Option<Instant>,
     apply_idle: HashSet<String>,
     notify_on: bool,
     cycle: bool,
@@ -472,17 +466,6 @@ impl App {
             });
         }
 
-        if cfg.autopilot_bin.exists() {
-            let dir = cfg.autopilot_dir.clone();
-            let bin = cfg.autopilot_bin.clone();
-            let profile = pilot_profile.clone();
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || {
-                pilot::refresh_scan_status(&dir, &bin, &profile);
-                ctx.request_repaint();
-            });
-        }
-
         let transcript_log = TranscriptLog::open().map(Arc::new);
 
         let mic = if st.mic_on {
@@ -522,11 +505,11 @@ impl App {
                 want: None,
                 profile: pilot_profile,
                 status: String::new(),
-                stats: None,
-                stats_mtime: None,
-                scan: None,
-                scan_mtime: None,
-                batch_baseline: 0,
+                summary: None,
+                summary_next: Instant::now(),
+                turn_since: None,
+                turn_start: None,
+                chat_started_at: None,
                 apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
                 cycle: true,
@@ -603,7 +586,7 @@ impl App {
         };
         app.toggle_avatar();
         if app.cfg.autopilot_bin.exists() {
-            app.enter_apply_lap();
+            app.begin_turn();
         } else {
             app.autopilot.cycle = false;
         }
@@ -817,17 +800,17 @@ impl App {
                 }
             }
         }
-        let stats_path = profile_stats_path(&self.cfg.autopilot_dir, &self.autopilot.profile);
-        let mtime = std::fs::metadata(&stats_path).and_then(|m| m.modified()).ok();
-        if mtime != self.autopilot.stats_mtime {
-            self.autopilot.stats = pilot_stats::load(&stats_path);
-            self.autopilot.stats_mtime = mtime;
-        }
-        let scan_path = self.cfg.autopilot_dir.join("data").join("scan.json");
-        let scan_mtime = std::fs::metadata(&scan_path).and_then(|m| m.modified()).ok();
-        if scan_mtime != self.autopilot.scan_mtime {
-            self.autopilot.scan = pilot_scan::load(&scan_path);
-            self.autopilot.scan_mtime = scan_mtime;
+        if Instant::now() >= self.autopilot.summary_next {
+            let since = self.autopilot.turn_since.clone();
+            if let Some(s) = pilot_summary::fetch(
+                &self.cfg.autopilot_dir,
+                &self.cfg.autopilot_bin,
+                &self.autopilot.profile,
+                since.as_deref(),
+            ) {
+                self.autopilot.summary = Some(s);
+            }
+            self.autopilot.summary_next = Instant::now() + Duration::from_secs(3);
         }
         self.autopilot.notify_on =
             pilot_notify::read_enabled(&self.cfg.autopilot_dir.join("data"));
@@ -836,8 +819,7 @@ impl App {
     fn next_eligible_profile(&self, from: &str) -> Option<String> {
         let order: Vec<&str> = PILOT_PROFILES.iter().map(|(k, _)| *k).collect();
         next_eligible_in_order(&order, from, |key| {
-            let path = profile_stats_path(&self.cfg.autopilot_dir, key);
-            pilot_stats::load(&path)
+            pilot_summary::fetch(&self.cfg.autopilot_dir, &self.cfg.autopilot_bin, key, None)
                 .map(|s| s.daily_limit <= 0 || s.applied_today < s.daily_limit)
                 .unwrap_or(true)
         })
@@ -847,50 +829,84 @@ impl App {
         if self.autopilot.want != Some(pilot::Phase::Apply) {
             return;
         }
-        let Some(stats) = &self.autopilot.stats else {
+        let Some(sum) = &self.autopilot.summary else {
             return;
         };
-        let over_limit = stats.daily_limit > 0 && stats.applied_today >= stats.daily_limit;
-        let batch_done =
-            stats.applied_today - self.autopilot.batch_baseline >= APPLY_BATCH_SIZE;
-        if !over_limit && !batch_done {
+        let over_limit = sum.daily_limit > 0 && sum.applied_today >= sum.daily_limit;
+        let applied_turn = sum.applied.turn;
+        if !over_limit && !apply_part_done(applied_turn, false) {
             return;
         }
+        telemetry::event(
+            "pilot.turn_chat",
+            serde_json::json!({
+                "profile": self.autopilot.profile,
+                "applied_turn": applied_turn,
+                "reason": if over_limit { "daily_limit" } else { "target" },
+            }),
+        );
+        self.enter_chat_part();
+    }
+
+    fn enter_chat_part(&mut self) {
         self.autopilot.apply_idle.clear();
+        self.autopilot.chat_started_at = Some(Instant::now());
+        self.autopilot.want = Some(pilot::Phase::Chat);
+        self.autopilot.status = "🔄 ход: чат".to_string();
+        self.reconcile_pilot();
+    }
+
+    fn maybe_finish_chat_part(&mut self) {
+        if self.autopilot.want != Some(pilot::Phase::Chat) || !self.autopilot.cycle {
+            return;
+        }
+        let Some(sum) = &self.autopilot.summary else {
+            return;
+        };
+        let elapsed = self
+            .autopilot
+            .chat_started_at
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        if chat_part_done(sum.replies.turn, false, elapsed) {
+            self.rotate_to_next_profile();
+        }
+    }
+
+    fn rotate_to_next_profile(&mut self) {
         let cur = self.autopilot.profile.clone();
         let next = self.next_eligible_profile(&cur);
         telemetry::event(
             "pilot.rotate_profile",
-            serde_json::json!({
-                "from": cur,
-                "applied_today": stats.applied_today,
-                "daily_limit": stats.daily_limit,
-                "reason": if over_limit { "daily_limit" } else { "batch" },
-                "next": next,
-            }),
+            serde_json::json!({ "from": cur, "next": next }),
         );
         match next {
             Some(next) => {
-                let path = profile_stats_path(&self.cfg.autopilot_dir, &next);
-                self.autopilot.batch_baseline =
-                    pilot_stats::load(&path).map(|s| s.applied_today).unwrap_or(0);
                 self.autopilot.profile = next;
-                self.autopilot.scan_mtime = None;
-                self.autopilot.stats = None;
-                self.autopilot.stats_mtime = None;
-                self.reconcile_pilot();
+                self.begin_turn();
             }
-            None => {
-                if self.autopilot.cycle {
-                    self.autopilot.applies_exhausted = true;
-                    self.enter_chat_lap();
-                } else {
-                    self.autopilot.want = None;
-                    self.autopilot.status =
-                        "все профили исчерпали дневной лимит откликов".to_string();
-                    self.reconcile_pilot();
-                }
-            }
+            None => self.end_cycle_for_today(),
+        }
+    }
+
+    fn begin_turn(&mut self) {
+        self.autopilot.turn_since = Some(telemetry::now_local());
+        self.autopilot.turn_start = Some(Instant::now());
+        self.autopilot.chat_started_at = None;
+        self.autopilot.summary = None;
+        self.autopilot.summary_next = Instant::now();
+        let scanned_today = pilot_summary::fetch(
+            &self.cfg.autopilot_dir,
+            &self.cfg.autopilot_bin,
+            &self.autopilot.profile,
+            None,
+        )
+        .and_then(|s| s.last_scan_date)
+        .is_some_and(|d| d == today_local());
+        if scanned_today {
+            self.enter_apply_lap();
+        } else {
+            self.enter_scan();
         }
     }
 
@@ -912,24 +928,12 @@ impl App {
         self.autopilot.chat_done.clear();
         self.autopilot.applies_exhausted = false;
         self.autopilot.enrich_until = None;
-        self.autopilot.batch_baseline = self
-            .autopilot
-            .stats
-            .as_ref()
-            .map(|s| s.applied_today)
-            .unwrap_or(0);
         self.autopilot.apply_idle.clear();
         self.autopilot.want = Some(pilot::Phase::Apply);
-        self.autopilot.status = "🔄 цикл: отклики".to_string();
+        self.autopilot.status = "🔄 ход: отклики".to_string();
         self.reconcile_pilot();
     }
 
-    fn enter_chat_lap(&mut self) {
-        self.autopilot.chat_done.clear();
-        self.autopilot.want = Some(pilot::Phase::Chat);
-        self.autopilot.status = "🔄 цикл: чаты".to_string();
-        self.reconcile_pilot();
-    }
 
     fn enter_scan(&mut self) {
         self.autopilot.want = Some(pilot::Phase::ScanAll);
@@ -953,9 +957,7 @@ impl App {
         match next_chat_profile(&order, &cur, &self.autopilot.chat_done) {
             Some(next) => {
                 self.autopilot.profile = next;
-                self.autopilot.scan_mtime = None;
-                self.autopilot.stats = None;
-                self.autopilot.stats_mtime = None;
+                self.autopilot.summary = None;
                 self.reconcile_pilot();
             }
             None => {
@@ -2468,10 +2470,10 @@ impl App {
                         },
                     );
                 });
-                if let Some(scan) = &self.autopilot.scan {
-                    if !scan.groups.is_empty() {
+                if let Some(s) = &self.autopilot.summary {
+                    if !s.groups.is_empty() {
                         ui.add_space(2.0);
-                        let total: i64 = scan.groups.iter().map(|g| g.pending).sum();
+                        let total: i64 = s.groups.iter().map(|g| g.new).sum();
                         if ui
                             .selectable_label(
                                 self.autopilot.want == Some(Phase::ScanAll),
@@ -2491,10 +2493,10 @@ impl App {
                             });
                         }
                         ui.horizontal_wrapped(|ui| {
-                            for g in &scan.groups {
+                            for g in &s.groups {
                                 let active =
                                     self.autopilot.want == Some(Phase::Scan(g.name.clone()));
-                                let label = format!("🔎 {} ({})", g.name, g.pending);
+                                let label = format!("🔎 {} ({})", g.name, g.new);
                                 if ui
                                     .selectable_label(active, label)
                                     .on_hover_text(
@@ -2513,15 +2515,13 @@ impl App {
                             }
                         });
                     }
-                }
-                if let Some(scan) = &self.autopilot.scan {
                     let enrich_active = self.autopilot.want == Some(Phase::Enrich);
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         if ui
                             .selectable_label(
                                 enrich_active,
-                                format!("✨ Дообогатить ({})", scan.unenriched),
+                                format!("✨ Дообогатить ({})", s.unenriched),
                             )
                             .on_hover_text(
                                 "Открыть необогащённые вакансии пула и сохранить \
@@ -2556,32 +2556,50 @@ impl App {
                     );
                     ui.label(job);
                 }
-                if let Some(s) = &self.autopilot.stats {
+                if let Some(s) = &self.autopilot.summary {
                     let color = egui::Color32::from_rgb(150, 160, 175);
+                    ui.add_space(2.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "📨 откликов: {} (сегодня {})",
-                            s.applied_total, s.applied_today
+                            "📨 отклики {}/{} · всего {} (сегодня {}/{})",
+                            s.applied.turn, APPLY_TARGET, s.applied.total,
+                            s.applied_today, s.daily_limit,
                         ))
                         .size(11.0)
                         .color(color),
                     );
                     ui.label(
                         egui::RichText::new(format!(
-                            "💬 чатов обработано: {}",
-                            s.chats_acted
+                            "💬 ответы {}/{} · всего {}",
+                            s.replies.turn, CHAT_REPLY_CAP, s.replies.total,
                         ))
                         .size(11.0)
                         .color(color),
                     );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "🔒 капча {}/{} · 📝 формы {}/{} · 403 {}/{} · 🥀 протухло {}/{}",
+                            s.captcha.turn, s.captcha.total, s.forms.turn, s.forms.total,
+                            s.http_403.turn, s.http_403.total, s.expired.turn, s.expired.total,
+                        ))
+                        .size(11.0)
+                        .color(color),
+                    );
+                    if !s.top.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("⭐ топ: {}", s.top.join(" · ")))
+                                .size(11.0)
+                                .color(color),
+                        );
+                    }
                 }
             });
             self.autopilot_collapsed = ap_collapsed;
             if let Some(p) = new_profile {
                 self.autopilot.profile = p;
-                self.autopilot.scan_mtime = None;
-                self.autopilot.stats = None;
-                self.autopilot.stats_mtime = None;
+                self.autopilot.summary = None;
+                self.autopilot.turn_since = None;
+                self.autopilot.turn_start = None;
                 if self.autopilot.want.is_some() {
                     self.reconcile_pilot();
                 }
@@ -2594,10 +2612,11 @@ impl App {
                 self.autopilot.chat_lap = w == Some(Phase::Chat);
                 if w == Some(Phase::Chat) {
                     self.autopilot.chat_done.clear();
+                    self.autopilot.chat_started_at = Some(Instant::now());
                 }
                 if w == Some(Phase::Apply) {
-                    self.autopilot.batch_baseline =
-                        self.autopilot.stats.as_ref().map(|s| s.applied_today).unwrap_or(0);
+                    self.autopilot.turn_since = Some(telemetry::now_local());
+                    self.autopilot.turn_start = Some(Instant::now());
                     self.autopilot.apply_idle.clear();
                 }
                 self.autopilot.want = w;
@@ -2614,7 +2633,7 @@ impl App {
                     self.reconcile_pilot();
                 } else {
                     self.autopilot.cycle = true;
-                    self.enter_apply_lap();
+                    self.begin_turn();
                 }
             }
             if toggle_pause {
@@ -2871,6 +2890,7 @@ impl eframe::App for App {
 
         self.maybe_reload();
         self.maybe_rotate_profile();
+        self.maybe_finish_chat_part();
         self.maybe_end_enrich_window();
 
         self.wheel_ticks = self.win_move.wheel.swap(0, Ordering::Relaxed);
@@ -2954,59 +2974,17 @@ impl eframe::App for App {
                 && self.autopilot.want == Some(pilot::Phase::Apply)
             {
                 let cur = self.autopilot.profile.clone();
-                let made = self
-                    .autopilot
-                    .stats
-                    .as_ref()
-                    .map(|s| s.applied_today - self.autopilot.batch_baseline)
-                    .unwrap_or(0);
-                if made > 0 {
-                    self.autopilot.apply_idle.clear();
-                } else {
-                    self.autopilot.apply_idle.insert(cur.clone());
-                }
-                let next = self.next_eligible_profile(&cur);
-                let decision = decide_apply_chain(next.as_deref(), &self.autopilot.apply_idle);
-                let reason = match (&decision, next.is_none()) {
-                    (ApplyChain::Stop, true) => "all_limited",
-                    (ApplyChain::Stop, false) => "idle_lap",
-                    (ApplyChain::Switch(_), _) => "switch",
-                };
                 telemetry::event(
-                    "pilot.apply_chain",
-                    serde_json::json!({
-                        "from": cur,
-                        "made": made,
-                        "next": next,
-                        "reason": reason,
-                    }),
+                    "pilot.exit",
+                    serde_json::json!({ "reason": "apply завершён", "profile": cur }),
                 );
-                match decision {
-                    ApplyChain::Switch(next_profile) => {
-                        let path = profile_stats_path(&self.cfg.autopilot_dir, &next_profile);
-                        self.autopilot.batch_baseline =
-                            pilot_stats::load(&path).map(|s| s.applied_today).unwrap_or(0);
-                        self.autopilot.profile = next_profile;
-                        self.autopilot.scan_mtime = None;
-                        self.autopilot.stats = None;
-                        self.autopilot.stats_mtime = None;
-                        self.reconcile_pilot();
-                    }
-                    ApplyChain::Stop => {
-                        if self.autopilot.cycle {
-                            if reason == "all_limited" {
-                                self.autopilot.applies_exhausted = true;
-                            }
-                            self.enter_chat_lap();
-                        } else {
-                            self.autopilot.want = None;
-                            self.autopilot.status =
-                                "все аккаунты обработали пул откликов".to_string();
-                        }
-                    }
+                if self.autopilot.cycle {
+                    self.enter_chat_part();
+                } else {
+                    self.autopilot.want = None;
+                    self.autopilot.status = "отклики остановлены".to_string();
                 }
-            } else if finished == Some(pilot::Phase::Chat)
-                && (self.autopilot.cycle || self.autopilot.chat_lap)
+            } else if finished == Some(pilot::Phase::Chat) && self.autopilot.chat_lap
             {
                 self.advance_chat();
             } else if finished == Some(pilot::Phase::Enrich) && self.autopilot.cycle {
@@ -3640,8 +3618,8 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod apply_chain_tests {
     use super::{
-        decide_apply_chain, enrich_window_over, next_chat_profile, next_eligible_in_order,
-        ApplyChain,
+        apply_part_done, chat_part_done, enrich_window_over, next_chat_profile,
+        next_eligible_in_order,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
@@ -3679,32 +3657,18 @@ mod apply_chain_tests {
     }
 
     #[test]
-    fn decide_switch_when_next_fresh() {
-        let idle = HashSet::new();
-        assert_eq!(
-            decide_apply_chain(Some("back"), &idle),
-            ApplyChain::Switch("back".to_string())
-        );
+    fn apply_part_done_on_target_or_exhaustion() {
+        assert!(apply_part_done(27, false));
+        assert!(apply_part_done(5, true));
+        assert!(!apply_part_done(26, false));
     }
 
     #[test]
-    fn decide_stop_when_next_none() {
-        let idle = HashSet::new();
-        assert_eq!(decide_apply_chain(None, &idle), ApplyChain::Stop);
-    }
-
-    #[test]
-    fn decide_stop_when_next_already_idle() {
-        let idle: HashSet<String> = ["back".to_string()].into_iter().collect();
-        assert_eq!(decide_apply_chain(Some("back"), &idle), ApplyChain::Stop);
-    }
-
-    #[test]
-    fn single_profile_exhausted_stops_after_one_exit() {
-        let mut idle = HashSet::new();
-        idle.insert("fullstack".to_string());
-        let next = next_eligible_in_order(&["fullstack"], "fullstack", |_| true);
-        assert_eq!(decide_apply_chain(next.as_deref(), &idle), ApplyChain::Stop);
+    fn chat_part_done_on_empty_cap_or_time() {
+        assert!(chat_part_done(0, true, Duration::from_secs(1)));
+        assert!(chat_part_done(40, false, Duration::from_secs(1)));
+        assert!(chat_part_done(3, false, Duration::from_secs(31 * 60)));
+        assert!(!chat_part_done(3, false, Duration::from_secs(60)));
     }
 
     #[test]

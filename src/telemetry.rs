@@ -57,6 +57,10 @@ pub fn error(ev: &str, err: &str) {
     event(ev, serde_json::json!({ "err": err }));
 }
 
+pub fn now_local() -> String {
+    fmt_local(now_ms())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
