@@ -94,6 +94,158 @@ fn enrich_window_over(now: Instant, until: Option<Instant>) -> bool {
     until.is_some_and(|u| now >= u)
 }
 
+// Эмпирические стоимости шагов фаз (замер по логам 25.07): скан ~30с/группа,
+// обогащение ~5с/вакансия (медиана интервала между «Обогащено» на 1486 событиях;
+// пауза в конфиге 2–4с + fetch ~2с), отклик ~40с (письмо LLM + отправка).
+const SCAN_GROUP_SECS: u64 = 30;
+const ENRICH_ITEM_SECS: u64 = 5;
+const APPLY_ITEM_SECS: u64 = 40;
+
+fn fmt_eta(secs: u64) -> String {
+    if secs < 60 {
+        "<1м".to_string()
+    } else {
+        format!("{}м", secs.div_ceil(60))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SegState {
+    Done,
+    Active,
+    Pending,
+}
+
+struct PhaseSeg {
+    icon: &'static str,
+    secs: u64,
+    progress: Option<f32>,
+    state: SegState,
+}
+
+fn turn_segments(
+    cur: usize,
+    groups: usize,
+    unenriched: i64,
+    enrich_start: i64,
+    ranked: i64,
+    applied_turn: i64,
+    chat_elapsed: Duration,
+) -> Vec<PhaseSeg> {
+    let target_left = (APPLY_TARGET - applied_turn).max(0);
+    let apply_items = if ranked > 0 {
+        target_left.min(ranked)
+    } else {
+        target_left
+    };
+    let enrich_prog = if enrich_start > 0 {
+        1.0 - unenriched.max(0) as f32 / enrich_start as f32
+    } else {
+        0.0
+    };
+    let chat_left = CHAT_TIME_CAP.saturating_sub(chat_elapsed);
+    let chat_prog = chat_elapsed.as_secs_f32() / CHAT_TIME_CAP.as_secs_f32();
+    let defs: [(&str, u64, Option<f32>); 4] = [
+        ("🔎", groups as u64 * SCAN_GROUP_SECS, None),
+        ("✨", unenriched.max(0) as u64 * ENRICH_ITEM_SECS, Some(enrich_prog)),
+        ("📨", apply_items as u64 * APPLY_ITEM_SECS, Some(
+            applied_turn as f32 / APPLY_TARGET as f32,
+        )),
+        ("💬", chat_left.as_secs(), Some(chat_prog)),
+    ];
+    defs.iter()
+        .enumerate()
+        .map(|(i, &(icon, secs, progress))| PhaseSeg {
+            icon,
+            secs: if i < cur { 0 } else { secs },
+            progress,
+            state: match i.cmp(&cur) {
+                std::cmp::Ordering::Less => SegState::Done,
+                std::cmp::Ordering::Equal => SegState::Active,
+                std::cmp::Ordering::Greater => SegState::Pending,
+            },
+        })
+        .collect()
+}
+
+fn seg_widths(secs: &[u64], min_w: f32, total_w: f32) -> Vec<f32> {
+    let n = secs.len().max(1) as f32;
+    let sum: u64 = secs.iter().sum();
+    let flex = (total_w - min_w * n).max(0.0);
+    secs.iter()
+        .map(|&s| {
+            min_w
+                + if sum > 0 {
+                    flex * s as f32 / sum as f32
+                } else {
+                    0.0
+                }
+        })
+        .collect()
+}
+
+fn draw_turn_bar(ui: &mut egui::Ui, pal: &theme::Palette, segs: &[PhaseSeg]) {
+    let h = 16.0;
+    let gap = 3.0;
+    let avail = ui.available_width().min(300.0);
+    let secs: Vec<u64> = segs.iter().map(|s| s.secs).collect();
+    let widths = seg_widths(
+        &secs,
+        26.0,
+        avail - gap * (segs.len().saturating_sub(1)) as f32,
+    );
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let colors = [pal.info, pal.accent, pal.ok, pal.warn];
+    let mut x = rect.left();
+    let mut pulse = false;
+    for (i, (seg, w)) in segs.iter().zip(&widths).enumerate() {
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(*w, h));
+        let c = colors[i % colors.len()];
+        painter.rect_filled(r, 4.0, c.gamma_multiply(0.18));
+        let fill = match seg.state {
+            SegState::Done => 1.0,
+            SegState::Pending => 0.0,
+            SegState::Active => match seg.progress {
+                Some(p) => p.clamp(0.0, 1.0),
+                None => {
+                    pulse = true;
+                    (ui.input(|inp| inp.time * 1.6).sin() * 0.4 + 0.5) as f32
+                }
+            },
+        };
+        if fill > 0.0 {
+            let fr = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * fill, h));
+            let alpha = if seg.state == SegState::Done { 0.4 } else { 0.85 };
+            painter.rect_filled(fr, 4.0, c.gamma_multiply(alpha));
+        }
+        if seg.state == SegState::Active {
+            painter.rect_stroke(r, 4.0, egui::Stroke::new(1.0, c), egui::StrokeKind::Inside);
+        }
+        let label = if seg.state == SegState::Done || *w < 46.0 {
+            seg.icon.to_string()
+        } else {
+            format!("{} {}", seg.icon, fmt_eta(seg.secs))
+        };
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(9.5),
+            pal.text,
+        );
+        x += w + gap;
+    }
+    if pulse {
+        ui.ctx().request_repaint_after(Duration::from_millis(120));
+    }
+    resp.on_hover_text(
+        "Ход профиля: скан → обогащение → отклики → чат. Ширина — оставшееся время \
+         фазы (30с/группа, 11с/вакансия, 40с/отклик; чат — остаток крышки 30м), \
+         заливка — прогресс.",
+    );
+}
+
 fn today_local() -> String {
     telemetry::now_local()[..10].to_string()
 }
@@ -141,6 +293,7 @@ struct AutopilotState {
     chat_done: HashSet<String>,
     enrich_until: Option<Instant>,
     applies_exhausted: bool,
+    enrich_start: Option<i64>,
 }
 
 struct ShotState {
@@ -527,6 +680,7 @@ impl App {
                 chat_done: HashSet::new(),
                 enrich_until: None,
                 applies_exhausted: false,
+                enrich_start: None,
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
@@ -972,6 +1126,7 @@ impl App {
             Some(next) => {
                 self.autopilot.profile = next;
                 self.autopilot.summary = None;
+                self.autopilot.chat_started_at = Some(Instant::now());
                 self.reconcile_pilot();
             }
             None => {
@@ -2596,14 +2751,64 @@ impl App {
                 if let Some(s) = &self.autopilot.summary {
                     let color = pal.muted;
                     ui.add_space(2.0);
+                    if let Some(w) = self.autopilot.want.clone() {
+                        if w == Phase::Enrich {
+                            if self.autopilot.enrich_start.is_none() {
+                                self.autopilot.enrich_start = Some(s.unenriched.max(1));
+                            }
+                        } else {
+                            self.autopilot.enrich_start = None;
+                        }
+                        let cur = match w {
+                            Phase::Scan(_) | Phase::ScanAll => 0,
+                            Phase::Enrich => 1,
+                            Phase::Apply => 2,
+                            Phase::Chat => 3,
+                        };
+                        let chat_elapsed = self
+                            .autopilot
+                            .chat_started_at
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        let segs = turn_segments(
+                            cur,
+                            s.groups.len(),
+                            s.unenriched,
+                            self.autopilot.enrich_start.unwrap_or(0),
+                            s.ranked,
+                            s.applied.turn,
+                            chat_elapsed,
+                        );
+                        draw_turn_bar(ui, &pal, &segs);
+                        ui.add_space(2.0);
+                    }
                     ui.label(
                         egui::RichText::new(format!(
-                            "📨 отклики {}/{} · всего {} (сегодня {}/{})",
-                            s.applied.turn, APPLY_TARGET, s.applied.total,
+                            "🗂 база {} · сегодня +{} найдено · ✨ {} обогащено",
+                            s.pool_total, s.found_today, s.enriched_today,
+                        ))
+                        .size(11.0)
+                        .color(color),
+                    );
+                    let plan = if s.ranked > 0 {
+                        let items = (APPLY_TARGET - s.applied.turn).max(0).min(s.ranked);
+                        format!(" · план хода {}", s.applied.turn + items)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "📨 отклики {}/{}{} · всего {} (сегодня {}/{})",
+                            s.applied.turn, APPLY_TARGET, plan, s.applied.total,
                             s.applied_today, s.daily_limit,
                         ))
                         .size(11.0)
                         .color(color),
+                    )
+                    .on_hover_text(
+                        "план хода = сколько откликов реально выйдет в этом цикле: \
+                         цель 27, но не больше числа кандидатов после фильтров \
+                         (группы, стоп-слова, порог релевантности)",
                     );
                     ui.label(
                         egui::RichText::new(format!(
@@ -2637,6 +2842,10 @@ impl App {
                 self.autopilot.summary = None;
                 self.autopilot.turn_since = None;
                 self.autopilot.turn_start = None;
+                self.autopilot.enrich_start = None;
+                self.autopilot.chat_started_at = (self.autopilot.want
+                    == Some(Phase::Chat))
+                .then(Instant::now);
                 if self.autopilot.want.is_some() {
                     self.reconcile_pilot();
                 }
@@ -3029,6 +3238,18 @@ impl eframe::App for App {
             } else if finished == Some(pilot::Phase::Chat) && self.autopilot.chat_lap
             {
                 self.advance_chat();
+            } else if finished == Some(pilot::Phase::Chat)
+                && self.autopilot.cycle
+                && self.autopilot.want == Some(pilot::Phase::Chat)
+            {
+                telemetry::event(
+                    "pilot.exit",
+                    serde_json::json!({
+                        "reason": "чат разобран",
+                        "profile": self.autopilot.profile,
+                    }),
+                );
+                self.rotate_to_next_profile();
             } else if finished == Some(pilot::Phase::Enrich) && self.autopilot.cycle {
                 if self.autopilot.applies_exhausted {
                     self.end_cycle_for_today();
@@ -3674,7 +3895,7 @@ fn main() -> eframe::Result<()> {
 mod apply_chain_tests {
     use super::{
         apply_part_done, chat_part_done, enrich_window_over, next_chat_profile,
-        next_eligible_in_order,
+        next_eligible_in_order, seg_widths, turn_segments, SegState,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
@@ -3724,6 +3945,37 @@ mod apply_chain_tests {
         assert!(chat_part_done(40, false, Duration::from_secs(1)));
         assert!(chat_part_done(3, false, Duration::from_secs(31 * 60)));
         assert!(!chat_part_done(3, false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn turn_segments_states_and_secs() {
+        // Активная фаза — отклики (cur=2): скан/обогащение позади (secs=0),
+        // откликов осталось min(27-7, ranked=10)=10 × 40с, чат впереди с крышкой.
+        let segs = turn_segments(2, 4, 0, 0, 10, 7, Duration::ZERO);
+        assert_eq!(
+            segs.iter().map(|s| s.state).collect::<Vec<_>>(),
+            [SegState::Done, SegState::Done, SegState::Active, SegState::Pending],
+        );
+        assert_eq!(segs[0].secs, 0);
+        assert_eq!(segs[2].secs, 10 * 40);
+        assert_eq!(segs[3].secs, 30 * 60);
+        // Обогащение на середине: 100 из стартовых 200 → прогресс 0.5.
+        let segs = turn_segments(1, 4, 100, 200, 0, 0, Duration::ZERO);
+        assert_eq!(segs[1].state, SegState::Active);
+        assert!((segs[1].progress.unwrap() - 0.5).abs() < 1e-6);
+        // У скана прогресс неизвестен (индикация пульсом).
+        let segs = turn_segments(0, 4, 0, 0, 0, 0, Duration::ZERO);
+        assert!(segs[0].progress.is_none());
+    }
+
+    #[test]
+    fn seg_widths_min_plus_proportional() {
+        let w = seg_widths(&[0, 100, 300, 0], 20.0, 480.0);
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[0], 20.0);
+        assert!((w[1] - 120.0).abs() < 0.5); // 20 + 400×(100/400)
+        assert!((w[2] - 320.0).abs() < 0.5); // 20 + 400×(300/400)
+        assert!((w.iter().sum::<f32>() - 480.0).abs() < 0.5);
     }
 
     #[test]

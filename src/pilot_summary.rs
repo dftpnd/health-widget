@@ -37,9 +37,17 @@ pub struct Summary {
     #[serde(default)]
     pub unenriched: i64,
     #[serde(default)]
+    pub pool_total: i64,
+    #[serde(default)]
+    pub found_today: i64,
+    #[serde(default)]
+    pub enriched_today: i64,
+    #[serde(default)]
     pub last_scan_date: Option<String>,
     #[serde(default)]
     pub top: Vec<String>,
+    #[serde(default)]
+    pub ranked: i64,
     #[serde(default)]
     pub applied_today: i64,
     #[serde(default)]
@@ -72,7 +80,8 @@ mod tests {
           "captcha":{"turn":1,"total":20},"forms":{"turn":0,"total":7},
           "http_403":{"turn":5,"total":210},"expired":{"turn":4,"total":190},
           "groups":[{"name":"Backend Go","new":8},{"name":"Rust","new":2}],
-          "unenriched":10,"last_scan_date":"2026-07-24","top":["Go dev"],
+          "unenriched":10,"pool_total":530,"found_today":42,"enriched_today":18,
+          "last_scan_date":"2026-07-24","top":["Go dev"],"ranked":17,
           "applied_today":12,"daily_limit":200,"updated_at":"x"
         }"#;
         let s: Summary = serde_json::from_str(js).unwrap();
@@ -80,5 +89,9 @@ mod tests {
         assert_eq!(s.groups.len(), 2);
         assert_eq!(s.top, vec!["Go dev".to_string()]);
         assert_eq!(s.last_scan_date.as_deref(), Some("2026-07-24"));
+        assert_eq!(s.pool_total, 530);
+        assert_eq!(s.found_today, 42);
+        assert_eq!(s.enriched_today, 18);
+        assert_eq!(s.ranked, 17);
     }
 }
