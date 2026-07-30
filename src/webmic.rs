@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::transcribe::{Feeder, Transcriber, Transcript};
+use crate::transcribe::{Health, Stt, Transcript};
 use crate::transcript_log::TranscriptLog;
 
 pub const PORT: u16 = 8787;
@@ -154,11 +154,12 @@ fn serve_loop(
     shared: Arc<Mutex<Shared>>,
     token: Option<String>,
 ) {
-    let mut stt: Option<(Transcriber, Feeder)> = None;
+    let mut stt: Option<Arc<Stt>> = None;
     let mut last_audio: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
         if stt.is_some()
-            && last_audio.is_some_and(|t| t.elapsed() > IDLE_STT_STOP)
+            && (!crate::transcribe::is_enabled()
+                || last_audio.is_some_and(|t| t.elapsed() > IDLE_STT_STOP))
         {
             stt = None;
             if let Ok(mut g) = shared.lock() {
@@ -182,7 +183,7 @@ fn handle_request(
     log: &Option<Arc<TranscriptLog>>,
     shared: &Arc<Mutex<Shared>>,
     stop: &Arc<AtomicBool>,
-    stt: &mut Option<(Transcriber, Feeder)>,
+    stt: &mut Option<Arc<Stt>>,
     last_audio: &mut Option<Instant>,
     token: Option<&str>,
 ) {
@@ -309,26 +310,26 @@ fn on_audio(
     channel: &'static str,
     log: &Option<Arc<TranscriptLog>>,
     shared: &Arc<Mutex<Shared>>,
-    stt: &mut Option<(Transcriber, Feeder)>,
+    stt: &mut Option<Arc<Stt>>,
     last_audio: &mut Option<Instant>,
 ) -> serde_json::Value {
     let samples = pcm_from_le(body);
     if !samples.is_empty() {
         *last_audio = Some(Instant::now());
-        if stt.is_none() {
-            *stt = Transcriber::start(rate_from_url(url), channel, log.clone());
+        if stt.is_none() && crate::transcribe::is_enabled() {
+            *stt = Some(Stt::new(rate_from_url(url), channel, log.clone(), true));
         }
     }
     let mut finals: Vec<String> = Vec::new();
     let mut partial = String::new();
-    let stt_alive = match stt.as_mut() {
-        Some((t, f)) => {
-            f.feed(&samples);
-            if let Ok(mut q) = t.fresh_handle().lock() {
+    let stt_alive = match stt.as_ref() {
+        Some(s) => {
+            s.feed(&samples);
+            if let Ok(mut q) = s.fresh_handle().lock() {
                 finals.extend(q.drain(..));
             }
-            partial = t.text().1;
-            true
+            partial = s.text().1;
+            s.health() == Health::Live
         }
         None => false,
     };

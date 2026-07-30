@@ -18,6 +18,9 @@ impl TranscriptLog {
             let _ = std::fs::create_dir_all(dir);
         }
         let conn = Connection::open(&path).ok()?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transcript (
                  id      INTEGER PRIMARY KEY,
@@ -67,13 +70,18 @@ impl TranscriptLog {
         if text.is_empty() {
             return;
         }
-        let call_id = self.current_call.lock().ok().and_then(|g| *g);
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO transcript(session, call_id, channel, text) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![self.session, call_id, channel, text],
-            );
+        let call_id = self
+            .current_call
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_owned();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = conn.execute(
+            "INSERT INTO transcript(session, call_id, channel, text) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![self.session, call_id, channel, text],
+        ) {
+            crate::telemetry::error("transcript.insert_fail", &e.to_string());
         }
     }
 

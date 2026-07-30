@@ -3,13 +3,59 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::transcript_log::TranscriptLog;
 
 const STT_RATE: f64 = 16000.0;
 const MAX_FINALS: usize = 50_000;
 const FRESH_CAP: usize = 32;
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+const RETRY_COLD: Duration = Duration::from_secs(300);
+const WARMUP: Duration = Duration::from_secs(25);
+const DIED_YOUNG: Duration = Duration::from_secs(20);
+const YOUNG_STREAK_MAX: u32 = 3;
+const SPEECH_RMS: f32 = 0.015;
+const STALL_SPEECH_SECS: f32 = 90.0;
+const WEB_RESERVE_MIB: u64 = 5000;
+const LINGER: Duration = Duration::from_secs(10);
+
+static START_GATE: Mutex<Option<Instant>> = Mutex::new(None);
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+fn guard<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn rms(batch: &[f32]) -> f32 {
+    if batch.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = batch.iter().map(|v| v * v).sum();
+    (sum / batch.len() as f32).sqrt()
+}
+
+struct StartFail {
+    why: String,
+    retry_in: Option<Duration>,
+}
+
+impl StartFail {
+    fn hard(why: impl Into<String>) -> Self {
+        Self { why: why.into(), retry_in: None }
+    }
+}
 
 #[derive(Default)]
 pub struct Transcript {
@@ -17,9 +63,26 @@ pub struct Transcript {
     pub partial: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Health {
+    Off,
+    Starting,
+    Warmup,
+    Live,
+    Down(String),
+}
+
+impl Health {
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Health::Down(why) => Some(format!("⚠ распознавание не работает: {why}")),
+            _ => None,
+        }
+    }
+}
+
 pub struct Transcriber {
-    state: Arc<Mutex<Transcript>>,
-    fresh: Arc<Mutex<VecDeque<String>>>,
+    alive: Arc<AtomicBool>,
     child: Child,
     channel: &'static str,
 }
@@ -35,6 +98,10 @@ pub struct Feeder {
 }
 
 impl Feeder {
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
     pub fn feed(&mut self, s: &[f32]) {
         if self.dead || s.is_empty() {
             return;
@@ -68,27 +135,38 @@ impl Feeder {
 }
 
 impl Transcriber {
-    pub fn start(
+    fn start(
         src_rate: u32,
         channel: &'static str,
         log: Option<Arc<TranscriptLog>>,
-    ) -> Option<(Transcriber, Feeder)> {
-        if std::env::var("HEALTH_TRANSCRIBE").as_deref() == Ok("0") {
-            return None;
-        }
-        if let Some(free) = free_vram_mib() {
-            let need = min_free_mib();
-            if free < need {
-                crate::telemetry::error(
-                    "stt.low_vram",
-                    &format!("{channel}: свободно {free} MiB < порога {need} MiB"),
-                );
-                return None;
+        state: Arc<Mutex<Transcript>>,
+        fresh: Arc<Mutex<VecDeque<String>>>,
+        out_seq: Arc<AtomicU64>,
+    ) -> Result<(Transcriber, Feeder), StartFail> {
+        let mut gate = guard(&START_GATE);
+        if let Some(last) = *gate {
+            let since = last.elapsed();
+            if since < WARMUP {
+                return Err(StartFail {
+                    why: "жду прогрева соседнего канала".to_string(),
+                    retry_in: Some(WARMUP - since),
+                });
             }
         }
-        let python = python_path()?;
+        if let Some(free) = free_vram_mib() {
+            let need = need_mib(channel);
+            if free < need {
+                let why = if need > min_free_mib() {
+                    format!("мало VRAM ({free} < {need} МиБ, держу место под веб-канал)")
+                } else {
+                    format!("мало VRAM ({free} МиБ < {need} МиБ)")
+                };
+                return Err(StartFail::hard(why));
+            }
+        }
+        let python = python_path().ok_or_else(|| StartFail::hard("нет venv-whisper"))?;
         let model = model_spec();
-        let script = ensure_script()?;
+        let script = ensure_script().ok_or_else(|| StartFail::hard("нет whisper_stream.py"))?;
 
         let mut child = Command::new(&python)
             .arg(&script)
@@ -97,7 +175,7 @@ impl Transcriber {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
+            .map_err(|e| StartFail::hard(format!("не запустился: {e}")))?;
 
         let pid = child.id();
         if let Some(errout) = child.stderr.take() {
@@ -116,14 +194,14 @@ impl Transcriber {
             });
         }
 
-        let stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-        let state = Arc::new(Mutex::new(Transcript::default()));
-        let fresh: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let stdin = child.stdin.take().ok_or_else(|| StartFail::hard("нет stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| StartFail::hard("нет stdout"))?;
+        let alive = Arc::new(AtomicBool::new(true));
 
         {
             let state = state.clone();
             let fresh = fresh.clone();
+            let alive = alive.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 let mut reason = "eof";
@@ -139,7 +217,8 @@ impl Transcriber {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let Ok(mut g) = state.lock() else { break };
+                    out_seq.fetch_add(1, Ordering::Relaxed);
+                    let mut g = guard(&state);
                     if let Some(p) = v.get("partial").and_then(|p| p.as_str()) {
                         g.partial = p.to_string();
                     } else if let Some(t) = v.get("final").and_then(|t| t.as_str()) {
@@ -149,7 +228,8 @@ impl Transcriber {
                         g.finals.push_str(t);
                         trim_head(&mut g.finals, MAX_FINALS);
                         g.partial.clear();
-                        if let Ok(mut q) = fresh.lock() {
+                        {
+                            let mut q = guard(&fresh);
                             if q.len() >= FRESH_CAP {
                                 q.pop_front();
                             }
@@ -160,6 +240,7 @@ impl Transcriber {
                         }
                     }
                 }
+                alive.store(false, Ordering::Relaxed);
                 crate::telemetry::event(
                     "stt.reader.end",
                     serde_json::json!({ "channel": channel, "reason": reason }),
@@ -176,11 +257,236 @@ impl Transcriber {
             dead: false,
             channel,
         };
+        *gate = Some(Instant::now());
         crate::telemetry::event(
             "stt.start",
             serde_json::json!({ "channel": channel, "model": model }),
         );
-        Some((Transcriber { state, fresh, child, channel }, feeder))
+        Ok((Transcriber { alive, child, channel }, feeder))
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    fn linger(&mut self) {
+        let deadline = Instant::now() + LINGER;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => return,
+            }
+        }
+        crate::telemetry::event(
+            "stt.linger.timeout",
+            serde_json::json!({ "channel": self.channel }),
+        );
+    }
+}
+
+struct Retry {
+    next: Instant,
+    delay: Duration,
+    young_streak: u32,
+}
+
+struct Stall {
+    seen_seq: u64,
+    speech_secs: f32,
+}
+
+struct Live {
+    transcriber: Option<Transcriber>,
+    feeder: Option<Feeder>,
+    started: Instant,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.feeder.take();
+        if let Some(mut t) = self.transcriber.take() {
+            std::thread::spawn(move || t.linger());
+        }
+    }
+}
+
+pub struct Stt {
+    state: Arc<Mutex<Transcript>>,
+    fresh: Arc<Mutex<VecDeque<String>>>,
+    out_seq: Arc<AtomicU64>,
+    live: Mutex<Option<Live>>,
+    retry: Mutex<Retry>,
+    stall: Mutex<Stall>,
+    health: Mutex<Health>,
+    enabled: bool,
+    src_rate: u32,
+    channel: &'static str,
+    log: Option<Arc<TranscriptLog>>,
+}
+
+impl Stt {
+    pub fn new(
+        src_rate: u32,
+        channel: &'static str,
+        log: Option<Arc<TranscriptLog>>,
+        want: bool,
+    ) -> Arc<Self> {
+        let enabled =
+            want && is_enabled() && std::env::var("HEALTH_TRANSCRIBE").as_deref() != Ok("0");
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(Transcript::default())),
+            fresh: Arc::new(Mutex::new(VecDeque::new())),
+            out_seq: Arc::new(AtomicU64::new(0)),
+            live: Mutex::new(None),
+            retry: Mutex::new(Retry { next: Instant::now(), delay: RETRY_MIN, young_streak: 0 }),
+            stall: Mutex::new(Stall { seen_seq: 0, speech_secs: 0.0 }),
+            health: Mutex::new(if enabled { Health::Starting } else { Health::Off }),
+            enabled,
+            src_rate,
+            channel,
+            log,
+        })
+    }
+
+    pub fn feed(&self, batch: &[f32]) {
+        if !self.enabled {
+            return;
+        }
+        let mut live = guard(&self.live);
+        if live.is_none() {
+            self.try_start(&mut live);
+        }
+        let Some(l) = live.as_mut() else {
+            return;
+        };
+        let (Some(feeder), Some(transcriber)) = (l.feeder.as_mut(), l.transcriber.as_ref()) else {
+            return;
+        };
+        feeder.feed(batch);
+        let fault = if feeder.is_dead() || !transcriber.is_alive() {
+            Some(("процесс распознавания упал", "died"))
+        } else if self.stalled(batch) {
+            Some(("нет ответа от распознавания", "stall"))
+        } else {
+            None
+        };
+        let Some((why, kind)) = fault else {
+            return;
+        };
+        let young = l.started.elapsed() < DIED_YOUNG;
+        drop(live.take());
+        self.reset_stall();
+        crate::telemetry::event(
+            "stt.fault",
+            serde_json::json!({ "channel": self.channel, "kind": kind, "young": young }),
+        );
+        let cold = {
+            let mut r = guard(&self.retry);
+            r.young_streak = if young { r.young_streak + 1 } else { 0 };
+            r.young_streak >= YOUNG_STREAK_MAX
+        };
+        if cold {
+            self.set_health(Health::Down(
+                "распознавание падает на старте, пауза 5 мин".to_string(),
+            ));
+            let mut r = guard(&self.retry);
+            r.next = Instant::now() + RETRY_COLD;
+            r.delay = RETRY_MIN;
+            r.young_streak = 0;
+        } else {
+            self.set_health(Health::Down(why.to_string()));
+            self.schedule_retry();
+        }
+    }
+
+    fn stalled(&self, batch: &[f32]) -> bool {
+        let seq = self.out_seq.load(Ordering::Relaxed);
+        let mut s = guard(&self.stall);
+        if seq != s.seen_seq {
+            s.seen_seq = seq;
+            s.speech_secs = 0.0;
+            return false;
+        }
+        if rms(batch) >= SPEECH_RMS {
+            s.speech_secs += batch.len() as f32 / self.src_rate as f32;
+        }
+        s.speech_secs >= STALL_SPEECH_SECS
+    }
+
+    fn reset_stall(&self) {
+        let mut s = guard(&self.stall);
+        s.seen_seq = self.out_seq.load(Ordering::Relaxed);
+        s.speech_secs = 0.0;
+    }
+
+    fn try_start(&self, live: &mut Option<Live>) {
+        if Instant::now() < guard(&self.retry).next {
+            return;
+        }
+        match Transcriber::start(
+            self.src_rate,
+            self.channel,
+            self.log.clone(),
+            self.state.clone(),
+            self.fresh.clone(),
+            self.out_seq.clone(),
+        ) {
+            Ok((transcriber, feeder)) => {
+                *live = Some(Live {
+                    transcriber: Some(transcriber),
+                    feeder: Some(feeder),
+                    started: Instant::now(),
+                });
+                self.reset_stall();
+                let mut r = guard(&self.retry);
+                r.delay = RETRY_MIN;
+                r.next = Instant::now();
+                drop(r);
+                self.set_health(Health::Live);
+            }
+            Err(fail) => {
+                match fail.retry_in {
+                    Some(d) => {
+                        self.set_health(Health::Warmup);
+                        guard(&self.retry).next = Instant::now() + d;
+                    }
+                    None => {
+                        self.set_health(Health::Down(fail.why));
+                        self.schedule_retry();
+                    }
+                }
+            }
+        }
+    }
+
+    fn schedule_retry(&self) {
+        let mut r = guard(&self.retry);
+        r.next = Instant::now() + r.delay;
+        r.delay = next_delay(r.delay);
+    }
+
+    fn set_health(&self, next: Health) {
+        let mut g = guard(&self.health);
+        if *g == next {
+            return;
+        }
+        *g = next.clone();
+        let (status, why) = match &next {
+            Health::Off => ("off", String::new()),
+            Health::Starting => ("starting", String::new()),
+            Health::Warmup => ("warmup", String::new()),
+            Health::Live => ("live", String::new()),
+            Health::Down(w) => ("down", w.clone()),
+        };
+        crate::telemetry::event(
+            "stt.health",
+            serde_json::json!({ "channel": self.channel, "status": status, "why": why }),
+        );
+    }
+
+    pub fn health(&self) -> Health {
+        guard(&self.health).clone()
     }
 
     pub fn fresh_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
@@ -192,17 +498,14 @@ impl Transcriber {
     }
 
     pub fn text(&self) -> (String, String) {
-        match self.state.lock() {
-            Ok(g) => (g.finals.clone(), g.partial.clone()),
-            Err(_) => (String::new(), String::new()),
-        }
+        let g = guard(&self.state);
+        (g.finals.clone(), g.partial.clone())
     }
 
     pub fn clear(&self) {
-        if let Ok(mut g) = self.state.lock() {
-            g.finals.clear();
-            g.partial.clear();
-        }
+        let mut g = guard(&self.state);
+        g.finals.clear();
+        g.partial.clear();
     }
 }
 
@@ -256,6 +559,15 @@ fn min_free_mib() -> u64 {
         .unwrap_or(5000)
 }
 
+fn need_mib(channel: &str) -> u64 {
+    let base = min_free_mib();
+    if channel == crate::CH_MIC {
+        base + WEB_RESERVE_MIB
+    } else {
+        base
+    }
+}
+
 fn ensure_script() -> Option<PathBuf> {
     const SRC: &str = include_str!("../scripts/whisper_stream.py");
     let path = script_path()?;
@@ -267,6 +579,10 @@ fn ensure_script() -> Option<PathBuf> {
         std::fs::write(&path, SRC).ok()?;
     }
     Some(path)
+}
+
+fn next_delay(cur: Duration) -> Duration {
+    (cur * 2).min(RETRY_MAX)
 }
 
 fn trim_head(s: &mut String, max: usize) {
@@ -284,7 +600,55 @@ fn trim_head(s: &mut String, max: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_free_mib, trim_head};
+    use super::{next_delay, parse_free_mib, rms, trim_head, Health, Stt, SPEECH_RMS, RETRY_MAX, RETRY_MIN};
+    use std::time::Duration;
+
+    #[test]
+    fn mic_yields_vram_to_web_channel() {
+        let base = super::need_mib(crate::CH_ZOOM);
+        assert_eq!(super::need_mib(crate::CH_WEB), base, "веб не уступает");
+        assert_eq!(
+            super::need_mib(crate::CH_MIC),
+            base + super::WEB_RESERVE_MIB,
+            "микрофон стартует только если остаётся место под веб"
+        );
+    }
+
+    #[test]
+    fn rms_separates_speech_from_room_noise() {
+        assert_eq!(rms(&[]), 0.0);
+        let quiet: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 1e-3 } else { -1e-3 }).collect();
+        assert!(rms(&quiet) < SPEECH_RMS, "фоновый шум не считается речью");
+        let loud: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 0.2 } else { -0.2 }).collect();
+        assert!(rms(&loud) >= SPEECH_RMS, "речь считается речью");
+    }
+
+    #[test]
+    fn retry_backs_off_and_caps() {
+        let mut d = RETRY_MIN;
+        for _ in 0..10 {
+            d = next_delay(d);
+        }
+        assert_eq!(d, RETRY_MAX);
+        assert_eq!(next_delay(RETRY_MIN), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn disabled_stt_never_spawns() {
+        let stt = Stt::new(44100, "тест", None, false);
+        stt.feed(&[0.1, 0.2, 0.3]);
+        assert_eq!(stt.health(), Health::Off);
+        assert_eq!(stt.text(), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn down_health_has_visible_label() {
+        assert!(Health::Down("мало VRAM".into()).label().is_some());
+        assert_eq!(Health::Live.label(), None);
+        assert_eq!(Health::Off.label(), None);
+        assert_eq!(Health::Starting.label(), None);
+        assert_eq!(Health::Warmup.label(), None);
+    }
 
     #[test]
     fn parse_single_gpu() {

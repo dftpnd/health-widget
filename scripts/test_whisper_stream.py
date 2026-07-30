@@ -13,6 +13,7 @@ from whisper_stream import (
     take_final,
     flatten_words,
     cut_bytes,
+    trim_backlog,
     SAMPLE_RATE,
 )
 
@@ -241,6 +242,23 @@ class TestCutBytes(unittest.TestCase):
     def test_committed_end_beyond_buffer_clamped(self):
         self.assertEqual(cut_bytes(13 * SAMPLE_RATE * 2, 99.0, 12.0),
                          13 * SAMPLE_RATE * 2)
+
+class TestTrimBacklog(unittest.TestCase):
+    def test_under_limit_keeps_everything(self):
+        buf = bytearray(b"12345")
+        self.assertEqual(trim_backlog(buf, 10), 0)
+        self.assertEqual(bytes(buf), b"12345")
+
+    def test_drops_oldest_over_limit(self):
+        buf = bytearray(b"0123456789")
+        self.assertEqual(trim_backlog(buf, 4), 6)
+        self.assertEqual(bytes(buf), b"6789")
+
+    def test_exact_limit_no_drop(self):
+        buf = bytearray(b"1234")
+        self.assertEqual(trim_backlog(buf, 4), 0)
+        self.assertEqual(bytes(buf), b"1234")
+
 
 if __name__ == "__main__":
     unittest.main()

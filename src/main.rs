@@ -2,7 +2,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 mod audio;
 mod avatar;
@@ -21,6 +21,7 @@ mod pilot_notify;
 mod kwin_shot;
 mod prompts;
 mod recorder;
+mod robot;
 mod screenshot;
 mod state;
 mod tartarus;
@@ -61,6 +62,12 @@ const APPLY_TARGET: i64 = 27;
 const CHAT_REPLY_CAP: i64 = 40;
 const CHAT_TIME_CAP: Duration = Duration::from_secs(30 * 60);
 const ENRICH_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+const SCANS_PER_DAY: i64 = 4;
+const SCAN_GAP_MIN: i64 = 6 * 60;
+
+fn may_scan(scans_today: i64, age_min: Option<i64>) -> bool {
+    scans_today < SCANS_PER_DAY && age_min.map_or(true, |m| m >= SCAN_GAP_MIN)
+}
 
 fn next_eligible_in_order(
     order: &[&str],
@@ -240,7 +247,7 @@ fn draw_turn_bar(ui: &mut egui::Ui, pal: &theme::Palette, segs: &[PhaseSeg]) {
         ui.ctx().request_repaint_after(Duration::from_millis(120));
     }
     resp.on_hover_text(
-        "Ход профиля: скан → обогащение → отклики → чат. Ширина — оставшееся время \
+        "Ход профиля: скан -> обогащение -> отклики -> чат. Ширина — оставшееся время \
          фазы (30с/группа, 11с/вакансия, 40с/отклик; чат — остаток крышки 30м), \
          заливка — прогресс.",
     );
@@ -270,6 +277,8 @@ struct AudioState {
     mic: Option<audio::AudioMonitor>,
     zoom: Option<audio::AudioMonitor>,
     mic_target: Option<String>,
+    mic_stt: bool,
+    stt_off: bool,
     prog_target: Option<String>,
     mics: Vec<audio::Device>,
     programs: Vec<audio::Device>,
@@ -294,6 +303,29 @@ struct AutopilotState {
     enrich_until: Option<Instant>,
     applies_exhausted: bool,
     enrich_start: Option<i64>,
+    chatter: VecDeque<(String, Instant)>,
+    chatter_cursor: u64,
+    said_status: String,
+}
+
+const CHATTER_CAP: usize = 12;
+
+fn profile_label(key: &str) -> &str {
+    PILOT_PROFILES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, l)| *l)
+        .unwrap_or(key)
+}
+
+fn phase_label(phase: &pilot::Phase) -> String {
+    match phase {
+        pilot::Phase::Chat => "чат".to_string(),
+        pilot::Phase::Apply => "отклики".to_string(),
+        pilot::Phase::Scan(g) => format!("скан «{g}»"),
+        pilot::Phase::ScanAll => "скан всех групп".to_string(),
+        pilot::Phase::Enrich => "дообогащение".to_string(),
+    }
 }
 
 struct ShotState {
@@ -624,13 +656,25 @@ impl App {
 
         let transcript_log = TranscriptLog::open().map(Arc::new);
 
+        transcribe::set_enabled(!st.stt_off);
+
         let mic = if st.mic_on {
-            audio::AudioMonitor::start(st.mic_target.as_deref(), CH_MIC, transcript_log.clone())
+            audio::AudioMonitor::start(
+                st.mic_target.as_deref(),
+                CH_MIC,
+                transcript_log.clone(),
+                st.mic_stt,
+            )
         } else {
             None
         };
         let zoom = if st.zoom_on {
-            audio::AudioMonitor::start_sink_monitor(CH_ZOOM, transcript_log.clone())
+            audio::AudioMonitor::start_program(
+                st.prog_target.as_deref(),
+                CH_ZOOM,
+                transcript_log.clone(),
+                true,
+            )
         } else {
             None
         };
@@ -656,7 +700,9 @@ impl App {
                 mic,
                 zoom,
                 mic_target: st.mic_target.clone(),
-                prog_target: None,
+                mic_stt: st.mic_stt,
+                stt_off: st.stt_off,
+                prog_target: st.prog_target.clone(),
                 mics: audio::list_mics(),
                 programs: audio::list_programs(),
                 scope: Vec::with_capacity(2048),
@@ -675,12 +721,15 @@ impl App {
                 chat_started_at: None,
                 apply_idle: HashSet::new(),
                 notify_on: pilot_notify_on,
-                cycle: true,
+                cycle: false,
                 chat_lap: false,
                 chat_done: HashSet::new(),
                 enrich_until: None,
                 applies_exhausted: false,
                 enrich_start: None,
+                chatter: VecDeque::new(),
+                chatter_cursor: 0,
+                said_status: String::new(),
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
@@ -750,12 +799,11 @@ impl App {
             web_last_post_id: 0,
             web_fresh_posts: Vec::new(),
         };
-        app.toggle_avatar();
+        if st.avatar_on {
+            app.toggle_avatar();
+        }
         if app.cfg.autopilot_bin.exists() {
             kill_stray_pilots(&app.cfg.autopilot_bin);
-            app.begin_turn();
-        } else {
-            app.autopilot.cycle = false;
         }
         app
     }
@@ -771,10 +819,10 @@ impl App {
             None => Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         };
         let mut phrases = Vec::new();
-        if let Some(q) = self.audio.mic.as_ref().and_then(|m| m.fresh_finals()) {
+        if let Some(q) = self.audio.mic.as_ref().map(|m| m.fresh_finals()) {
             phrases.push(q);
         }
-        if let Some(q) = self.audio.zoom.as_ref().and_then(|z| z.fresh_finals()) {
+        if let Some(q) = self.audio.zoom.as_ref().map(|z| z.fresh_finals()) {
             phrases.push(q);
         }
         match avatar::Avatar::start(&self.cfg.avatar, samples, phrases) {
@@ -787,9 +835,38 @@ impl App {
     }
 
     fn start_program(&self) -> Option<audio::AudioMonitor> {
-        match self.audio.prog_target.as_deref() {
-            Some(t) => audio::AudioMonitor::start(Some(t), CH_ZOOM, self.transcript_log.clone()),
-            None => audio::AudioMonitor::start_sink_monitor(CH_ZOOM, self.transcript_log.clone()),
+        audio::AudioMonitor::start_program(
+            self.audio.prog_target.as_deref(),
+            CH_ZOOM,
+            self.transcript_log.clone(),
+            true,
+        )
+    }
+
+    fn start_mic(&self) -> Option<audio::AudioMonitor> {
+        audio::AudioMonitor::start(
+            self.audio.mic_target.as_deref(),
+            CH_MIC,
+            self.transcript_log.clone(),
+            self.audio.mic_stt,
+        )
+    }
+
+    fn restart_zoom(&mut self) {
+        let carried = self.audio.zoom.take().and_then(|old| old.take_recorder());
+        self.audio.zoom = self.start_program();
+        Self::hand_over(&self.audio.zoom, carried);
+    }
+
+    fn restart_mic(&mut self) {
+        let carried = self.audio.mic.take().and_then(|old| old.take_recorder());
+        self.audio.mic = self.start_mic();
+        Self::hand_over(&self.audio.mic, carried);
+    }
+
+    fn hand_over(mon: &Option<audio::AudioMonitor>, rec: Option<recorder::WavRecorder>) {
+        if let (Some(m), Some(w)) = (mon, rec) {
+            m.adopt_recorder(w);
         }
     }
 
@@ -861,7 +938,39 @@ impl App {
         }
     }
 
+    fn say(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if line.trim().is_empty() {
+            return;
+        }
+        let feed = &mut self.autopilot.chatter;
+        if feed.back().is_some_and(|(t, _)| *t == line) {
+            return;
+        }
+        if feed.len() >= CHATTER_CAP {
+            feed.pop_front();
+        }
+        feed.push_back((line, Instant::now()));
+    }
+
+    fn pump_chatter(&mut self) {
+        let (fresh, cursor) = match &self.autopilot.proc {
+            Some(p) => p.since(self.autopilot.chatter_cursor),
+            None => (Vec::new(), self.autopilot.chatter_cursor),
+        };
+        self.autopilot.chatter_cursor = cursor;
+        for line in fresh {
+            self.say(line);
+        }
+        if self.autopilot.status != self.autopilot.said_status {
+            self.autopilot.said_status = self.autopilot.status.clone();
+            let status = self.autopilot.status.clone();
+            self.say(status);
+        }
+    }
+
     fn reconcile_pilot(&mut self) {
+        self.pump_chatter();
         let desired = match self.autopilot.want.clone() {
             None => {
                 if self.autopilot.proc.is_some() {
@@ -879,7 +988,28 @@ impl App {
         if same_phase && same_profile {
             return;
         }
+        let was = self
+            .autopilot
+            .proc
+            .as_ref()
+            .and_then(|p| p.profile())
+            .map(str::to_string);
         self.autopilot.proc = None;
+        self.autopilot.chatter_cursor = 0;
+        let next = phase_label(&desired);
+        match was {
+            Some(prev) if prev != self.autopilot.profile => self.say(format!(
+                "🔀 Меняю профиль: {} -> {} · дальше {}",
+                profile_label(&prev),
+                profile_label(&self.autopilot.profile),
+                next,
+            )),
+            _ => self.say(format!(
+                "▶ Дальше {} · профиль {}",
+                next,
+                profile_label(&self.autopilot.profile),
+            )),
+        }
         self.autopilot.proc = pilot::Pilot::start(
             &self.cfg.autopilot_dir,
             &self.cfg.autopilot_bin,
@@ -933,7 +1063,11 @@ impl App {
             height: Some(size.y),
             mic_on: self.audio.mic.is_some(),
             mic_target: self.audio.mic_target.clone(),
+            mic_stt: self.audio.mic_stt,
+            stt_off: self.audio.stt_off,
             zoom_on: self.audio.zoom.is_some(),
+            prog_target: self.audio.prog_target.clone(),
+            avatar_on: self.avatar.cam.is_some(),
             pinned: self.pinned,
             pilot_profile: Some(self.autopilot.profile.clone()),
             llm_provider: Some(self.llm_provider.to_string()),
@@ -1063,18 +1197,20 @@ impl App {
         self.autopilot.chat_started_at = None;
         self.autopilot.summary = None;
         self.autopilot.summary_next = Instant::now();
-        let scanned_today = pilot_summary::fetch(
+        let sum = pilot_summary::fetch(
             &self.cfg.autopilot_dir,
             &self.cfg.autopilot_bin,
             &self.autopilot.profile,
             None,
-        )
-        .and_then(|s| s.last_scan_date)
-        .is_some_and(|d| d == today_local());
-        if scanned_today {
-            self.enter_apply_lap();
-        } else {
+        );
+        let (scans_today, age_min) = match &sum {
+            Some(s) => (s.scans_today, s.scan_age_min),
+            None => (SCANS_PER_DAY, Some(0)),
+        };
+        if may_scan(scans_today, age_min) {
             self.enter_scan();
+        } else {
+            self.enter_apply_lap();
         }
     }
 
@@ -1224,6 +1360,7 @@ impl App {
         let mut toggle_theme = false;
         let mut toggle_terminal = false;
         let mut toggle_webmic = false;
+        let mut toggle_stt = false;
         let mut do_restart = false;
         ui.horizontal(|ui| {
             if let Some(t) = &title {
@@ -1249,6 +1386,18 @@ impl App {
                     .clicked()
                 {
                     toggle_theme = true;
+                }
+                let stt_on = !self.audio.stt_off;
+                if ui
+                    .selectable_label(stt_on, if stt_on { "🗣" } else { "🔇" })
+                    .on_hover_text(if stt_on {
+                        "Виспер включён — выключить распознавание везде (микрофон, звук программ, веб-микрофон) и освободить VRAM"
+                    } else {
+                        "Виспер выключен — включить распознавание"
+                    })
+                    .clicked()
+                {
+                    toggle_stt = true;
                 }
                 if ui
                     .button("📁")
@@ -1350,6 +1499,20 @@ impl App {
         if toggle_theme {
             self.theme = self.theme.toggled();
         }
+        if toggle_stt {
+            self.audio.stt_off = !self.audio.stt_off;
+            transcribe::set_enabled(!self.audio.stt_off);
+            if self.audio.mic.is_some() {
+                self.restart_mic();
+            }
+            if self.audio.zoom.is_some() {
+                self.restart_zoom();
+            }
+            telemetry::event(
+                "stt.switch",
+                serde_json::json!({ "on": !self.audio.stt_off }),
+            );
+        }
         if toggle_terminal {
             self.terminal_open = !self.terminal_open;
             let cur = ctx.screen_rect();
@@ -1396,7 +1559,7 @@ impl App {
             }
             hr_reply::HrReplyState::Done => {
                 ui.label(
-                    egui::RichText::new("✓")
+                    egui::RichText::new("✔")
                         .size(13.0)
                         .color(p.ok),
                 );
@@ -1412,7 +1575,7 @@ impl App {
             hr_reply::HrReplyState::Idle => {}
         }
         ui.add_enabled_ui(!running, |ui| {
-            ui.menu_button("✍️", |ui| {
+            ui.menu_button("✉", |ui| {
                 for (key, label) in PILOT_PROFILES {
                     if ui.button(*label).clicked() {
                         hr_reply::start(
@@ -1443,7 +1606,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("📝 Системные промпты").size(15.0).strong().color(accent));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("✖").clicked() {
                         self.prompt_open = false;
                     }
                 });
@@ -1455,7 +1618,7 @@ impl App {
             ] {
                 ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(self.prompts.active == slot, format!("● {label}"))
+                        .selectable_label(self.prompts.active == slot, format!("• {label}"))
                         .on_hover_text("Использовать этот промпт в чате")
                         .clicked()
                     {
@@ -1509,13 +1672,13 @@ impl App {
 
     fn draw_keys_help(&mut self, ctx: &egui::Context) {
         let binds: &[(&str, &str)] = &[
-            ("02", "🧹 Очистить транскрипт микрофона"),
+            ("02", "🗑 Очистить транскрипт микрофона"),
             ("04", "🔀 Свитч LLM для чата: DeepSeek ↔ OpenAI"),
             ("05", "📷 Скриншот"),
-            ("07", "🧹 Очистить транскрипт зума"),
+            ("07", "🗑 Очистить транскрипт зума"),
             ("10", "⌨ Печатать код из буфера в позиции курсора"),
             ("12", "🗑 Очистить чат"),
-            ("20", "🎛 Цель D-pad: виджет → веб-мик → чат"),
+            ("20", "⚙ Цель D-pad: виджет -> веб-мик -> чат"),
             ("D-pad", "🕹 Двигать выбранное окно по экрану"),
             ("Колесо", "🖱 Скролл выбранного окна (чат / веб-мик)"),
         ];
@@ -1526,7 +1689,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("⌨ Бинды клавиатуры").size(15.0).strong().color(accent));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("✖").clicked() {
                         self.help_open = false;
                     }
                 });
@@ -1561,7 +1724,9 @@ impl App {
         let zoom_on = self.audio.zoom.is_some();
         let mic_target = self.audio.mic_target.clone();
         let prog_target = self.audio.prog_target.clone();
+        let mic_stt = self.audio.mic_stt;
         let mut toggle_mic = false;
+        let mut toggle_mic_stt = false;
         let mut toggle_zoom = false;
         let mut mic_off = false;
         let mut zoom_off = false;
@@ -1582,27 +1747,38 @@ impl App {
             let cur = if mic_on {
                 device_label(&mic_target, &self.audio.mics, "🎤 по умолчанию")
             } else {
-                "⊘ выключено".to_string()
+                "🔇 выключено".to_string()
             };
             egui::ComboBox::from_id_salt("mic-src")
                 .width(150.0)
                 .selected_text(egui::RichText::new(cur).size(11.0))
                 .show_ui(ui, |ui| {
-                    if ui.selectable_label(!mic_on, "⊘ выключено").clicked() {
-                        mic_off = true;
-                    }
-                    if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
-                        new_mic = Some(None);
-                    }
-                    for d in &self.audio.mics {
-                        let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
-                        if ui.selectable_label(sel, &d.label).clicked() {
-                            new_mic = Some(Some(d.target.clone()));
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        if ui.selectable_label(!mic_on, "🔇 выключено").clicked() {
+                            mic_off = true;
                         }
-                    }
+                        if ui.selectable_label(mic_on && mic_target.is_none(), "🎤 по умолчанию").clicked() {
+                            new_mic = Some(None);
+                        }
+                        for d in &self.audio.mics {
+                            let sel = mic_on && mic_target.as_deref() == Some(d.target.as_str());
+                            if ui.selectable_label(sel, &d.label).clicked() {
+                                new_mic = Some(Some(d.target.clone()));
+                            }
+                        }
+                    });
                 });
             if ui.small_button("⟳").on_hover_text("обновить список микрофонов").clicked() {
                 refresh_mic = true;
+            }
+            if ui
+                .selectable_label(mic_stt, "📝")
+                .on_hover_text(
+                    "Распознавать речь с микрофона (~4 ГБ VRAM; уступает место веб-каналу)",
+                )
+                .clicked()
+            {
+                toggle_mic_stt = true;
             }
         });
 
@@ -1617,23 +1793,23 @@ impl App {
             let cur = if zoom_on {
                 device_label(&prog_target, &self.audio.programs, "🔊 весь вывод")
             } else {
-                "⊘ выключено".to_string()
+                "🔇 выключено".to_string()
             };
             egui::ComboBox::from_id_salt("prog-src")
                 .width(150.0)
                 .selected_text(egui::RichText::new(cur).size(11.0))
                 .show_ui(ui, |ui| {
                     egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                        if ui.selectable_label(!zoom_on, "⊘ выключено").clicked() {
+                        if ui.selectable_label(!zoom_on, "🔇 выключено").clicked() {
                             zoom_off = true;
                         }
                         if ui.selectable_label(zoom_on && prog_target.is_none(), "🔊 весь вывод").clicked() {
                             new_prog = Some(None);
                         }
                         for d in &self.audio.programs {
-                            let sel = zoom_on && prog_target.as_deref() == Some(d.target.as_str());
+                            let sel = zoom_on && prog_target.as_deref() == Some(d.key.as_str());
                             if ui.selectable_label(sel, &d.label).clicked() {
-                                new_prog = Some(Some(d.target.clone()));
+                                new_prog = Some(Some(d.key.clone()));
                             }
                         }
                     });
@@ -1642,6 +1818,20 @@ impl App {
                 refresh = true;
             }
         });
+
+        for (mon, glyph) in [(&self.audio.mic, "🎤"), (&self.audio.zoom, "🔊")] {
+            let Some(m) = mon.as_ref() else {
+                continue;
+            };
+            let warnings = [m.notice().map(|n| format!("⚠ {n}")), m.stt_health().label()];
+            for text in warnings.into_iter().flatten() {
+                ui.label(
+                    egui::RichText::new(format!("{glyph} {text}"))
+                        .size(11.0)
+                        .color(self.palette.err),
+                );
+            }
+        }
         });
 
         if refresh {
@@ -1653,11 +1843,17 @@ impl App {
         }
         if let Some(sel) = new_mic {
             self.audio.mic_target = sel;
-            self.audio.mic = audio::AudioMonitor::start(self.audio.mic_target.as_deref(), CH_MIC, self.transcript_log.clone());
+            self.restart_mic();
         }
         if let Some(sel) = new_prog {
             self.audio.prog_target = sel;
-            self.audio.zoom = self.start_program();
+            self.restart_zoom();
+        }
+        if toggle_mic_stt {
+            self.audio.mic_stt = !self.audio.mic_stt;
+            if self.audio.mic.is_some() {
+                self.restart_mic();
+            }
         }
         if mic_off {
             self.audio.mic = None;
@@ -1666,18 +1862,18 @@ impl App {
             self.audio.zoom = None;
         }
         if toggle_mic {
-            self.audio.mic = if self.audio.mic.is_some() {
-                None
+            if self.audio.mic.is_some() {
+                self.audio.mic = None;
             } else {
-                audio::AudioMonitor::start(self.audio.mic_target.as_deref(), CH_MIC, self.transcript_log.clone())
-            };
+                self.audio.mic = self.start_mic();
+            }
         }
         if toggle_zoom {
-            self.audio.zoom = if self.audio.zoom.is_some() {
-                None
+            if self.audio.zoom.is_some() {
+                self.audio.zoom = None;
             } else {
-                self.start_program()
-            };
+                self.audio.zoom = self.start_program();
+            }
         }
         ui.add_space(2.0);
     }
@@ -1785,7 +1981,7 @@ impl App {
             .trim()
             .chars()
             .take(160)
-            .map(|c| if c == '\n' { '⏎' } else { c })
+            .map(|c| if c == '\n' { '↩' } else { c })
             .collect();
         ui.add(
             egui::Label::new(egui::RichText::new(preview).size(11.0).monospace())
@@ -1872,7 +2068,7 @@ impl App {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("✖").clicked() {
                                 close = true;
                             }
                         },
@@ -1982,7 +2178,7 @@ impl App {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("✖").clicked() {
                                 close = true;
                             }
                         },
@@ -2071,7 +2267,7 @@ impl App {
         }
         let (lines, partial, stt_on, active, posts, new_imgs) = match shared.lock() {
             Ok(mut g) => {
-                g.zoom = self.audio.zoom.as_ref().and_then(|m| m.transcript_handle());
+                g.zoom = self.audio.zoom.as_ref().map(|m| m.transcript_handle());
                 let mut posts = Vec::new();
                 let mut new_imgs = Vec::new();
                 for p in &g.posts {
@@ -2170,9 +2366,9 @@ impl App {
                             .color(p.muted),
                     );
                     let (dot, status) = if active {
-                        ("🟢", "клиент говорит")
+                        ("🔊", "клиент говорит")
                     } else if stt_on {
-                        ("🟡", "тишина")
+                        ("🔇", "тишина")
                     } else {
                         ("⚪", "жду клиента")
                     };
@@ -2182,14 +2378,14 @@ impl App {
                             .color(p.muted),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("✖").clicked() {
                             close = true;
                         }
                     });
                 });
                 let half = (ui.available_height() - 40.0).max(80.0) / 2.0;
                 ui.label(
-                    egui::RichText::new("🗣 Речь")
+                    egui::RichText::new("💬 Речь")
                         .size(10.0)
                         .strong()
                         .color(p.muted),
@@ -2363,11 +2559,11 @@ impl App {
                 match &*self.glue.lock().unwrap() {
                     Idle => None,
                     Working { total: 0, .. } => Some((
-                        "⧗ склеиваю…".to_string(),
+                        "⌛ склеиваю…".to_string(),
                         p.warn,
                     )),
                     Working { done, total } => Some((
-                        format!("⧗ склеиваю {}/{}…", done + 1, total),
+                        format!("⌛ склеиваю {}/{}…", done + 1, total),
                         p.warn,
                     )),
                     Done(0) => Some((
@@ -2455,11 +2651,11 @@ impl App {
             match &*self.shot.status.lock().unwrap() {
                 Idle => None,
                 Marking => Some((
-                    "⧗ кликни две точки…".to_string(),
+                    "⌛ кликни две точки…".to_string(),
                     p.warn,
                 )),
                 Working => Some((
-                    "⧗ режу…".to_string(),
+                    "⌛ режу…".to_string(),
                     p.warn,
                 )),
                 Saved(path) => {
@@ -2513,328 +2709,368 @@ impl App {
             let mut toggle_cycle = false;
             let running = self.autopilot.want.is_some();
             let paused = self.autopilot.proc.as_ref().is_some_and(|p| p.is_paused());
-            let status = if paused {
-                "⏸ на паузе".to_string()
+            self.pump_chatter();
+            let live = self
+                .autopilot
+                .chatter
+                .back()
+                .map(|(t, at)| (t.clone(), at.elapsed()));
+            let history: Vec<String> = self
+                .autopilot
+                .chatter
+                .iter()
+                .rev()
+                .skip(1)
+                .take(6)
+                .map(|(t, _)| t.clone())
+                .collect();
+            let (status, age) = if paused {
+                ("⏸ на паузе".to_string(), Duration::ZERO)
             } else {
-                self.autopilot.proc
-                    .as_ref()
-                    .and_then(|p| p.last_line())
-                    .unwrap_or_else(|| self.autopilot.status.clone())
+                match live {
+                    Some((line, age)) => (line, age),
+                    None => (self.autopilot.status.clone(), Duration::ZERO),
+                }
+            };
+            let say = if paused {
+                robot::Remark { mood: robot::Mood::Waiting, text: "На паузе — жду команды".into() }
+            } else if !running {
+                robot::Remark { mood: robot::Mood::Idle, text: if status.is_empty() {
+                    "Стою без дела — включи фазу".to_string()
+                } else {
+                    status.clone()
+                } }
+            } else {
+                robot::remark(&status)
             };
             let mut ap_collapsed = self.autopilot_collapsed;
-            section_collapsible(pal, ui, "🤖 Автопилот", &mut ap_collapsed, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
-                        "Профиль автопилота: аккаунт браузера, резюме и контакты",
-                    );
-                    let cur = PILOT_PROFILES
-                        .iter()
-                        .find(|(k, _)| *k == self.autopilot.profile)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Fullstack");
-                    egui::ComboBox::from_id_salt("pilot-profile")
-                        .width(150.0)
-                        .selected_text(egui::RichText::new(cur).size(11.0))
-                        .show_ui(ui, |ui| {
-                            for (key, label) in PILOT_PROFILES {
-                                if ui
-                                    .selectable_label(self.autopilot.profile == *key, *label)
-                                    .clicked()
-                                    && self.autopilot.profile != *key
-                                {
-                                    new_profile = Some((*key).to_string());
+            section_collapsible(pal, ui, "⚙ Автопилот", &mut ap_collapsed, |ui| {
+                ui.columns(2, |cols| {
+                    let ui = &mut cols[0];
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("👤").size(13.0)).on_hover_text(
+                            "Профиль автопилота: аккаунт браузера, резюме и контакты",
+                        );
+                        let cur = PILOT_PROFILES
+                            .iter()
+                            .find(|(k, _)| *k == self.autopilot.profile)
+                            .map(|(_, l)| *l)
+                            .unwrap_or("Fullstack");
+                        egui::ComboBox::from_id_salt("pilot-profile")
+                            .width(150.0)
+                            .selected_text(egui::RichText::new(cur).size(11.0))
+                            .show_ui(ui, |ui| {
+                                for (key, label) in PILOT_PROFILES {
+                                    if ui
+                                        .selectable_label(self.autopilot.profile == *key, *label)
+                                        .clicked()
+                                        && self.autopilot.profile != *key
+                                    {
+                                        new_profile = Some((*key).to_string());
+                                    }
                                 }
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.autopilot.cycle, "🔄 Цикл")
-                        .on_hover_text(
-                            "Непрерывно: отклики по всем аккаунтам → чаты по всем \
-                             аккаунтам → скан → дообогащение (до 2ч), затем заново. \
-                             Когда все аккаунты упрутся в дневной лимит — финальное \
-                             дообогащение пула и стоп до завтра",
-                        )
-                        .clicked()
-                    {
-                        toggle_cycle = true;
-                    }
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.autopilot.want == Some(Phase::Chat), "💬 Чат")
-                        .on_hover_text(
-                            "Автопилот: пройтись по чатам всех аккаунтов один раз \
-                             (без откликов), ответить где надо и остановиться",
-                        )
-                        .clicked()
-                    {
-                        new_want = Some(if self.autopilot.want == Some(Phase::Chat) {
-                            None
-                        } else {
-                            Some(Phase::Chat)
-                        });
-                    }
-                    if ui
-                        .selectable_label(self.autopilot.want == Some(Phase::Apply), "📨 Отклики")
-                        .on_hover_text("Автопилот: разбирать очередь скана — откликаться")
-                        .clicked()
-                    {
-                        new_want = Some(if self.autopilot.want == Some(Phase::Apply) {
-                            None
-                        } else {
-                            Some(Phase::Apply)
-                        });
-                    }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui
-                                .add_enabled(running, egui::Button::new("⏻ Выключить"))
-                                .on_hover_text("Остановить автопилот и закрыть браузер")
-                                .clicked()
-                            {
-                                new_want = Some(None);
-                            }
-                            let (label, hint) = if paused {
-                                ("▶ Продолжить", "Снять паузу — продолжить с того же места")
-                            } else {
-                                ("⏸ Пауза", "Заморозить автопилот на месте (браузер не закрывается)")
-                            };
-                            if ui
-                                .add_enabled(self.autopilot.proc.is_some(), egui::Button::new(label))
-                                .on_hover_text(hint)
-                                .clicked()
-                            {
-                                toggle_pause = true;
-                            }
-                        },
-                    );
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let on = self.autopilot.notify_on;
-                    let label = if on {
-                        "🔔 Уведомления: вкл"
-                    } else {
-                        "🔕 Уведомления: выкл"
-                    };
-                    if ui
-                        .selectable_label(on, label)
-                        .on_hover_text(
-                            "TG-пинги о собеседовании/контактах/позитиве в чате \
-                             (общий тумблер на все профили)",
-                        )
-                        .clicked()
-                    {
-                        let data_dir = self.cfg.autopilot_dir.join("data");
-                        if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
-                            eprintln!("notify.json write failed: {e}");
-                        } else {
-                            self.autopilot.notify_on = !on;
-                        }
-                    }
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let applying = self.autopilot.want == Some(Phase::Apply);
-                            let (lbl, hint) = if applying {
-                                ("⏹ Стоп", "Остановить отклики")
-                            } else {
-                                (
-                                    "▶ Начать",
-                                    "Начать отклики по соответствию резюме: \
-                                     свежее и более релевантное (по навыкам и \
-                                     заголовку) — впереди. Каждые 27 откликов \
-                                     переключается на другой профиль по кругу, \
-                                     пока не упрутся все дневные лимиты.",
-                                )
-                            };
-                            if ui.button(lbl).on_hover_text(hint).clicked() {
-                                new_want =
-                                    Some(if applying { None } else { Some(Phase::Apply) });
-                            }
-                        },
-                    );
-                });
-                if let Some(s) = &self.autopilot.summary {
-                    if !s.groups.is_empty() {
-                        ui.add_space(2.0);
-                        let total: i64 = s.groups.iter().map(|g| g.new).sum();
+                            });
+                    });
+                    ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(
-                                self.autopilot.want == Some(Phase::ScanAll),
-                                format!("🔎 Все группы ({total})"),
-                            )
+                            .selectable_label(self.autopilot.cycle, "🔄 Цикл")
                             .on_hover_text(
-                                "Сканировать все группы подряд в очередь, \
-                                 затем само запустится дообогащение \
-                                 (повторно — стоп)",
+                                "Непрерывно: отклики по всем аккаунтам -> чаты по всем \
+                                 аккаунтам -> скан -> дообогащение (до 2ч), затем заново. \
+                                 Когда все аккаунты упрутся в дневной лимит — финальное \
+                                 дообогащение пула и стоп до завтра",
                             )
                             .clicked()
                         {
-                            new_want = Some(if self.autopilot.want == Some(Phase::ScanAll) {
-                                None
-                            } else {
-                                Some(Phase::ScanAll)
-                            });
+                            toggle_cycle = true;
                         }
-                        ui.horizontal_wrapped(|ui| {
-                            for g in &s.groups {
-                                let active =
-                                    self.autopilot.want == Some(Phase::Scan(g.name.clone()));
-                                let label = format!("🔎 {} ({})", g.name, g.new);
-                                if ui
-                                    .selectable_label(active, label)
-                                    .on_hover_text(
-                                        "Скан группы в очередь откликов, \
-                                         затем само запустится дообогащение \
-                                         (повторно — стоп)",
-                                    )
-                                    .clicked()
-                                {
-                                    new_want = Some(if active {
-                                        None
-                                    } else {
-                                        Some(Phase::Scan(g.name.clone()))
-                                    });
-                                }
+                    });
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        let on = self.autopilot.notify_on;
+                        let label = if on {
+                            "🔔 Уведомления: вкл"
+                        } else {
+                            "🔕 Уведомления: выкл"
+                        };
+                        if ui
+                            .selectable_label(on, label)
+                            .on_hover_text(
+                                "TG-пинги о собеседовании/контактах/позитиве в чате \
+                                 (общий тумблер на все профили)",
+                            )
+                            .clicked()
+                        {
+                            let data_dir = self.cfg.autopilot_dir.join("data");
+                            if let Err(e) = pilot_notify::set_enabled(&data_dir, !on) {
+                                eprintln!("notify.json write failed: {e}");
+                            } else {
+                                self.autopilot.notify_on = !on;
                             }
-                        });
+                        }
+                    });
+                    ui.add_space(3.0);
+                    if let Some(s) = &self.autopilot.summary {
+                        let color = pal.muted;
+                        ui.add_space(2.0);
+                        if let Some(w) = self.autopilot.want.clone() {
+                            if w == Phase::Enrich {
+                                if self.autopilot.enrich_start.is_none() {
+                                    self.autopilot.enrich_start = Some(s.unenriched.max(1));
+                                }
+                            } else {
+                                self.autopilot.enrich_start = None;
+                            }
+                            let cur = match w {
+                                Phase::Scan(_) | Phase::ScanAll => 0,
+                                Phase::Enrich => 1,
+                                Phase::Apply => 2,
+                                Phase::Chat => 3,
+                            };
+                            let chat_elapsed = self
+                                .autopilot
+                                .chat_started_at
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default();
+                            let segs = turn_segments(
+                                cur,
+                                s.groups.len(),
+                                s.unenriched,
+                                self.autopilot.enrich_start.unwrap_or(0),
+                                s.ranked,
+                                s.applied.turn,
+                                chat_elapsed,
+                            );
+                            draw_turn_bar(ui, &pal, &segs);
+                            ui.add_space(2.0);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "📚 база {} · сегодня +{} найдено · ✨ {} обогащено",
+                                s.pool_total, s.found_today, s.enriched_today,
+                            ))
+                            .size(11.0)
+                            .color(color),
+                        );
+                        let next_scan = match s.scan_age_min {
+                            _ if s.scans_today >= SCANS_PER_DAY => " · на сегодня хватит".to_string(),
+                            Some(m) if m < SCAN_GAP_MIN => {
+                                format!(" · следующий через {}", robot::human_gap(SCAN_GAP_MIN - m))
+                            }
+                            _ => " · можно сканировать".to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "🔎 сканов сегодня {}/{}{}",
+                                s.scans_today, SCANS_PER_DAY, next_scan,
+                            ))
+                            .size(11.0)
+                            .color(color),
+                        )
+                        .on_hover_text(
+                            "Цикл сам запускает скан не чаще 4 раз в сутки на профиль \
+                             и не чаще, чем раз в 6 часов. Кнопки скана руками \
+                             этот лимит не спрашивают.",
+                        );
+                        let plan = if s.ranked > 0 {
+                            let items = (APPLY_TARGET - s.applied.turn).max(0).min(s.ranked);
+                            format!(" · план хода {}", s.applied.turn + items)
+                        } else {
+                            String::new()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "📨 отклики {}/{}{} · всего {} (сегодня {}/{})",
+                                s.applied.turn, APPLY_TARGET, plan, s.applied.total,
+                                s.applied_today, s.daily_limit,
+                            ))
+                            .size(11.0)
+                            .color(color),
+                        )
+                        .on_hover_text(
+                            "план хода = сколько откликов реально выйдет в этом цикле: \
+                             цель 27, но не больше числа кандидатов после фильтров \
+                             (группы, стоп-слова, порог релевантности)",
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "💬 ответы {}/{} · всего {}",
+                                s.replies.turn, CHAT_REPLY_CAP, s.replies.total,
+                            ))
+                            .size(11.0)
+                            .color(color),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "🔒 капча {}/{} · 📝 формы {}/{} · 403 {}/{} · 🍂 протухло {}/{}",
+                                s.captcha.turn, s.captcha.total, s.forms.turn, s.forms.total,
+                                s.http_403.turn, s.http_403.total, s.expired.turn, s.expired.total,
+                            ))
+                            .size(11.0)
+                            .color(color),
+                        );
+                        if !s.top.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("⭐ топ: {}", s.top.join(" · ")))
+                                    .size(11.0)
+                                    .color(color),
+                            );
+                        }
                     }
-                    let enrich_active = self.autopilot.want == Some(Phase::Enrich);
+                    let ui = &mut cols[1];
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(
-                                enrich_active,
-                                format!("✨ Дообогатить ({})", s.unenriched),
-                            )
+                            .selectable_label(self.autopilot.want == Some(Phase::Chat), "💬 Чат")
                             .on_hover_text(
-                                "Открыть необогащённые вакансии пула и сохранить \
-                                 полное описание, дату публикации и вектор \
-                                 (точный подбор под резюме). Повторно — стоп; \
-                                 по завершении гаснет сама.",
+                                "Автопилот: пройтись по чатам всех аккаунтов один раз \
+                                 (без откликов), ответить где надо и остановиться",
                             )
                             .clicked()
                         {
-                            new_want = Some(if enrich_active {
+                            new_want = Some(if self.autopilot.want == Some(Phase::Chat) {
                                 None
                             } else {
-                                Some(Phase::Enrich)
+                                Some(Phase::Chat)
                             });
                         }
-                        if enrich_active {
-                            ui.add(egui::Spinner::new().size(14.0));
+                        if ui
+                            .selectable_label(self.autopilot.want == Some(Phase::Apply), "📨 Отклики")
+                            .on_hover_text("Автопилот: разбирать очередь скана — откликаться")
+                            .clicked()
+                        {
+                            new_want = Some(if self.autopilot.want == Some(Phase::Apply) {
+                                None
+                            } else {
+                                Some(Phase::Apply)
+                            });
                         }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .add_enabled(running, egui::Button::new("⛔ Выключить"))
+                                    .on_hover_text("Остановить автопилот и закрыть браузер")
+                                    .clicked()
+                                {
+                                    new_want = Some(None);
+                                }
+                                let (label, hint) = if paused {
+                                    ("▶ Продолжить", "Снять паузу — продолжить с того же места")
+                                } else {
+                                    ("⏸ Пауза", "Заморозить автопилот на месте (браузер не закрывается)")
+                                };
+                                if ui
+                                    .add_enabled(self.autopilot.proc.is_some(), egui::Button::new(label))
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    toggle_pause = true;
+                                }
+                            },
+                        );
                     });
-                }
-                if !status.is_empty() {
-                    let mut job = egui::text::LayoutJob::default();
-                    job.wrap.max_width = ui.available_width();
-                    job.append(
-                        &status,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(10.0),
-                            color: pal.muted,
-                            ..Default::default()
-                        },
-                    );
-                    ui.label(job);
-                }
-                if let Some(s) = &self.autopilot.summary {
-                    let color = pal.muted;
                     ui.add_space(2.0);
-                    if let Some(w) = self.autopilot.want.clone() {
-                        if w == Phase::Enrich {
-                            if self.autopilot.enrich_start.is_none() {
-                                self.autopilot.enrich_start = Some(s.unenriched.max(1));
+                    ui.horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let applying = self.autopilot.want == Some(Phase::Apply);
+                                let (lbl, hint) = if applying {
+                                    ("⏹ Стоп", "Остановить отклики")
+                                } else {
+                                    (
+                                        "▶ Начать",
+                                        "Начать отклики по соответствию резюме: \
+                                         свежее и более релевантное (по навыкам и \
+                                         заголовку) — впереди. Каждые 27 откликов \
+                                         переключается на другой профиль по кругу, \
+                                         пока не упрутся все дневные лимиты.",
+                                    )
+                                };
+                                if ui.button(lbl).on_hover_text(hint).clicked() {
+                                    new_want =
+                                        Some(if applying { None } else { Some(Phase::Apply) });
+                                }
+                            },
+                        );
+                    });
+                    if let Some(s) = &self.autopilot.summary {
+                        if !s.groups.is_empty() {
+                            ui.add_space(2.0);
+                            let total: i64 = s.groups.iter().map(|g| g.new).sum();
+                            if ui
+                                .selectable_label(
+                                    self.autopilot.want == Some(Phase::ScanAll),
+                                    format!("🔎 Все группы ({total})"),
+                                )
+                                .on_hover_text(
+                                    "Сканировать все группы подряд в очередь, \
+                                     затем само запустится дообогащение \
+                                     (повторно — стоп)",
+                                )
+                                .clicked()
+                            {
+                                new_want = Some(if self.autopilot.want == Some(Phase::ScanAll) {
+                                    None
+                                } else {
+                                    Some(Phase::ScanAll)
+                                });
                             }
-                        } else {
-                            self.autopilot.enrich_start = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for g in &s.groups {
+                                    let active =
+                                        self.autopilot.want == Some(Phase::Scan(g.name.clone()));
+                                    let label = format!("🔎 {} ({})", g.name, g.new);
+                                    if ui
+                                        .selectable_label(active, label)
+                                        .on_hover_text(
+                                            "Скан группы в очередь откликов, \
+                                             затем само запустится дообогащение \
+                                             (повторно — стоп)",
+                                        )
+                                        .clicked()
+                                    {
+                                        new_want = Some(if active {
+                                            None
+                                        } else {
+                                            Some(Phase::Scan(g.name.clone()))
+                                        });
+                                    }
+                                }
+                            });
                         }
-                        let cur = match w {
-                            Phase::Scan(_) | Phase::ScanAll => 0,
-                            Phase::Enrich => 1,
-                            Phase::Apply => 2,
-                            Phase::Chat => 3,
-                        };
-                        let chat_elapsed = self
-                            .autopilot
-                            .chat_started_at
-                            .map(|t| t.elapsed())
-                            .unwrap_or_default();
-                        let segs = turn_segments(
-                            cur,
-                            s.groups.len(),
-                            s.unenriched,
-                            self.autopilot.enrich_start.unwrap_or(0),
-                            s.ranked,
-                            s.applied.turn,
-                            chat_elapsed,
-                        );
-                        draw_turn_bar(ui, &pal, &segs);
+                        let enrich_active = self.autopilot.want == Some(Phase::Enrich);
                         ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    enrich_active,
+                                    format!("✨ Дообогатить ({})", s.unenriched),
+                                )
+                                .on_hover_text(
+                                    "Открыть необогащённые вакансии пула и сохранить \
+                                     полное описание, дату публикации и вектор \
+                                     (точный подбор под резюме). Повторно — стоп; \
+                                     по завершении гаснет сама.",
+                                )
+                                .clicked()
+                            {
+                                new_want = Some(if enrich_active {
+                                    None
+                                } else {
+                                    Some(Phase::Enrich)
+                                });
+                            }
+                            if enrich_active {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            }
+                        });
                     }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "🗂 база {} · сегодня +{} найдено · ✨ {} обогащено",
-                            s.pool_total, s.found_today, s.enriched_today,
-                        ))
-                        .size(11.0)
-                        .color(color),
-                    );
-                    let plan = if s.ranked > 0 {
-                        let items = (APPLY_TARGET - s.applied.turn).max(0).min(s.ranked);
-                        format!(" · план хода {}", s.applied.turn + items)
-                    } else {
-                        String::new()
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "📨 отклики {}/{}{} · всего {} (сегодня {}/{})",
-                            s.applied.turn, APPLY_TARGET, plan, s.applied.total,
-                            s.applied_today, s.daily_limit,
-                        ))
-                        .size(11.0)
-                        .color(color),
-                    )
-                    .on_hover_text(
-                        "план хода = сколько откликов реально выйдет в этом цикле: \
-                         цель 27, но не больше числа кандидатов после фильтров \
-                         (группы, стоп-слова, порог релевантности)",
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "💬 ответы {}/{} · всего {}",
-                            s.replies.turn, CHAT_REPLY_CAP, s.replies.total,
-                        ))
-                        .size(11.0)
-                        .color(color),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "🔒 капча {}/{} · 📝 формы {}/{} · 403 {}/{} · 🥀 протухло {}/{}",
-                            s.captcha.turn, s.captcha.total, s.forms.turn, s.forms.total,
-                            s.http_403.turn, s.http_403.total, s.expired.turn, s.expired.total,
-                        ))
-                        .size(11.0)
-                        .color(color),
-                    );
-                    if !s.top.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("⭐ топ: {}", s.top.join(" · ")))
-                                .size(11.0)
-                                .color(color),
-                        );
-                    }
-                }
+                    ui.add_space(4.0);
+                    robot::draw(ui, &pal, &say, age, &status);
+                    robot::draw_history(ui, &pal, &history);
+                });
             });
             self.autopilot_collapsed = ap_collapsed;
             if let Some(p) = new_profile {
@@ -2921,7 +3157,7 @@ impl App {
         let mon = if mic { &self.audio.mic } else { &self.audio.zoom };
         let text = mon
             .as_ref()
-            .and_then(|m| m.transcript())
+            .map(|m| m.transcript())
             .map(|(finals, _)| finals.trim().to_string())
             .unwrap_or_default();
         if text.is_empty() {
@@ -3008,7 +3244,7 @@ impl App {
                         });
                     });
                     draw_scope(p, ui, &self.audio.scope, color);
-                    picked = draw_transcript(p, ui, mon.transcript(), color, "mic")
+                    picked = draw_transcript(p, ui, Some(mon.transcript()), color, "mic")
                         .or(picked.take());
                 }
                 if let Some(mon) = &self.audio.zoom {
@@ -3026,7 +3262,7 @@ impl App {
                         });
                     });
                     draw_scope(p, ui, &self.audio.scope, color);
-                    picked = draw_transcript(p, ui, mon.transcript(), color, "zoom")
+                    picked = draw_transcript(p, ui, Some(mon.transcript()), color, "zoom")
                         .or(picked.take());
                 }
             });
@@ -3497,14 +3733,14 @@ fn open_calls_dir() {
     let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
 }
 
-fn device_label(target: &Option<String>, list: &[audio::Device], default: &str) -> String {
-    match target {
+fn device_label(key: &Option<String>, list: &[audio::Device], default: &str) -> String {
+    match key {
         None => default.to_string(),
-        Some(t) => list
+        Some(k) => list
             .iter()
-            .find(|d| &d.target == t)
+            .find(|d| &d.key == k)
             .map(|d| d.label.clone())
-            .unwrap_or_else(|| t.clone()),
+            .unwrap_or_else(|| k.clone()),
     }
 }
 
@@ -3894,13 +4130,23 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod apply_chain_tests {
     use super::{
-        apply_part_done, chat_part_done, enrich_window_over, next_chat_profile,
-        next_eligible_in_order, seg_widths, turn_segments, SegState,
+        apply_part_done, chat_part_done, enrich_window_over, may_scan, next_chat_profile,
+        next_eligible_in_order, seg_widths, turn_segments, SegState, SCANS_PER_DAY,
+        SCAN_GAP_MIN,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     const ORDER: &[&str] = &["fullstack", "back", "llm"];
+
+    #[test]
+    fn scan_allowed_four_times_a_day_with_six_hour_gap() {
+        assert!(may_scan(0, None), "ни разу не сканировали — можно");
+        assert!(may_scan(1, Some(SCAN_GAP_MIN)), "гэп выдержан — можно");
+        assert!(!may_scan(1, Some(SCAN_GAP_MIN - 1)), "гэп не выдержан — нельзя");
+        assert!(!may_scan(SCANS_PER_DAY, Some(10_000)), "суточный лимит выбран");
+        assert!(may_scan(SCANS_PER_DAY - 1, Some(10_000)), "остался один скан");
+    }
 
     #[test]
     fn next_wraps_to_following_profile() {

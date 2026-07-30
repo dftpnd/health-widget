@@ -13,7 +13,15 @@ pub struct State {
     #[serde(default)]
     pub mic_target: Option<String>,
     #[serde(default)]
+    pub mic_stt: bool,
+    #[serde(default)]
+    pub stt_off: bool,
+    #[serde(default)]
     pub zoom_on: bool,
+    #[serde(default)]
+    pub prog_target: Option<String>,
+    #[serde(default)]
+    pub avatar_on: bool,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]

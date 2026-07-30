@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const LOG_CAP: usize = 6;
+const LOG_CAP: usize = 12;
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -31,11 +31,26 @@ impl Phase {
     }
 }
 
+struct Log {
+    lines: VecDeque<String>,
+    at: Instant,
+    total: u64,
+}
+
+pub fn tidy(line: &str) -> String {
+    if let Some((head, tail)) = line.split_once(" - ") {
+        if head.matches(" | ").count() >= 2 {
+            return tail.trim().to_string();
+        }
+    }
+    line.trim().to_string()
+}
+
 pub struct Pilot {
     child: Child,
     phase: Phase,
     profile: Option<String>,
-    log: Arc<Mutex<VecDeque<String>>>,
+    log: Arc<Mutex<Log>>,
     paused: bool,
 }
 
@@ -60,17 +75,23 @@ impl Pilot {
 
         let mut child = cmd.spawn().ok()?;
 
-        let log = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_CAP)));
+        let log = Arc::new(Mutex::new(Log {
+            lines: VecDeque::with_capacity(LOG_CAP),
+            at: Instant::now(),
+            total: 0,
+        }));
         if let Some(stderr) = child.stderr.take() {
             let sink = log.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
                     if let Ok(mut g) = sink.lock() {
-                        if g.len() >= LOG_CAP {
-                            g.pop_front();
+                        if g.lines.len() >= LOG_CAP {
+                            g.lines.pop_front();
                         }
-                        g.push_back(line);
+                        g.lines.push_back(line);
+                        g.at = Instant::now();
+                        g.total += 1;
                     }
                 }
             });
@@ -97,8 +118,19 @@ impl Pilot {
         self.profile.as_deref()
     }
 
-    pub fn last_line(&self) -> Option<String> {
-        self.log.lock().ok().and_then(|g| g.back().cloned())
+    pub fn since(&self, cursor: u64) -> (Vec<String>, u64) {
+        let Ok(g) = self.log.lock() else {
+            return (Vec::new(), cursor);
+        };
+        let dropped = g.total - g.lines.len() as u64;
+        let from = cursor.max(dropped);
+        let fresh = g
+            .lines
+            .iter()
+            .skip((from - dropped) as usize)
+            .map(|l| tidy(l))
+            .collect();
+        (fresh, g.total)
     }
 
     pub fn is_paused(&self) -> bool {
@@ -162,6 +194,10 @@ impl Drop for Pilot {
 impl Pilot {
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn last_line(&self) -> Option<String> {
+        self.log.lock().ok().and_then(|g| g.lines.back().cloned())
     }
 }
 
@@ -266,6 +302,35 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(p.last_line().as_deref(), Some("GOT-USR2"), "SIGUSR2 не доставлен");
         assert!(p.alive(), "после resume процесс должен быть жив");
+    }
+
+    #[test]
+    fn tidy_strips_loguru_prefix() {
+        assert_eq!(
+            tidy("12:03:11 | INFO    | autopilot.tasks.listings - 🤖 Пишу письмо (LLM): Go dev"),
+            "🤖 Пишу письмо (LLM): Go dev"
+        );
+        assert_eq!(tidy("  args: run --chat  "), "args: run --chat");
+        assert_eq!(tidy("hh: [выбор] «опыт» -> «3-6 лет»"), "hh: [выбор] «опыт» -> «3-6 лет»");
+    }
+
+    #[test]
+    fn since_returns_only_fresh_lines_tidied() {
+        let _serial = SERIAL.lock().unwrap();
+        let bin = fake_bin(
+            "three-lines",
+            "echo '12:00:00 | INFO | m - a' >&2; echo 'b' >&2; echo 'c' >&2; sleep 5",
+        );
+        let dir = std::env::temp_dir();
+        let p = Pilot::start(dir.as_path(), &bin, Phase::Apply, None).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (all, cursor) = p.since(0);
+        assert_eq!(all, vec!["a".to_string(), "b".into(), "c".into()]);
+        assert_eq!(cursor, 3);
+        let (fresh, cursor) = p.since(cursor);
+        assert!(fresh.is_empty(), "новых строк нет: {fresh:?}");
+        assert_eq!(cursor, 3);
+        assert_eq!(p.since(2).0, vec!["c".to_string()]);
     }
 
     #[test]

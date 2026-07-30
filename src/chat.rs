@@ -127,7 +127,7 @@ impl Chat {
         let mut clicked = false;
         let mut resp = None;
         ui.horizontal(|ui| {
-            let clicked_btn = ui.button(RichText::new("➤").size(22.0)).clicked();
+            let clicked_btn = ui.button(RichText::new("▶").size(22.0)).clicked();
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     .hint_text("спросить…")

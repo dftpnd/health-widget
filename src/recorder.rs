@@ -1,5 +1,5 @@
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -18,6 +18,17 @@ impl WavRecorder {
         let mut file = File::create(path)?;
         file.write_all(&Self::header(rate, 0))?;
         Ok(Self { file, data_bytes: 0 })
+    }
+
+    pub fn append(path: &Path, rate: u32) -> std::io::Result<Self> {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if len <= HEADER_LEN {
+            return Self::create(path, rate);
+        }
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let data_bytes = u32::try_from(len - HEADER_LEN).unwrap_or(u32::MAX);
+        file.seek(SeekFrom::Start(HEADER_LEN + data_bytes as u64))?;
+        Ok(Self { file, data_bytes })
     }
 
     fn header(rate: u32, data_bytes: u32) -> [u8; 44] {
@@ -70,6 +81,41 @@ impl Drop for WavRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_keeps_existing_audio() {
+        let path = std::env::temp_dir().join("hw-rec-append.wav");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = WavRecorder::create(&path, 44100).unwrap();
+            w.write(&[0.1, 0.2, 0.3]);
+        }
+        {
+            let mut w = WavRecorder::append(&path, 44100).unwrap();
+            w.write(&[0.4, 0.5]);
+        }
+        let b = std::fs::read(&path).unwrap();
+        let data = u32::from_le_bytes([b[40], b[41], b[42], b[43]]);
+        assert_eq!(data, 10, "3 + 2 сэмпла по 2 байта");
+        assert_eq!(b.len() as u32, 44 + data);
+        let first = i16::from_le_bytes([b[44], b[45]]);
+        assert_eq!(first, (0.1f32 * 32767.0) as i16, "первый сэмпл не затёрт");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_creates_when_missing() {
+        let path = std::env::temp_dir().join("hw-rec-append-new.wav");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = WavRecorder::append(&path, 44100).unwrap();
+            w.write(&[0.5]);
+        }
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(&b[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes([b[40], b[41], b[42], b[43]]), 2);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn writes_valid_wav_header_and_sizes() {

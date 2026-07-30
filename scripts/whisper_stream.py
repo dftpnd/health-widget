@@ -190,21 +190,38 @@ def take_final(pending: list[str], limit: int = FINAL_MAX_WORDS) -> tuple[str, l
         return " ".join(pending), []
     return "", pending
 
+def trim_backlog(buf: bytearray, limit: int) -> int:
+    if len(buf) <= limit:
+        return 0
+    cut = len(buf) - limit
+    del buf[:cut]
+    return cut
+
 _buf = bytearray()
 _buf_lock = threading.Lock()
 _stdin_open = True
+_dropped_bytes = 0
+
+MAX_BACKLOG_SECONDS = 30.0
 
 def _drain_stdin():
     """Отдельный поток: непрерывно вычитываем stdin, чтобы Rust не упирался в
     заполненный пайп, пока грузится модель или идёт инференс."""
-    global _stdin_open
-    while True:
-        b = sys.stdin.buffer.read(4096)
-        if not b:
-            _stdin_open = False
-            return
-        with _buf_lock:
-            _buf.extend(b)
+    global _stdin_open, _dropped_bytes
+    limit = int(MAX_BACKLOG_SECONDS * SAMPLE_RATE) * 2
+    try:
+        while True:
+            b = sys.stdin.buffer.read(4096)
+            if not b:
+                break
+            with _buf_lock:
+                _buf.extend(b)
+                _dropped_bytes += trim_backlog(_buf, limit)
+    except Exception as e:
+        sys.stderr.write(f"stdin reader died: {e!r}\n")
+        sys.stderr.flush()
+    finally:
+        _stdin_open = False
 
 def _take(n: int) -> bytes:
     with _buf_lock:
@@ -331,7 +348,13 @@ def main() -> int:
         since_decode = 0
         emit_partial("")
 
+    reported_drops = 0
     while True:
+        if _dropped_bytes > reported_drops:
+            lag = (_dropped_bytes - reported_drops) / (SAMPLE_RATE * 2)
+            reported_drops = _dropped_bytes
+            sys.stderr.write(f"backlog overflow: dropped {lag:.1f}s of audio\n")
+            sys.stderr.flush()
         chunk = _take(65536)
         if chunk:
             pending_bytes.extend(chunk)
@@ -364,4 +387,12 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _code = main()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(3)
+    sys.stdout.flush()
+    os._exit(_code or 0)
