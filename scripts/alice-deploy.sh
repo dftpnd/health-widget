@@ -72,15 +72,22 @@ if ! yc serverless function get --name "$FN" >/dev/null 2>&1; then
   yc serverless function create --name "$FN"
 fi
 
+ENVS="ALICE_BUCKET=$BUCKET,ALICE_PUSH_TOKEN=$TOKEN,AWS_ACCESS_KEY_ID=$KEY_ID,AWS_SECRET_ACCESS_KEY=$SECRET"
+[ -n "$SKILL_ID" ] && ENVS="$ENVS,ALICE_SKILL_ID=$SKILL_ID"
+
+PKG=$(mktemp -d)
+trap 'rm -rf "$PKG"' EXIT
+cp "$SRC/handler.py" "$SRC/requirements.txt" "$PKG/"
+
 yc serverless function version create \
   --function-name "$FN" \
   --runtime python312 \
   --entrypoint handler.handle \
   --memory 128m \
   --execution-timeout 5s \
-  --source-path "$SRC" \
+  --source-path "$PKG" \
   --service-account-id "$SA_ID" \
-  --environment "ALICE_BUCKET=$BUCKET,ALICE_PUSH_TOKEN=$TOKEN,ALICE_SKILL_ID=$SKILL_ID,AWS_ACCESS_KEY_ID=$KEY_ID,AWS_SECRET_ACCESS_KEY=$SECRET" >/dev/null
+  --environment "$ENVS" >/dev/null
 
 yc serverless function allow-unauthenticated-invoke "$FN" >/dev/null 2>&1 || true
 
