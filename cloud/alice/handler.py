@@ -115,6 +115,13 @@ def handle(event, context):
         save_state(client(), bucket, body)
         return reply(200, {"ok": True})
 
+    meta = body.get("meta") or {}
+    print(json.dumps({
+        "kind": "dialog",
+        "client": meta.get("client_id", ""),
+        "command": (body.get("request") or {}).get("command", ""),
+    }, ensure_ascii=False))
+
     expected = os.environ.get("ALICE_SKILL_ID", "")
     got = (body.get("session") or {}).get("skill_id", "")
     if expected and got != expected:
