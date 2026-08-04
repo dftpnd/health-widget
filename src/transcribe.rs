@@ -143,6 +143,7 @@ impl Transcriber {
         state: Arc<Mutex<Transcript>>,
         fresh: Arc<Mutex<VecDeque<String>>>,
         out_seq: Arc<AtomicU64>,
+        finals_seq: Arc<AtomicU64>,
     ) -> Result<(Transcriber, Feeder), StartFail> {
         let mut gate = guard(&START_GATE);
         if let Some(last) = *gate {
@@ -229,6 +230,7 @@ impl Transcriber {
                         g.finals.push_str(t);
                         trim_head(&mut g.finals, MAX_FINALS);
                         g.partial.clear();
+                        finals_seq.fetch_add(1, Ordering::Relaxed);
                         {
                             let mut q = guard(&fresh);
                             if q.len() >= FRESH_CAP {
@@ -336,6 +338,7 @@ pub struct Stt {
     state: Arc<Mutex<Transcript>>,
     fresh: Arc<Mutex<VecDeque<String>>>,
     out_seq: Arc<AtomicU64>,
+    finals_seq: Arc<AtomicU64>,
     live: Mutex<Option<Live>>,
     retry: Mutex<Retry>,
     stall: Mutex<Stall>,
@@ -360,6 +363,7 @@ impl Stt {
             state: Arc::new(Mutex::new(Transcript::default())),
             fresh: Arc::new(Mutex::new(VecDeque::new())),
             out_seq: Arc::new(AtomicU64::new(0)),
+            finals_seq: Arc::new(AtomicU64::new(0)),
             live: Mutex::new(None),
             retry: Mutex::new(Retry { next: Instant::now(), delay: RETRY_MIN, young_streak: 0 }),
             stall: Mutex::new(Stall { seen_seq: 0, speech_secs: 0.0 }),
@@ -461,6 +465,7 @@ impl Stt {
             self.state.clone(),
             self.fresh.clone(),
             self.out_seq.clone(),
+            self.finals_seq.clone(),
         ) {
             Ok((transcriber, feeder)) => {
                 *live = Some(Live {
@@ -517,6 +522,10 @@ impl Stt {
 
     pub fn health(&self) -> Health {
         guard(&self.health).clone()
+    }
+
+    pub fn finals_seq(&self) -> u64 {
+        self.finals_seq.load(Ordering::Relaxed)
     }
 
     pub fn fresh_handle(&self) -> Arc<Mutex<VecDeque<String>>> {

@@ -6,6 +6,7 @@ use std::collections::{HashSet, VecDeque};
 
 mod audio;
 mod avatar;
+mod awake;
 mod chat;
 mod clip;
 mod config;
@@ -43,8 +44,10 @@ const CH_MIC: &str = "🎤 я";
 const CH_ZOOM: &str = "🔊 телемост";
 const CH_WEB: &str = "🌐 веб";
 const WEB_FRESH_GLOW: Duration = Duration::from_millis(2200);
+const CHAT_QUEUE_MAX: usize = 4;
 
 const GRIP: f32 = 16.0;
+const PRESENT_SIZE: f32 = 30.0;
 const MARGIN: f32 = 12.0;
 const CHAT_WIN_W: f32 = 440.0;
 const CHAT_WIN_H: f32 = 520.0;
@@ -55,7 +58,6 @@ const PILOT_PROFILES: &[(&str, &str)] = &[
     ("fullstack", "Fullstack"),
     ("back", "Backend"),
     ("llm", "LLM"),
-    ("analyst", "Системный аналитик"),
 ];
 
 const APPLY_TARGET: i64 = 27;
@@ -67,6 +69,16 @@ const SCAN_GAP_MIN: i64 = 6 * 60;
 
 fn may_scan(scans_today: i64, age_min: Option<i64>) -> bool {
     scans_today < SCANS_PER_DAY && age_min.map_or(true, |m| m >= SCAN_GAP_MIN)
+}
+
+fn pool_covers_turn(ranked: i64, applied_today: i64, daily_limit: i64) -> bool {
+    let left = if daily_limit > 0 {
+        (daily_limit - applied_today).max(0)
+    } else {
+        APPLY_TARGET
+    };
+    let need = left.min(APPLY_TARGET);
+    need > 0 && ranked >= need
 }
 
 fn next_eligible_in_order(
@@ -273,11 +285,47 @@ struct ActiveCall {
     frames: Option<frames::FrameCapture>,
 }
 
+const CALL_SILENCE_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+struct AutoCall {
+    seen: u64,
+    last_final: Instant,
+    paused: bool,
+}
+
+#[derive(PartialEq, Debug)]
+enum AutoCallAction {
+    Start,
+    End,
+}
+
+fn auto_call_step(
+    state: &mut AutoCall,
+    finals_total: u64,
+    call_active: bool,
+    now: Instant,
+) -> Option<AutoCallAction> {
+    let spoke = finals_total > state.seen;
+    if now.duration_since(state.last_final) >= CALL_SILENCE_LIMIT {
+        state.paused = false;
+    }
+    if spoke {
+        state.seen = finals_total;
+        state.last_final = now;
+    }
+    if call_active {
+        if now.duration_since(state.last_final) >= CALL_SILENCE_LIMIT {
+            return Some(AutoCallAction::End);
+        }
+        return None;
+    }
+    (spoke && !state.paused).then_some(AutoCallAction::Start)
+}
+
 struct AudioState {
     mic: Option<audio::AudioMonitor>,
     zoom: Option<audio::AudioMonitor>,
     mic_target: Option<String>,
-    mic_stt: bool,
     stt_off: bool,
     prog_target: Option<String>,
     mics: Vec<audio::Device>,
@@ -306,6 +354,7 @@ struct AutopilotState {
     chatter: VecDeque<(String, Instant)>,
     chatter_cursor: u64,
     said_status: String,
+    awake: awake::Awake,
 }
 
 const CHATTER_CAP: usize = 12;
@@ -401,6 +450,7 @@ struct App {
     currently_visible: bool,
     transcript_log: Option<Arc<TranscriptLog>>,
     active_call: Option<ActiveCall>,
+    auto_call: AutoCall,
     audio: AudioState,
     avatar: AvatarState,
     pinned: bool,
@@ -430,12 +480,17 @@ struct App {
     scopes_collapsed: bool,
     chat: chat::Chat,
     chat_collapsed: bool,
-    deepseek: Option<deepseek::Slot>,
+    deepseek: Option<deepseek::Job>,
+    deepseek_since: Option<Instant>,
+    chat_queue: VecDeque<(String, String, bool)>,
     prompts: prompts::Prompts,
     prompt_draft_1: String,
     prompt_draft_2: String,
     prompt_open: bool,
     llm_provider: deepseek::Provider,
+    present_mode: bool,
+    present_size_before: Option<egui::Vec2>,
+    present_resize_logs: u8,
     help_open: bool,
     clipboard_preview: Arc<std::sync::Mutex<String>>,
     clip_open: bool,
@@ -663,7 +718,7 @@ impl App {
                 st.mic_target.as_deref(),
                 CH_MIC,
                 transcript_log.clone(),
-                st.mic_stt,
+                false,
             )
         } else {
             None
@@ -688,6 +743,12 @@ impl App {
             .unwrap_or(theme::Theme::Dark);
         let palette = theme.palette(cfg.bg_alpha);
 
+        let seen_finals = [mic.as_ref(), zoom.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|m| m.finals_count())
+            .sum();
+
         let mut app = Self {
             cfg,
             shared,
@@ -696,11 +757,15 @@ impl App {
             currently_visible: true,
             transcript_log: transcript_log.clone(),
             active_call: None,
+            auto_call: AutoCall {
+                seen: seen_finals,
+                last_final: Instant::now(),
+                paused: false,
+            },
             audio: AudioState {
                 mic,
                 zoom,
                 mic_target: st.mic_target.clone(),
-                mic_stt: st.mic_stt,
                 stt_off: st.stt_off,
                 prog_target: st.prog_target.clone(),
                 mics: audio::list_mics(),
@@ -730,6 +795,7 @@ impl App {
                 chatter: VecDeque::new(),
                 chatter_cursor: 0,
                 said_status: String::new(),
+                awake: awake::Awake::new(),
             },
             hr_reply: Arc::new(std::sync::Mutex::new(hr_reply::HrReplyState::Idle)),
             last_saved: st.clone(),
@@ -760,6 +826,8 @@ impl App {
             chat: chat::Chat::default(),
             chat_collapsed: st.chat_collapsed,
             deepseek: None,
+            deepseek_since: None,
+            chat_queue: VecDeque::new(),
             prompts: prompts::load(),
             prompt_draft_1: String::new(),
             prompt_draft_2: String::new(),
@@ -771,6 +839,9 @@ impl App {
                 .unwrap_or(deepseek::Provider::DeepSeek),
             theme,
             palette,
+            present_mode: false,
+            present_size_before: None,
+            present_resize_logs: 0,
             help_open: false,
             clipboard_preview,
             clip_open: st.clip_open,
@@ -848,7 +919,7 @@ impl App {
             self.audio.mic_target.as_deref(),
             CH_MIC,
             self.transcript_log.clone(),
-            self.audio.mic_stt,
+            false,
         )
     }
 
@@ -870,7 +941,21 @@ impl App {
         }
     }
 
-    fn start_call(&mut self) {
+    fn tick_auto_call(&mut self) {
+        let total: u64 = [self.audio.mic.as_ref(), self.audio.zoom.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|m| m.finals_count())
+            .sum();
+        let active = self.active_call.is_some();
+        match auto_call_step(&mut self.auto_call, total, active, Instant::now()) {
+            Some(AutoCallAction::Start) => self.start_call(true),
+            Some(AutoCallAction::End) => self.end_call(true),
+            None => {}
+        }
+    }
+
+    fn start_call(&mut self, auto: bool) {
         let Some(log) = self.transcript_log.clone() else {
             return;
         };
@@ -878,7 +963,14 @@ impl App {
         let Some(id) = log.start_call(&name) else {
             return;
         };
-        telemetry::event("call.start", serde_json::json!({ "id": id, "name": name }));
+        if !auto {
+            self.auto_call.paused = false;
+            self.auto_call.last_final = Instant::now();
+        }
+        telemetry::event(
+            "call.start",
+            serde_json::json!({ "id": id, "name": name, "auto": auto }),
+        );
         self.active_call = Some(ActiveCall { id, name, frames: None });
         self.reconcile_call_recording();
         self.start_frame_capture();
@@ -897,11 +989,17 @@ impl App {
         }
     }
 
-    fn end_call(&mut self) {
+    fn end_call(&mut self, auto: bool) {
         let Some(call) = self.active_call.take() else {
             return;
         };
-        telemetry::event("call.end", serde_json::json!({ "id": call.id, "name": call.name }));
+        if !auto {
+            self.auto_call.paused = true;
+        }
+        telemetry::event(
+            "call.end",
+            serde_json::json!({ "id": call.id, "name": call.name, "auto": auto }),
+        );
         if let Some(capture) = call.frames {
             capture.stop();
         }
@@ -971,6 +1069,8 @@ impl App {
 
     fn reconcile_pilot(&mut self) {
         self.pump_chatter();
+        let busy = self.autopilot.want.is_some() || self.autopilot.proc.is_some() || self.autopilot.cycle;
+        self.autopilot.awake.set(busy);
         let desired = match self.autopilot.want.clone() {
             None => {
                 if self.autopilot.proc.is_some() {
@@ -1063,7 +1163,6 @@ impl App {
             height: Some(size.y),
             mic_on: self.audio.mic.is_some(),
             mic_target: self.audio.mic_target.clone(),
-            mic_stt: self.audio.mic_stt,
             stt_off: self.audio.stt_off,
             zoom_on: self.audio.zoom.is_some(),
             prog_target: self.audio.prog_target.clone(),
@@ -1207,7 +1306,19 @@ impl App {
             Some(s) => (s.scans_today, s.scan_age_min),
             None => (SCANS_PER_DAY, Some(0)),
         };
-        if may_scan(scans_today, age_min) {
+        let pool_ready = sum.as_ref().is_some_and(|s| {
+            pool_covers_turn(s.ranked, s.applied_today, s.daily_limit)
+        });
+        if pool_ready {
+            telemetry::event(
+                "pilot.scan_skipped",
+                serde_json::json!({
+                    "profile": self.autopilot.profile,
+                    "ranked": sum.as_ref().map(|s| s.ranked),
+                }),
+            );
+        }
+        if may_scan(scans_today, age_min) && !pool_ready {
             self.enter_scan();
         } else {
             self.enter_apply_lap();
@@ -1380,6 +1491,7 @@ impl App {
                 if ui.selectable_label(pinned, "📌").on_hover_text(hint).clicked() {
                     toggle_pin = true;
                 }
+                self.draw_present_button(ui);
                 if ui
                     .button(self.theme.icon())
                     .on_hover_text(self.theme.hint())
@@ -1547,6 +1659,31 @@ impl App {
             self.draw_prompt_editor(ctx);
         }
         ui.add_space(2.0);
+    }
+
+    fn draw_present_button(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .selectable_label(false, "🎬")
+            .on_hover_text("Режим презентации: свернуть виджет до одной кнопки")
+            .clicked()
+        {
+            self.set_present_mode(true);
+        }
+    }
+
+    fn draw_present_button_filling(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let button = egui::Button::new(egui::RichText::new("🎬").size(15.0))
+            .frame(false)
+            .fill(egui::Color32::TRANSPARENT);
+        if ui.put(rect, button).clicked() {
+            self.set_present_mode(false);
+        }
+    }
+
+    fn set_present_mode(&mut self, on: bool) {
+        self.present_mode = on;
+        self.present_resize_logs = 6;
+        telemetry::event("present.toggle", serde_json::json!({ "on": on }));
     }
 
     fn draw_hr_reply_button(&mut self, ui: &mut egui::Ui) {
@@ -1724,9 +1861,7 @@ impl App {
         let zoom_on = self.audio.zoom.is_some();
         let mic_target = self.audio.mic_target.clone();
         let prog_target = self.audio.prog_target.clone();
-        let mic_stt = self.audio.mic_stt;
         let mut toggle_mic = false;
-        let mut toggle_mic_stt = false;
         let mut toggle_zoom = false;
         let mut mic_off = false;
         let mut zoom_off = false;
@@ -1770,15 +1905,6 @@ impl App {
                 });
             if ui.small_button("⟳").on_hover_text("обновить список микрофонов").clicked() {
                 refresh_mic = true;
-            }
-            if ui
-                .selectable_label(mic_stt, "📝")
-                .on_hover_text(
-                    "Распознавать речь с микрофона (~4 ГБ VRAM; уступает место веб-каналу)",
-                )
-                .clicked()
-            {
-                toggle_mic_stt = true;
             }
         });
 
@@ -1848,12 +1974,6 @@ impl App {
         if let Some(sel) = new_prog {
             self.audio.prog_target = sel;
             self.restart_zoom();
-        }
-        if toggle_mic_stt {
-            self.audio.mic_stt = !self.audio.mic_stt;
-            if self.audio.mic.is_some() {
-                self.restart_mic();
-            }
         }
         if mic_off {
             self.audio.mic = None;
@@ -2628,9 +2748,9 @@ impl App {
         });
         if call_toggle {
             if self.active_call.is_some() {
-                self.end_call();
+                self.end_call(false);
             } else {
-                self.start_call();
+                self.start_call(false);
             }
         }
         if glue_go {
@@ -3132,28 +3252,40 @@ impl App {
 
     fn process_transcript_keys(&mut self, ctx: &egui::Context) {
         if self.transcript_keys.clear_chat.swap(false, Ordering::Relaxed) {
+            let nothing_to_clear = !self.chat.has_dialogue()
+                && self.deepseek.is_none()
+                && self.chat_queue.is_empty();
+            self.abort_deepseek("очистка");
+            self.chat_queue.clear();
             self.chat.clear();
-            self.deepseek = None;
+            self.reset_active_prompt();
+            if nothing_to_clear {
+                self.report_chain();
+            }
         }
         if self.transcript_keys.send_mic.swap(false, Ordering::Relaxed) {
-            self.chat.clear();
-            self.deepseek = None;
-            self.send_transcript(ctx.clone(), true, self.prompts.prompt_1.clone());
+            self.send_transcript(ctx.clone(), true, self.prompts.prompt_1.clone(), true, true);
         }
         if self.transcript_keys.send_zoom.swap(false, Ordering::Relaxed) {
-            self.chat.clear();
-            self.deepseek = None;
-            self.send_transcript(ctx.clone(), false, self.prompts.prompt_1.clone());
+            self.send_transcript(ctx.clone(), false, self.prompts.prompt_1.clone(), true, false);
         }
         if self.transcript_keys.send_mic_p2.swap(false, Ordering::Relaxed) {
-            self.send_transcript(ctx.clone(), true, self.prompts.prompt_2.clone());
+            self.send_transcript(ctx.clone(), true, self.prompts.prompt_2.clone(), false, true);
         }
         if self.transcript_keys.send_zoom_p2.swap(false, Ordering::Relaxed) {
-            self.send_transcript(ctx.clone(), false, self.prompts.prompt_2.clone());
+            self.send_transcript(ctx.clone(), false, self.prompts.prompt_2.clone(), false, false);
         }
     }
 
-    fn send_transcript(&mut self, ctx: egui::Context, mic: bool, prompt: String) {
+    fn send_transcript(
+        &mut self,
+        ctx: egui::Context,
+        mic: bool,
+        prompt: String,
+        reset: bool,
+        think: bool,
+    ) {
+        let channel = if mic { CH_MIC } else { CH_ZOOM };
         let mon = if mic { &self.audio.mic } else { &self.audio.zoom };
         let text = mon
             .as_ref()
@@ -3161,12 +3293,98 @@ impl App {
             .map(|(finals, _)| finals.trim().to_string())
             .unwrap_or_default();
         if text.is_empty() {
+            let why = match mon.as_ref().map(|m| m.stt_health()) {
+                None | Some(transcribe::Health::Off) => "распознавание выключено".to_string(),
+                Some(transcribe::Health::Down(err)) => {
+                    format!("распознавание не работает: {err}")
+                }
+                _ => "нет распознанного текста".to_string(),
+            };
+            self.warn_send_skipped(channel, &why);
             return;
         }
         if let Some(m) = mon {
             m.clear_transcript();
         }
-        self.start_deepseek_with_prompt(ctx, prompt, text);
+        if reset {
+            self.abort_deepseek("новый диалог");
+            self.chat_queue.clear();
+            self.chat.clear();
+        }
+        let prompt = if self.chat.has_dialogue() {
+            prompt
+        } else {
+            self.prompts.prompt_1.clone()
+        };
+        self.start_deepseek_with_prompt(ctx, prompt, text, think);
+    }
+
+    fn reset_active_prompt(&mut self) {
+        if self.prompts.active == 1 {
+            return;
+        }
+        self.prompts.active = 1;
+        prompts::save(&self.prompts);
+    }
+
+    fn warn_send_skipped(&mut self, channel: &str, why: &str) {
+        telemetry::event(
+            "chat.send_skipped",
+            serde_json::json!({ "channel": channel, "why": why }),
+        );
+        self.chat_collapsed = false;
+        self.chat.push_note(format!("⚠ {channel}: {why} — нечего отправлять"));
+    }
+
+    fn abort_deepseek(&mut self, why: &str) {
+        if let Some(job) = self.deepseek.take() {
+            job.kill();
+            telemetry::event(
+                "chat.abort",
+                serde_json::json!({ "why": why, "waited_secs": self.deepseek_since.map(|t| t.elapsed().as_secs()) }),
+            );
+        }
+        self.deepseek_since = None;
+        self.chat.set_pending(false);
+    }
+
+    fn report_chain(&mut self) {
+        let mut lines = vec!["🔎 нечего очищать — проверяю цепочку".to_string()];
+        for (mon, channel) in [(&self.audio.mic, CH_MIC), (&self.audio.zoom, CH_ZOOM)] {
+            match mon.as_ref() {
+                None => lines.push(format!("{channel}: канал не запущен")),
+                Some(m) => {
+                    let (finals, partial) = m.transcript();
+                    let health = match m.stt_health() {
+                        transcribe::Health::Off => "распознавание выключено".to_string(),
+                        transcribe::Health::Starting => "распознавание стартует".to_string(),
+                        transcribe::Health::Warmup => "распознавание прогревается".to_string(),
+                        transcribe::Health::Live => "распознавание живо".to_string(),
+                        transcribe::Health::Down(why) => format!("распознавание упало: {why}"),
+                    };
+                    let silence = m.silent_for().as_secs();
+                    let notice = m.notice().map(|n| format!(", {n}")).unwrap_or_default();
+                    lines.push(format!(
+                        "{channel}: {health}, текста {} симв. (+{} в работе), звук молчит {silence} с{notice}",
+                        finals.trim().chars().count(),
+                        partial.trim().chars().count(),
+                    ));
+                }
+            }
+        }
+        let provider = self.llm_provider;
+        let key = if deepseek::key_present(&self.cfg.autopilot_dir, provider) {
+            "ключ есть"
+        } else {
+            "ключа нет в .env автопилота"
+        };
+        lines.push(format!("{}: {key}", provider.label()));
+        telemetry::event(
+            "chat.chain_report",
+            serde_json::json!({ "lines": lines.clone() }),
+        );
+        self.chat_collapsed = false;
+        self.chat.push_note(lines.join("\n"));
     }
 
     fn move_target_available(&self, target: MoveTarget) -> bool {
@@ -3226,26 +3444,14 @@ impl App {
         let p = self.palette;
         if self.audio.mic.is_some() || self.audio.zoom.is_some() {
             let mut picked: Option<String> = None;
-            let mut clear_mic = false;
             let mut clear_zoom = false;
             let mut collapsed = self.scopes_collapsed;
             section_collapsible(p, ui, "📈 Осциллограммы", &mut collapsed, |ui| {
                 if let Some(mon) = &self.audio.mic {
                     mon.snapshot(&mut self.audio.scope);
                     let color = p.ok;
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("🎤 Микрофон").size(11.0).color(color),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("🗑").on_hover_text("Очистить текст").clicked() {
-                                clear_mic = true;
-                            }
-                        });
-                    });
+                    ui.label(egui::RichText::new("🎤 Микрофон").size(11.0).color(color));
                     draw_scope(p, ui, &self.audio.scope, color);
-                    picked = draw_transcript(p, ui, Some(mon.transcript()), color, "mic")
-                        .or(picked.take());
                 }
                 if let Some(mon) = &self.audio.zoom {
                     mon.snapshot(&mut self.audio.scope);
@@ -3267,11 +3473,6 @@ impl App {
                 }
             });
             self.scopes_collapsed = collapsed;
-            if clear_mic {
-                if let Some(mon) = &self.audio.mic {
-                    mon.clear_transcript();
-                }
-            }
             if clear_zoom {
                 if let Some(mon) = &self.audio.zoom {
                     mon.clear_transcript();
@@ -3285,17 +3486,49 @@ impl App {
 
     fn start_deepseek(&mut self, ctx: egui::Context, question: String) {
         let prompt = self.prompts.active_text().to_string();
-        self.start_deepseek_with_prompt(ctx, prompt, question);
+        self.start_deepseek_with_prompt(ctx, prompt, question, true);
     }
 
-    fn start_deepseek_with_prompt(&mut self, ctx: egui::Context, prompt: String, question: String) {
+    fn start_deepseek_with_prompt(
+        &mut self,
+        ctx: egui::Context,
+        prompt: String,
+        question: String,
+        think: bool,
+    ) {
         let q = question.trim().to_string();
-        if q.is_empty() || self.deepseek.is_some() {
+        if q.is_empty() {
+            return;
+        }
+        if self.deepseek.is_some() {
+            self.enqueue_ask(prompt, q, think);
+            return;
+        }
+        self.launch_deepseek(ctx, prompt, q, think);
+    }
+
+    fn enqueue_ask(&mut self, prompt: String, q: String, think: bool) {
+        self.chat_collapsed = false;
+        if self.chat_queue.len() >= CHAT_QUEUE_MAX {
+            telemetry::event("chat.queue_full", serde_json::json!({ "len": q.len() }));
+            self.chat
+                .push_note("⚠ очередь запросов полна — сообщение отброшено".to_string());
             return;
         }
         telemetry::event(
+            "chat.queued",
+            serde_json::json!({ "len": q.len(), "depth": self.chat_queue.len() + 1 }),
+        );
+        let preview: String = q.chars().take(60).collect();
+        self.chat
+            .push_note(format!("⏳ ждёт предыдущего ответа: {preview}…"));
+        self.chat_queue.push_back((prompt, q, think));
+    }
+
+    fn launch_deepseek(&mut self, ctx: egui::Context, prompt: String, q: String, think: bool) {
+        telemetry::event(
             "chat.ask",
-            serde_json::json!({ "len": q.len(), "profile": self.autopilot.profile }),
+            serde_json::json!({ "len": q.len(), "profile": self.autopilot.profile, "think": think }),
         );
         self.chat.push_user(q);
         self.chat.set_pending(true);
@@ -3306,20 +3539,33 @@ impl App {
             self.llm_provider,
             prompt,
             self.chat.history(),
+            think,
         ));
+        self.deepseek_since = Some(Instant::now());
     }
 
-    fn poll_deepseek(&mut self) {
-        let done = self
-            .deepseek
-            .as_ref()
-            .and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+    fn poll_deepseek(&mut self, ctx: &egui::Context) {
+        let done = self.deepseek.as_ref().and_then(|job| job.take());
         if let Some(res) = done {
             self.deepseek = None;
+            self.deepseek_since = None;
             self.chat.set_pending(false);
             match res {
                 Ok(answer) => self.chat.push_bot(answer),
-                Err(e) => self.chat.push_bot(format!("⚠ {e}")),
+                Err(e) => self.chat.push_note(format!("⚠ {e}")),
+            }
+        } else if self
+            .deepseek_since
+            .is_some_and(|t| t.elapsed() > deepseek::GIVE_UP)
+        {
+            let provider = self.llm_provider;
+            self.abort_deepseek("не ответил");
+            self.chat
+                .push_note(format!("⚠ {} не ответил — слот освобождён", provider.label()));
+        }
+        if self.deepseek.is_none() {
+            if let Some((prompt, q, think)) = self.chat_queue.pop_front() {
+                self.launch_deepseek(ctx.clone(), prompt, q, think);
             }
         }
     }
@@ -3365,12 +3611,14 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.shared.shutdown.load(Ordering::Relaxed) {
             telemetry::event("app.shutdown", serde_json::json!({}));
-            self.end_call();
+            self.end_call(true);
             self.autopilot.want = None;
             self.reconcile_pilot();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+
+        self.tick_auto_call();
 
         self.palette = self.theme.palette(self.cfg.bg_alpha);
         ctx.set_visuals(self.theme.egui_visuals());
@@ -3382,7 +3630,7 @@ impl eframe::App for App {
 
         self.wheel_ticks = self.win_move.wheel.swap(0, Ordering::Relaxed);
 
-        self.poll_deepseek();
+        self.poll_deepseek(ctx);
 
         if self.shot.request.swap(false, Ordering::Relaxed) && !self.shot.active {
             telemetry::event("shot.request", serde_json::json!({}));
@@ -3394,15 +3642,15 @@ impl eframe::App for App {
             self.show_shot_overlay(ctx);
         }
 
-        if self.clip_open {
+        if self.clip_open && !self.present_mode {
             self.show_clip_window(ctx);
         }
 
-        if self.chat_open {
+        if self.chat_open && !self.present_mode {
             self.show_chat_window(ctx);
         }
 
-        if self.webmic.is_some() {
+        if self.webmic.is_some() && !self.present_mode {
             self.show_web_window(ctx);
         }
 
@@ -3519,6 +3767,47 @@ impl eframe::App for App {
                 .fill(bg)
                 .inner_margin(egui::Margin::same(MARGIN as i8))
                 .corner_radius(10);
+
+            if self.present_mode {
+                if self.present_size_before.is_none() {
+                    self.present_size_before = Some(ctx.screen_rect().size());
+                }
+                let present_frame = egui::Frame::default()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::same(0))
+                    .corner_radius(6);
+                egui::CentralPanel::default().frame(present_frame).show(ctx, |ui| {
+                    let panel = ui.max_rect();
+                    let drag = ui.interact(
+                        panel,
+                        ui.id().with("drag-move-present"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    self.draw_present_button_filling(ui, panel);
+                    self.process_transcript_keys(ctx);
+                    self.process_window_move(ctx);
+                });
+
+                let target = egui::vec2(PRESENT_SIZE, PRESENT_SIZE);
+                let cur = ctx.screen_rect().size();
+                if (target.x - cur.x).abs() > 0.5 || (target.y - cur.y).abs() > 0.5 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
+                    if self.present_resize_logs > 0 {
+                        self.present_resize_logs -= 1;
+                        eprintln!("present: resize {cur:?} → {target:?}");
+                    }
+                }
+
+                ctx.request_repaint_after(Duration::from_millis(500));
+                return;
+            }
+
+            if let Some(size) = self.present_size_before.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
 
             if self.terminal_open {
                 let resp = egui::SidePanel::right("terminal_panel")
@@ -4130,8 +4419,9 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod apply_chain_tests {
     use super::{
-        apply_part_done, chat_part_done, enrich_window_over, may_scan, next_chat_profile,
-        next_eligible_in_order, seg_widths, turn_segments, SegState, SCANS_PER_DAY,
+        apply_part_done, auto_call_step, chat_part_done, enrich_window_over, may_scan,
+        next_chat_profile, next_eligible_in_order, pool_covers_turn, seg_widths, turn_segments,
+        AutoCall, AutoCallAction, SegState, APPLY_TARGET, CALL_SILENCE_LIMIT, SCANS_PER_DAY,
         SCAN_GAP_MIN,
     };
     use std::collections::HashSet;
@@ -4146,6 +4436,26 @@ mod apply_chain_tests {
         assert!(!may_scan(1, Some(SCAN_GAP_MIN - 1)), "гэп не выдержан — нельзя");
         assert!(!may_scan(SCANS_PER_DAY, Some(10_000)), "суточный лимит выбран");
         assert!(may_scan(SCANS_PER_DAY - 1, Some(10_000)), "остался один скан");
+    }
+
+    #[test]
+    fn full_pool_covers_the_turn() {
+        assert!(pool_covers_turn(APPLY_TARGET, 0, 200), "хватает на весь ход");
+        assert!(
+            !pool_covers_turn(APPLY_TARGET - 1, 0, 200),
+            "не хватает на ход — нужен скан"
+        );
+        assert!(
+            pool_covers_turn(3, 197, 200),
+            "до лимита осталось 3 — трёх кандидатов достаточно"
+        );
+        assert!(
+            !pool_covers_turn(2, 197, 200),
+            "до лимита 3, кандидатов 2 — нужен скан"
+        );
+        assert!(!pool_covers_turn(500, 200, 200), "лимит выбран — ход пустой");
+        assert!(pool_covers_turn(APPLY_TARGET, 0, 0), "без лимита меряем целью хода");
+        assert!(!pool_covers_turn(0, 0, 200), "пустой пул — скан обязателен");
     }
 
     #[test]
@@ -4237,6 +4547,52 @@ mod apply_chain_tests {
     fn chat_next_none_when_all_done() {
         let done: HashSet<String> = ORDER.iter().map(|s| s.to_string()).collect();
         assert_eq!(next_chat_profile(ORDER, "fullstack", &done), None);
+    }
+
+    fn idle_auto_call(now: Instant) -> AutoCall {
+        AutoCall { seen: 0, last_final: now, paused: false }
+    }
+
+    #[test]
+    fn speech_opens_call() {
+        let now = Instant::now();
+        let mut st = idle_auto_call(now);
+        assert_eq!(auto_call_step(&mut st, 1, false, now), Some(AutoCallAction::Start));
+    }
+
+    #[test]
+    fn silence_limit_closes_call() {
+        let now = Instant::now();
+        let mut st = idle_auto_call(now);
+        let later = now + CALL_SILENCE_LIMIT;
+        assert_eq!(auto_call_step(&mut st, 0, true, later), Some(AutoCallAction::End));
+    }
+
+    #[test]
+    fn speech_keeps_call_alive() {
+        let now = Instant::now();
+        let mut st = idle_auto_call(now);
+        let later = now + CALL_SILENCE_LIMIT;
+        assert_eq!(auto_call_step(&mut st, 1, true, later), None);
+        let much_later = later + CALL_SILENCE_LIMIT - Duration::from_secs(1);
+        assert_eq!(auto_call_step(&mut st, 1, true, much_later), None);
+    }
+
+    #[test]
+    fn manual_stop_survives_new_speech() {
+        let now = Instant::now();
+        let mut st = AutoCall { seen: 0, last_final: now, paused: true };
+        assert_eq!(auto_call_step(&mut st, 1, false, now), None);
+        let soon = now + Duration::from_secs(60);
+        assert_eq!(auto_call_step(&mut st, 2, false, soon), None);
+    }
+
+    #[test]
+    fn pause_expires_after_silence() {
+        let now = Instant::now();
+        let mut st = AutoCall { seen: 0, last_final: now, paused: true };
+        let later = now + CALL_SILENCE_LIMIT;
+        assert_eq!(auto_call_step(&mut st, 1, false, later), Some(AutoCallAction::Start));
     }
 
     #[test]

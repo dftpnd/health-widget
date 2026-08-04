@@ -836,6 +836,10 @@ impl AudioMonitor {
         self.stt.clear();
     }
 
+    pub fn finals_count(&self) -> u64 {
+        self.stt.finals_seq()
+    }
+
     pub fn stt_health(&self) -> Health {
         self.stt.health()
     }
