@@ -20,6 +20,7 @@ const DIED_YOUNG: Duration = Duration::from_secs(20);
 const YOUNG_STREAK_MAX: u32 = 3;
 const SPEECH_RMS: f32 = 0.015;
 const STALL_SPEECH_SECS: f32 = 90.0;
+const NO_FINALS_AFTER: Duration = Duration::from_secs(300);
 const WEB_RESERVE_MIB: u64 = 5000;
 const LINGER: Duration = Duration::from_secs(10);
 
@@ -296,6 +297,26 @@ struct Stall {
     speech_secs: f32,
 }
 
+struct Quiet {
+    seen_seq: u64,
+    since: Instant,
+    reported: bool,
+}
+
+fn quiet_report(seq: u64, q: &mut Quiet, now: Instant) -> Option<u64> {
+    if seq != q.seen_seq {
+        q.seen_seq = seq;
+        q.since = now;
+        q.reported = false;
+        return None;
+    }
+    if q.reported || now.duration_since(q.since) < NO_FINALS_AFTER {
+        return None;
+    }
+    q.reported = true;
+    Some(now.duration_since(q.since).as_secs())
+}
+
 struct Live {
     transcriber: Option<Transcriber>,
     feeder: Option<Feeder>,
@@ -318,6 +339,7 @@ pub struct Stt {
     live: Mutex<Option<Live>>,
     retry: Mutex<Retry>,
     stall: Mutex<Stall>,
+    quiet: Mutex<Quiet>,
     health: Mutex<Health>,
     enabled: bool,
     src_rate: u32,
@@ -341,6 +363,7 @@ impl Stt {
             live: Mutex::new(None),
             retry: Mutex::new(Retry { next: Instant::now(), delay: RETRY_MIN, young_streak: 0 }),
             stall: Mutex::new(Stall { seen_seq: 0, speech_secs: 0.0 }),
+            quiet: Mutex::new(Quiet { seen_seq: 0, since: Instant::now(), reported: false }),
             health: Mutex::new(if enabled { Health::Starting } else { Health::Off }),
             enabled,
             src_rate,
@@ -364,6 +387,13 @@ impl Stt {
             return;
         };
         feeder.feed(batch);
+        let seq = self.out_seq.load(Ordering::Relaxed);
+        if let Some(secs) = quiet_report(seq, &mut guard(&self.quiet), Instant::now()) {
+            crate::telemetry::event(
+                "stt.no_finals",
+                serde_json::json!({ "channel": self.channel, "secs": secs }),
+            );
+        }
         let fault = if feeder.is_dead() || !transcriber.is_alive() {
             Some(("процесс распознавания упал", "died"))
         } else if self.stalled(batch) {
@@ -585,7 +615,7 @@ fn next_delay(cur: Duration) -> Duration {
     (cur * 2).min(RETRY_MAX)
 }
 
-fn trim_head(s: &mut String, max: usize) {
+pub fn trim_head(s: &mut String, max: usize) {
     let n = s.chars().count();
     if n <= max {
         return;
@@ -621,6 +651,25 @@ mod tests {
         assert!(rms(&quiet) < SPEECH_RMS, "фоновый шум не считается речью");
         let loud: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 0.2 } else { -0.2 }).collect();
         assert!(rms(&loud) >= SPEECH_RMS, "речь считается речью");
+    }
+
+    #[test]
+    fn no_finals_fires_once_per_episode() {
+        use super::{quiet_report, Quiet, NO_FINALS_AFTER};
+        let t0 = std::time::Instant::now();
+        let mut q = Quiet { seen_seq: 7, since: t0, reported: false };
+
+        assert_eq!(quiet_report(7, &mut q, t0 + Duration::from_secs(299)), None);
+        assert_eq!(quiet_report(7, &mut q, t0 + NO_FINALS_AFTER), Some(300));
+        assert_eq!(
+            quiet_report(7, &mut q, t0 + Duration::from_secs(900)),
+            None,
+            "одно событие на эпизод"
+        );
+
+        assert_eq!(quiet_report(8, &mut q, t0 + Duration::from_secs(901)), None);
+        assert!(!q.reported, "новый финал снимает флаг");
+        assert_eq!(quiet_report(8, &mut q, t0 + Duration::from_secs(1300)), Some(399));
     }
 
     #[test]
