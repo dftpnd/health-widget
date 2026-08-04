@@ -266,10 +266,6 @@ fn draw_turn_bar(ui: &mut egui::Ui, pal: &theme::Palette, segs: &[PhaseSeg]) {
     );
 }
 
-fn today_local() -> String {
-    telemetry::now_local()[..10].to_string()
-}
-
 const TERMINAL_W: f32 = 340.0;
 const TOP_ROW_H: f32 = 64.0;
 
@@ -609,6 +605,12 @@ impl App {
                 std::thread::sleep(poll);
             });
         }
+
+        alice::spawn(
+            cfg.autopilot_dir.clone(),
+            cfg.autopilot_bin.clone(),
+            PILOT_PROFILES.iter().map(|(k, _)| k.to_string()).collect(),
+        );
 
         let clip_pos = Arc::new(std::sync::Mutex::new(
             st.clip_x.zip(st.clip_y).map(|(x, y)| (x as i32, y as i32)),
