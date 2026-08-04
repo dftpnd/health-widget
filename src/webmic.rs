@@ -18,6 +18,8 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 const LINES_CAP: usize = 200;
 pub const MSG_MAX: usize = 64 * 1024;
 const POSTS_CAP: usize = 30;
+const ZOOM_FEED_MAX: usize = 50_000;
+const RATIO_WINDOW: Duration = Duration::from_secs(20);
 
 pub enum Post {
     Text(u64, String),
@@ -32,6 +34,8 @@ pub struct Shared {
     pub last_audio: Option<Instant>,
     pub posts: VecDeque<Post>,
     pub zoom: Option<Arc<Mutex<Transcript>>>,
+    zoom_feed: String,
+    zoom_seen: String,
     next_post_id: u64,
     cleared_lines: Option<VecDeque<String>>,
     cleared_posts: Option<VecDeque<Post>>,
@@ -48,6 +52,34 @@ impl Shared {
             self.posts.pop_front();
         }
         self.posts.push_back(make(self.next_post_id));
+    }
+
+    pub fn zoom_pull(&mut self) -> (bool, String, String) {
+        let Some(handle) = self.zoom.clone() else {
+            self.zoom_seen.clear();
+            return (false, String::new(), String::new());
+        };
+        let Some((finals, partial)) =
+            handle.lock().ok().map(|t| (t.finals.clone(), t.partial.clone()))
+        else {
+            return (false, String::new(), String::new());
+        };
+        let add = match finals.strip_prefix(self.zoom_seen.as_str()) {
+            Some(rest) => rest,
+            None => finals.as_str(),
+        };
+        if !add.trim().is_empty() {
+            if !self.zoom_feed.is_empty()
+                && !self.zoom_feed.ends_with(' ')
+                && !add.starts_with(' ')
+            {
+                self.zoom_feed.push(' ');
+            }
+            self.zoom_feed.push_str(add);
+            crate::transcribe::trim_head(&mut self.zoom_feed, ZOOM_FEED_MAX);
+        }
+        self.zoom_seen = finals;
+        (true, self.zoom_feed.clone(), partial)
     }
 
     pub fn clear_said(&mut self) {
@@ -145,6 +177,55 @@ impl Drop for WebMic {
     }
 }
 
+#[derive(Default)]
+struct Source {
+    sid: String,
+    rate: u32,
+    last: Option<Instant>,
+    samples: u64,
+    window: Option<Instant>,
+}
+
+impl Source {
+    fn active(&self) -> bool {
+        self.last.is_some_and(|t| t.elapsed() < CLIENT_ACTIVE)
+    }
+
+    fn taken_by(&self, sid: &str) -> bool {
+        self.active() && self.sid != sid
+    }
+
+    fn adopt(&mut self, sid: &str, rate: u32) {
+        self.sid = sid.to_string();
+        self.rate = rate;
+        self.samples = 0;
+        self.window = Some(Instant::now());
+    }
+
+    fn account(&mut self, channel: &'static str, n: usize) {
+        self.samples += n as u64;
+        let Some(start) = self.window else { return };
+        let secs = start.elapsed().as_secs_f64();
+        if secs < RATIO_WINDOW.as_secs_f64() {
+            return;
+        }
+        let got = self.samples as f64 / self.rate.max(1) as f64;
+        crate::telemetry::event(
+            "webmic.audio",
+            serde_json::json!({
+                "channel": channel,
+                "sid": self.sid,
+                "rate": self.rate,
+                "secs": (got * 10.0).round() / 10.0,
+                "wall": (secs * 10.0).round() / 10.0,
+                "ratio": (got / secs * 100.0).round() / 100.0,
+            }),
+        );
+        self.samples = 0;
+        self.window = Some(Instant::now());
+    }
+}
+
 fn serve_loop(
     server: tiny_http::Server,
     root: Option<PathBuf>,
@@ -155,11 +236,11 @@ fn serve_loop(
     token: Option<String>,
 ) {
     let mut stt: Option<Arc<Stt>> = None;
-    let mut last_audio: Option<Instant> = None;
+    let mut src = Source::default();
     while !stop.load(Ordering::Relaxed) {
         if stt.is_some()
             && (!crate::transcribe::is_enabled()
-                || last_audio.is_some_and(|t| t.elapsed() > IDLE_STT_STOP))
+                || src.last.is_some_and(|t| t.elapsed() > IDLE_STT_STOP))
         {
             stt = None;
             if let Ok(mut g) = shared.lock() {
@@ -172,7 +253,7 @@ fn serve_loop(
             Ok(None) => continue,
             Err(_) => break,
         };
-        handle_request(req, &root, channel, &log, &shared, &stop, &mut stt, &mut last_audio, token.as_deref());
+        handle_request(req, &root, channel, &log, &shared, &stop, &mut stt, &mut src, token.as_deref());
     }
 }
 
@@ -184,7 +265,7 @@ fn handle_request(
     shared: &Arc<Mutex<Shared>>,
     stop: &Arc<AtomicBool>,
     stt: &mut Option<Arc<Stt>>,
-    last_audio: &mut Option<Instant>,
+    src: &mut Source,
     token: Option<&str>,
 ) {
     let url = req.url().to_string();
@@ -201,10 +282,17 @@ fn handle_request(
             .as_reader()
             .take(MAX_BODY as u64)
             .read_to_end(&mut body);
-        let reply = on_audio(&url, &body, channel, log, shared, stt, last_audio);
-        let resp = tiny_http::Response::from_string(reply.to_string()).with_header(
-            tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
-        );
+        let reply = on_audio(&url, &body, channel, log, shared, stt, src);
+        let code = if reply.get("busy").and_then(|b| b.as_bool()) == Some(true) {
+            409
+        } else {
+            200
+        };
+        let resp = tiny_http::Response::from_string(reply.to_string())
+            .with_status_code(code)
+            .with_header(
+                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+            );
         let _ = req.respond(resp);
         return;
     }
@@ -311,13 +399,39 @@ fn on_audio(
     log: &Option<Arc<TranscriptLog>>,
     shared: &Arc<Mutex<Shared>>,
     stt: &mut Option<Arc<Stt>>,
-    last_audio: &mut Option<Instant>,
+    src: &mut Source,
 ) -> serde_json::Value {
     let samples = pcm_from_le(body);
+    let sid = query_param(url, "sid").unwrap_or_else(|| "anon".to_string());
+    let rate = rate_from_url(url);
     if !samples.is_empty() {
-        *last_audio = Some(Instant::now());
+        if src.taken_by(&sid) {
+            crate::telemetry::event(
+                "webmic.busy",
+                serde_json::json!({ "channel": channel, "holder": src.sid, "sid": sid }),
+            );
+            return serde_json::json!({ "busy": true });
+        }
+        if src.sid != sid || src.rate != rate {
+            crate::telemetry::event(
+                "webmic.source",
+                serde_json::json!({
+                    "channel": channel,
+                    "sid": sid,
+                    "rate": rate,
+                    "was_sid": src.sid,
+                    "was_rate": src.rate,
+                }),
+            );
+            if src.rate != rate {
+                *stt = None;
+            }
+            src.adopt(&sid, rate);
+        }
+        src.last = Some(Instant::now());
+        src.account(channel, samples.len());
         if stt.is_none() && crate::transcribe::is_enabled() {
-            *stt = Some(Stt::new(rate_from_url(url), channel, log.clone(), true));
+            *stt = Some(Stt::new(rate, channel, log.clone(), true));
         }
     }
     let mut finals: Vec<String> = Vec::new();
@@ -335,7 +449,7 @@ fn on_audio(
     };
     if let Ok(mut g) = shared.lock() {
         g.stt_on = stt_alive;
-        g.last_audio = *last_audio;
+        g.last_audio = src.last;
         g.partial = partial.clone();
         for l in &finals {
             if g.lines.len() >= LINES_CAP {
@@ -440,10 +554,9 @@ fn ws_accept(key: &str) -> Option<String> {
 }
 
 fn zoom_snapshot(shared: &Arc<Mutex<Shared>>) -> (bool, String, String) {
-    let handle = shared.lock().ok().and_then(|g| g.zoom.clone());
-    match handle.and_then(|h| h.lock().ok().map(|t| (t.finals.clone(), t.partial.clone()))) {
-        Some((f, p)) => (true, f, p),
-        None => (false, String::new(), String::new()),
+    match shared.lock() {
+        Ok(mut g) => g.zoom_pull(),
+        Err(_) => (false, String::new(), String::new()),
     }
 }
 
@@ -811,6 +924,25 @@ mod tests {
     }
 
     #[test]
+    fn zoom_feed_survives_widget_clear() {
+        let mut sh = Shared::default();
+        let zoom = Arc::new(Mutex::new(Transcript::default()));
+        sh.zoom = Some(zoom.clone());
+
+        zoom.lock().unwrap().finals = "первая фраза".to_string();
+        assert_eq!(sh.zoom_pull(), (true, "первая фраза".to_string(), String::new()));
+
+        zoom.lock().unwrap().finals = "первая фраза и вторая".to_string();
+        assert_eq!(sh.zoom_pull().1, "первая фраза и вторая");
+
+        zoom.lock().unwrap().finals.clear();
+        assert_eq!(sh.zoom_pull().1, "первая фраза и вторая");
+
+        zoom.lock().unwrap().finals = "после очистки".to_string();
+        assert_eq!(sh.zoom_pull().1, "первая фраза и вторая после очистки");
+    }
+
+    #[test]
     fn clear_of_empty_feed_keeps_stash() {
         let mut sh = Shared::default();
         sh.lines.push_back("раз".to_string());
@@ -837,6 +969,18 @@ mod tests {
         assert!(matches!(sh.posts.back(), Some(Post::Text(3, _))));
         sh.undo_sent();
         assert_eq!(sh.posts.len(), 3);
+    }
+
+    #[test]
+    fn source_holds_until_quiet() {
+        let mut src = Source::default();
+        assert!(!src.taken_by("a"));
+        src.adopt("a", 48_000);
+        src.last = Some(Instant::now());
+        assert!(!src.taken_by("a"));
+        assert!(src.taken_by("b"));
+        src.last = Some(Instant::now() - CLIENT_ACTIVE - Duration::from_millis(1));
+        assert!(!src.taken_by("b"));
     }
 
     #[test]

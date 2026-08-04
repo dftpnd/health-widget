@@ -4,6 +4,7 @@ use egui::RichText;
 pub enum Role {
     Me,
     Bot,
+    Note,
 }
 
 pub struct Msg {
@@ -34,6 +35,24 @@ impl Chat {
         });
     }
 
+    pub fn push_note(&mut self, text: String) {
+        let same_as_last = self
+            .messages
+            .last()
+            .is_some_and(|m| matches!(m.role, Role::Note) && m.text == text);
+        if same_as_last {
+            return;
+        }
+        self.messages.push(Msg {
+            role: Role::Note,
+            text,
+        });
+    }
+
+    pub fn has_dialogue(&self) -> bool {
+        self.messages.iter().any(|m| !matches!(m.role, Role::Note))
+    }
+
     pub fn set_pending(&mut self, pending: bool) {
         self.pending = pending;
     }
@@ -41,6 +60,7 @@ impl Chat {
     pub fn history(&self) -> Vec<(bool, String)> {
         self.messages
             .iter()
+            .filter(|m| !matches!(m.role, Role::Note))
             .map(|m| (matches!(m.role, Role::Me), m.text.clone()))
             .collect()
     }
@@ -92,6 +112,7 @@ impl Chat {
                         let (who, color) = match msg.role {
                             Role::Me => ("я", p.ok),
                             Role::Bot => ("бот", p.info),
+                            Role::Note => ("виджет", p.err),
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
@@ -150,5 +171,40 @@ impl Chat {
         } else {
             Some(q)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Chat;
+
+    #[test]
+    fn notes_stay_out_of_history() {
+        let mut chat = Chat::default();
+        chat.push_user("привет".into());
+        chat.push_note("⚠ нечего отправлять".into());
+        chat.push_bot("ответ".into());
+        assert_eq!(
+            chat.history(),
+            vec![(true, "привет".to_string()), (false, "ответ".to_string())]
+        );
+    }
+
+    #[test]
+    fn same_note_twice_pushes_once() {
+        let mut chat = Chat::default();
+        chat.push_note("⚠ нечего отправлять".into());
+        chat.push_note("⚠ нечего отправлять".into());
+        assert!(!chat.has_dialogue());
+        assert_eq!(chat.messages.len(), 1);
+    }
+
+    #[test]
+    fn dialogue_seen_only_past_notes() {
+        let mut chat = Chat::default();
+        chat.push_note("⚠ канал молчит".into());
+        assert!(!chat.has_dialogue());
+        chat.push_user("вопрос".into());
+        assert!(chat.has_dialogue());
     }
 }

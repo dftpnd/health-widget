@@ -1,9 +1,33 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub type Slot = Arc<Mutex<Option<Result<String, String>>>>;
+
+const CONNECT_TIMEOUT_SECS: &str = "10";
+const MAX_TIME_SECS: &str = "120";
+pub const GIVE_UP: Duration = Duration::from_secs(150);
+
+pub struct Job {
+    slot: Slot,
+    pid: Arc<AtomicI32>,
+}
+
+impl Job {
+    pub fn take(&self) -> Option<Result<String, String>> {
+        self.slot.lock().ok().and_then(|mut g| g.take())
+    }
+
+    pub fn kill(&self) {
+        let pid = self.pid.swap(0, Ordering::Relaxed);
+        if pid > 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
@@ -54,17 +78,21 @@ pub fn ask(
     provider: Provider,
     system: String,
     history: Vec<(bool, String)>,
-) -> Slot {
+    think: bool,
+) -> Job {
     let slot: Slot = Arc::new(Mutex::new(None));
+    let pid = Arc::new(AtomicI32::new(0));
     let out = slot.clone();
+    let out_pid = pid.clone();
     std::thread::spawn(move || {
-        let res = run(&autopilot_dir, provider, &system, &history);
+        let res = run(&autopilot_dir, provider, &system, &history, think, &out_pid);
+        out_pid.store(0, Ordering::Relaxed);
         if let Ok(mut g) = out.lock() {
             *g = Some(res);
         }
         ctx.request_repaint();
     });
-    slot
+    Job { slot, pid }
 }
 
 fn run(
@@ -72,6 +100,8 @@ fn run(
     provider: Provider,
     system: &str,
     history: &[(bool, String)],
+    think: bool,
+    pid: &AtomicI32,
 ) -> Result<String, String> {
     let env = read_env(&autopilot_dir.join(".env"));
     let (key_var, base_var, model_var, default_base, default_model, provider_name) = match provider {
@@ -113,14 +143,19 @@ fn run(
         let role = if *is_user { "user" } else { "assistant" };
         messages.push(serde_json::json!({ "role": role, "content": text }));
     }
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": false
     });
+    if !think {
+        payload["think"] = serde_json::Value::Bool(false);
+    }
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    let out = Command::new("curl")
+    let child = Command::new("curl")
         .arg("-sS")
+        .args(["--connect-timeout", CONNECT_TIMEOUT_SECS])
+        .args(["--max-time", MAX_TIME_SECS])
         .args(["-X", "POST"])
         .arg(&url)
         .args(["-H", "Content-Type: application/json"])
@@ -128,9 +163,23 @@ fn run(
         .arg(format!("Authorization: Bearer {key}"))
         .arg("-d")
         .arg(payload.to_string())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("curl не запустился: {e}"))?;
+    pid.store(child.id() as i32, Ordering::Relaxed);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("curl не дождались: {e}"))?;
+    if out.status.code().is_none() {
+        return Err("запрос прерван".to_string());
+    }
     if !out.status.success() {
+        if out.status.code() == Some(28) {
+            return Err(format!(
+                "{provider_name} не ответил за {MAX_TIME_SECS} с — попробуй ещё раз"
+            ));
+        }
         return Err(format!("curl: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| {
@@ -152,6 +201,16 @@ fn run(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("пустой ответ {provider_name}"))
+}
+
+pub fn key_present(autopilot_dir: &Path, provider: Provider) -> bool {
+    let var = match provider {
+        Provider::DeepSeek => "LLM_API_KEY",
+        Provider::OpenAi => "OPENAI_API_KEY",
+    };
+    read_env(&autopilot_dir.join(".env"))
+        .get(var)
+        .is_some_and(|k| !k.is_empty() && k != "EMPTY")
 }
 
 fn read_env(path: &Path) -> HashMap<String, String> {

@@ -21,6 +21,7 @@
 Файлы баз (рядом со скриптом, опциональны):
     it_hotwords.txt, it_corrections.tsv
 """
+import collections
 import os
 import re
 import sys
@@ -153,6 +154,7 @@ FRAME = 320
 FRAME_BYTES = FRAME * 2
 SILENCE_RMS = 500.0
 SILENCE_TAIL = 0.4
+PREROLL_SECONDS = 0.4
 MIN_SPEECH = 0.3
 MIN_NEW_AUDIO = 1.0
 MAX_BUFFER = 12.0
@@ -295,6 +297,7 @@ def main() -> int:
         sys.stdout.flush()
 
     audio = bytearray()
+    preroll = collections.deque(maxlen=max(1, int(PREROLL_SECONDS * SAMPLE_RATE / FRAME)))
     pending_bytes = bytearray()
     prev_words = []
     committed = 0
@@ -371,6 +374,11 @@ def main() -> int:
             samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
             if rms >= SILENCE_RMS:
+                if not speaking and preroll:
+                    head = b"".join(preroll)
+                    audio.extend(head)
+                    since_decode += len(head)
+                    preroll.clear()
                 speaking = True
                 silence_run = 0.0
                 speech_secs += FRAME / SAMPLE_RATE
@@ -381,6 +389,8 @@ def main() -> int:
                 since_decode += FRAME_BYTES
                 if silence_run >= SILENCE_TAIL:
                     flush()
+            else:
+                preroll.append(frame)
 
         if speaking and since_decode >= min_decode_bytes:
             stream_step()

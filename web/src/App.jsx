@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 
 const CHUNK_MS = 250
 const TOKEN = new URLSearchParams(location.search).get('t') || ''
+const SID = Math.random().toString(36).slice(2)
+const BACKLOG_SECONDS = 15
 
 export default function App() {
   const [running, setRunning] = useState(false)
@@ -171,6 +173,7 @@ export default function App() {
       tap.port.onmessage = (e) => buf.push(e.data)
       let seq = 0
       let inFlight = false
+      const backlogCap = BACKLOG_SECONDS * ctx.sampleRate
       const timer = setInterval(async () => {
         if (inFlight || buf.length === 0) return
         const chunks = buf
@@ -183,16 +186,26 @@ export default function App() {
         }
         inFlight = true
         try {
-          const r = await fetch(`api/audio?rate=${ctx.sampleRate}&seq=${seq++}&t=${TOKEN}`, {
-            method: 'POST',
-            body: pcm.buffer,
-          })
+          const r = await fetch(
+            `api/audio?rate=${ctx.sampleRate}&seq=${seq++}&sid=${SID}&t=${TOKEN}`,
+            { method: 'POST', body: pcm.buffer },
+          )
           const j = await r.json()
+          if (j.busy) {
+            stop()
+            setErr('микрофон уже занят другой вкладкой или устройством')
+            return
+          }
           if (j.finals?.length) setFinals((f) => [...f, ...j.finals])
           setPartial(j.partial || '')
           setStt(!!j.stt)
           setErr('')
         } catch {
+          buf.unshift(pcm)
+          let total = buf.reduce((n, c) => n + c.length, 0)
+          while (buf.length > 1 && total > backlogCap) {
+            total -= buf.shift().length
+          }
           setErr('связь с виджетом потеряна')
         } finally {
           inFlight = false
