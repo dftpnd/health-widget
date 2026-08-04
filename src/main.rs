@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, VecDeque};
 
+mod alice;
 mod audio;
 mod avatar;
 mod awake;
