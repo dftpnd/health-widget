@@ -47,6 +47,7 @@ const CH_ZOOM: &str = "🔊 телемост";
 const CH_WEB: &str = "🌐 веб";
 const WEB_FRESH_GLOW: Duration = Duration::from_millis(2200);
 const CHAT_QUEUE_MAX: usize = 4;
+const WINAGENT_ALERTS_CAP: usize = 20;
 
 const GRIP: f32 = 16.0;
 const PRESENT_SIZE: f32 = 30.0;
@@ -478,6 +479,9 @@ struct App {
     winagent: Option<winagent::WinAgent>,
     winagent_on: bool,
     winagent_collapsed: bool,
+    winagent_alerts: VecDeque<winagent::Alert>,
+    winagent_alerts_open: bool,
+    winagent_unread: usize,
     winagent_task: String,
     winagent_feed: VecDeque<String>,
     winagent_cursor: u64,
@@ -835,6 +839,9 @@ impl App {
             winagent: None,
             winagent_on: !st.winagent_off,
             winagent_collapsed: st.winagent_collapsed,
+            winagent_alerts: st.winagent_alerts.iter().cloned().collect(),
+            winagent_alerts_open: false,
+            winagent_unread: 0,
             winagent_task: String::new(),
             winagent_feed: VecDeque::new(),
             winagent_cursor: 0,
@@ -1193,6 +1200,7 @@ impl App {
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
             winagent_collapsed: self.winagent_collapsed,
+            winagent_alerts: self.winagent_alerts.iter().cloned().collect(),
             winagent_off: !self.winagent_on,
             scopes_collapsed: self.scopes_collapsed,
             chat_collapsed: self.chat_collapsed,
@@ -2844,6 +2852,13 @@ impl App {
         let Some(agent) = self.winagent.as_ref() else {
             return;
         };
+        for alert in agent.take_alerts() {
+            if self.winagent_alerts.len() >= WINAGENT_ALERTS_CAP {
+                self.winagent_alerts.pop_back();
+            }
+            self.winagent_alerts.push_front(alert);
+            self.winagent_unread += 1;
+        }
         let (fresh, cursor) = agent.since(self.winagent_cursor);
         self.winagent_cursor = cursor;
         for line in fresh {
@@ -2881,6 +2896,55 @@ impl App {
             self.winagent = None;
             self.winagent_feed.clear();
             self.winagent_cursor = 0;
+        }
+    }
+
+    fn draw_winagent_alerts(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let mut drop_id: Option<String> = None;
+        let mut copied: Option<String> = None;
+
+        for alert in self.winagent_alerts.iter() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&alert.when)
+                        .size(10.0)
+                        .color(pal.dim)
+                        .monospace(),
+                );
+                if ui
+                    .small_button(format!("⧉ {}", alert.id))
+                    .on_hover_text("Скопировать id разбора: runs/checks/<id>.json")
+                    .clicked()
+                {
+                    copied = Some(alert.id.clone());
+                }
+                if ui.small_button("×").on_hover_text("Убрать").clicked() {
+                    drop_id = Some(alert.id.clone());
+                }
+            });
+            ui.add(
+                egui::Label::new(egui::RichText::new(&alert.text).size(11.0).color(pal.warn))
+                    .wrap(),
+            );
+        }
+
+        if self.winagent_alerts.len() > 1
+            && ui.small_button("очистить всё").clicked()
+        {
+            self.winagent_alerts.clear();
+            self.winagent_unread = 0;
+            self.winagent_alerts_open = false;
+        }
+        if let Some(id) = drop_id {
+            self.winagent_alerts.retain(|a| a.id != id);
+            self.winagent_unread = self.winagent_unread.min(self.winagent_alerts.len());
+            if self.winagent_alerts.is_empty() {
+                self.winagent_alerts_open = false;
+            }
+        }
+        if let Some(id) = copied {
+            clip::set_async(id);
         }
     }
 
@@ -2929,7 +2993,29 @@ impl App {
                         halt = true;
                     }
                 }
+                if !self.winagent_alerts.is_empty() {
+                    let bell = if self.winagent_unread > 0 {
+                        format!("🔔 {}", self.winagent_unread)
+                    } else {
+                        "🔔".to_string()
+                    };
+                    let mark = egui::RichText::new(bell)
+                        .size(11.0)
+                        .color(if self.winagent_unread > 0 { pal.warn } else { pal.dim });
+                    if ui
+                        .selectable_label(self.winagent_alerts_open, mark)
+                        .on_hover_text("Проверки, нашедшие проблему после задачи")
+                        .clicked()
+                    {
+                        self.winagent_alerts_open = !self.winagent_alerts_open;
+                        self.winagent_unread = 0;
+                    }
+                }
             });
+
+            if self.winagent_alerts_open {
+                self.draw_winagent_alerts(ui);
+            }
 
             if self.winagent_on {
                 ui.horizontal(|ui| {

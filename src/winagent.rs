@@ -18,13 +18,52 @@ struct Log {
     total: u64,
 }
 
-pub struct WinAgent {
-    child: Child,
-    stdin: Option<ChildStdin>,
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Alert {
+    pub id: String,
+    pub text: String,
+    pub when: String,
+}
+
+pub fn parse_alert(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("⚠ проверка ")?;
+    let (id, text) = rest.split_once(':')?;
+    let id = id.trim();
+    let text = text.trim();
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) || text.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), text.to_string()))
+}
+
+#[derive(Clone)]
+struct Watch {
     log: Arc<Mutex<Log>>,
     linked: Arc<AtomicBool>,
     peer: Arc<Mutex<String>>,
     busy: Arc<AtomicBool>,
+    alerts: Arc<Mutex<Vec<Alert>>>,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Log {
+                lines: VecDeque::with_capacity(LOG_CAP),
+                total: 0,
+            })),
+            linked: Arc::new(AtomicBool::new(false)),
+            peer: Arc::new(Mutex::new(String::new())),
+            busy: Arc::new(AtomicBool::new(false)),
+            alerts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+pub struct WinAgent {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    watch: Watch,
 }
 
 impl WinAgent {
@@ -42,31 +81,24 @@ impl WinAgent {
         let mut child = cmd.spawn().map_err(|e| format!("не запускается: {e}"))?;
         let stdin = child.stdin.take();
 
-        let log = Arc::new(Mutex::new(Log {
-            lines: VecDeque::with_capacity(LOG_CAP),
-            total: 0,
-        }));
-        let linked = Arc::new(AtomicBool::new(false));
-        let peer = Arc::new(Mutex::new(String::new()));
-        let busy = Arc::new(AtomicBool::new(false));
-
+        let watch = Watch::default();
         if let Some(out) = child.stdout.take() {
-            pump(out, log.clone(), linked.clone(), peer.clone(), busy.clone());
+            pump(out, watch.clone());
         }
         if let Some(err) = child.stderr.take() {
-            pump(err, log.clone(), linked.clone(), peer.clone(), busy.clone());
+            pump(err, watch.clone());
         }
 
         let deadline = Instant::now() + SETTLE;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = child.try_wait() {
                 std::thread::sleep(Duration::from_millis(50));
-                return Err(last_words(&log));
+                return Err(last_words(&watch.log));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        Ok(Self { child, stdin, log, linked, peer, busy })
+        Ok(Self { child, stdin, watch })
     }
 
     pub fn alive(&mut self) -> bool {
@@ -74,15 +106,15 @@ impl WinAgent {
     }
 
     pub fn linked(&self) -> bool {
-        self.linked.load(Ordering::Relaxed)
+        self.watch.linked.load(Ordering::Relaxed)
     }
 
     pub fn busy(&self) -> bool {
-        self.busy.load(Ordering::Relaxed)
+        self.watch.busy.load(Ordering::Relaxed)
     }
 
     pub fn peer(&self) -> String {
-        self.peer.lock().map(|p| p.clone()).unwrap_or_default()
+        self.watch.peer.lock().map(|p| p.clone()).unwrap_or_default()
     }
 
     pub fn send(&mut self, task: &str) -> bool {
@@ -96,8 +128,8 @@ impl WinAgent {
         if writeln!(stdin, "{task}").is_err() || stdin.flush().is_err() {
             return false;
         }
-        self.busy.store(true, Ordering::Relaxed);
-        push(&self.log, format!("▸ {task}"));
+        self.watch.busy.store(true, Ordering::Relaxed);
+        push(&self.watch.log, format!("▸ {task}"));
         true
     }
 
@@ -108,12 +140,19 @@ impl WinAgent {
         if writeln!(stdin, "/stop").is_err() || stdin.flush().is_err() {
             return false;
         }
-        push(&self.log, "▪ стоп".into());
+        push(&self.watch.log, "▪ стоп".into());
         true
     }
 
+    pub fn take_alerts(&self) -> Vec<Alert> {
+        match self.watch.alerts.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn since(&self, cursor: u64) -> (Vec<String>, u64) {
-        let Ok(g) = self.log.lock() else {
+        let Ok(g) = self.watch.log.lock() else {
             return (Vec::new(), cursor);
         };
         let dropped = g.total - g.lines.len() as u64;
@@ -154,13 +193,8 @@ impl Drop for WinAgent {
     }
 }
 
-fn pump(
-    stream: impl std::io::Read + Send + 'static,
-    log: Arc<Mutex<Log>>,
-    linked: Arc<AtomicBool>,
-    peer: Arc<Mutex<String>>,
-    busy: Arc<AtomicBool>,
-) {
+fn pump(stream: impl std::io::Read + Send + 'static, watch: Watch) {
+    let Watch { log, linked, peer, busy, alerts } = watch;
     std::thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
@@ -185,6 +219,11 @@ fn pump(
             if text.contains(DONE) {
                 busy.store(false, Ordering::Relaxed);
                 continue;
+            }
+            if let Some((id, what)) = parse_alert(&text) {
+                if let Ok(mut g) = alerts.lock() {
+                    g.push(Alert { id, text: what, when: stamp() });
+                }
             }
             push(&log, text);
         }
@@ -232,6 +271,16 @@ fn push(log: &Arc<Mutex<Log>>, line: String) {
     }
 }
 
+fn stamp() -> String {
+    Command::new("date")
+        .arg("+%H:%M")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn tidy(line: &str) -> String {
     let t = line.trim_end();
     let t = t.strip_prefix("> ").unwrap_or(t);
@@ -254,6 +303,20 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    fn spawn_retry(bin: &Path) -> Child {
+        for _ in 0..20 {
+            let spawned = Command::new(bin)
+                .args(ARGS)
+                .current_dir(std::env::temp_dir())
+                .spawn();
+            if let Ok(child) = spawned {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("фейковый оркестратор должен стартовать");
     }
 
     fn start_retry(dir: &Path, bin: &Path) -> WinAgent {
@@ -313,6 +376,36 @@ mod tests {
     }
 
     #[test]
+    fn alert_line_becomes_notification() {
+        let (id, text) = parse_alert("⚠ проверка a1b2c3: файл не сохранился, окно «Ошибка»")
+            .expect("строка проверки разбирается");
+        assert_eq!(id, "a1b2c3");
+        assert_eq!(text, "файл не сохранился, окно «Ошибка»");
+
+        assert!(parse_alert("✓ проверка a1b2c3: чисто").is_none(), "чистый итог не уведомление");
+        assert!(parse_alert("  [1/25] uia.tree {}").is_none(), "обычный шаг не уведомление");
+        assert!(parse_alert("⚠ проверка a1b2c3:").is_none(), "без текста уведомления нет");
+    }
+
+    #[test]
+    fn alerts_collected_from_stream_once() {
+        let bin = fake_python(
+            "alerts",
+            "echo 'fake-win на связи, инструментов: 3'; \
+             echo '⚠ проверка ff01aa: не то окно'; echo '✓ проверка ff02bb: чисто'; sleep 5",
+        );
+        let a = start_retry(&std::env::temp_dir(), &bin);
+        let mut got = Vec::new();
+        assert!(wait_for(|| {
+            got = a.take_alerts();
+            !got.is_empty()
+        }));
+        assert_eq!(got.len(), 1, "в список идут только проблемы");
+        assert_eq!(got[0].id, "ff01aa");
+        assert!(a.take_alerts().is_empty(), "повторно то же уведомление не выдаётся");
+    }
+
+    #[test]
     fn stop_reaches_orchestrator_while_busy() {
         let bin = fake_python(
             "stop",
@@ -340,11 +433,7 @@ mod tests {
     #[test]
     fn start_kills_stray_orchestrator() {
         let bin = fake_python("stray", "sleep 30");
-        let mut stray = Command::new(&bin)
-            .args(ARGS)
-            .current_dir(std::env::temp_dir())
-            .spawn()
-            .unwrap();
+        let mut stray = spawn_retry(&bin);
 
         let _agent = start_retry(&std::env::temp_dir(), &bin);
 

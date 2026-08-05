@@ -36,6 +36,8 @@ pub struct State {
     pub winagent_collapsed: bool,
     #[serde(default)]
     pub winagent_off: bool,
+    #[serde(default)]
+    pub winagent_alerts: Vec<crate::winagent::Alert>,
     #[serde(default, alias = "metrics_collapsed")]
     pub scopes_collapsed: bool,
     #[serde(default)]
