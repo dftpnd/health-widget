@@ -892,6 +892,9 @@ impl App {
         if app.cfg.autopilot_bin.exists() {
             kill_stray_pilots(&app.cfg.autopilot_bin);
         }
+        if app.cfg.winagent_python.exists() {
+            winagent::kill_strays(&app.cfg.winagent_python);
+        }
         app
     }
 
@@ -2867,13 +2870,12 @@ impl App {
                 return;
             }
             self.winagent_cursor = 0;
-            self.winagent = winagent::WinAgent::start(
-                &self.cfg.winagent_dir,
-                &self.cfg.winagent_python,
-            );
-            if self.winagent.is_none() {
-                self.winagent_on = false;
-                self.winagent_feed.push_back("не удалось запустить оркестратор".into());
+            match winagent::WinAgent::start(&self.cfg.winagent_dir, &self.cfg.winagent_python) {
+                Ok(agent) => self.winagent = Some(agent),
+                Err(why) => {
+                    self.winagent_on = false;
+                    self.winagent_feed.push_back(why);
+                }
             }
         } else if !self.winagent_on && self.winagent.is_some() {
             self.winagent = None;
@@ -2895,6 +2897,7 @@ impl App {
         let peer = self.winagent.as_ref().map(|a| a.peer()).unwrap_or_default();
         let mut toggle = false;
         let mut submit = false;
+        let mut halt = false;
 
         let mut collapsed = self.winagent_collapsed;
         section_collapsible(pal, ui, "🖥 Агент Windows", &mut collapsed, |ui| {
@@ -2918,6 +2921,13 @@ impl App {
                 }
                 if busy {
                     ui.spinner();
+                    if ui
+                        .button("⏹")
+                        .on_hover_text("Прервать текущую задачу, не выключая оркестратор")
+                        .clicked()
+                    {
+                        halt = true;
+                    }
                 }
             });
 
@@ -2958,6 +2968,11 @@ impl App {
             let task = std::mem::take(&mut self.winagent_task);
             if let Some(agent) = self.winagent.as_mut() {
                 agent.send(&task);
+            }
+        }
+        if halt {
+            if let Some(agent) = self.winagent.as_mut() {
+                agent.stop_task();
             }
         }
     }
