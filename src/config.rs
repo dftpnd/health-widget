@@ -70,6 +70,8 @@ pub struct Config {
     pub detect_poll: Duration,
     pub autopilot_dir: PathBuf,
     pub autopilot_bin: PathBuf,
+    pub winagent_dir: PathBuf,
+    pub winagent_python: PathBuf,
     pub avatar: AvatarCfg,
 }
 
@@ -84,6 +86,11 @@ impl Default for Config {
             .join("projects")
             .join("work-autopilot");
         let autopilot_bin = autopilot_dir.join(".venv").join("bin").join("autopilot");
+        let winagent_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("projects")
+            .join("win-agent");
+        let winagent_python = winagent_dir.join(".venv").join("bin").join("python");
         Self {
             json_path,
             x: 40.0,
@@ -96,6 +103,8 @@ impl Default for Config {
             detect_poll: Duration::from_millis(1000),
             autopilot_dir,
             autopilot_bin,
+            winagent_dir,
+            winagent_python,
             avatar: AvatarCfg::default(),
         }
     }

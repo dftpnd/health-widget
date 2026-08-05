@@ -18,6 +18,7 @@ mod frames;
 mod hr_reply;
 mod instance;
 mod pilot;
+mod winagent;
 mod pilot_summary;
 mod pilot_notify;
 mod kwin_shot;
@@ -474,6 +475,12 @@ struct App {
     width_one_col: Option<f32>,
     terminal_width: f32,
     autopilot_collapsed: bool,
+    winagent: Option<winagent::WinAgent>,
+    winagent_on: bool,
+    winagent_collapsed: bool,
+    winagent_task: String,
+    winagent_feed: VecDeque<String>,
+    winagent_cursor: u64,
     scopes_collapsed: bool,
     chat: chat::Chat,
     chat_collapsed: bool,
@@ -825,6 +832,12 @@ impl App {
             width_one_col: None,
             terminal_width: st.terminal_width.unwrap_or(TERMINAL_W),
             autopilot_collapsed: st.autopilot_collapsed,
+            winagent: None,
+            winagent_on: !st.winagent_off,
+            winagent_collapsed: st.winagent_collapsed,
+            winagent_task: String::new(),
+            winagent_feed: VecDeque::new(),
+            winagent_cursor: 0,
             scopes_collapsed: st.scopes_collapsed,
             chat: chat::Chat::default(),
             chat_collapsed: st.chat_collapsed,
@@ -1176,6 +1189,8 @@ impl App {
             theme: Some(self.theme.label().to_string()),
             terminal_width: Some(self.terminal_width),
             autopilot_collapsed: self.autopilot_collapsed,
+            winagent_collapsed: self.winagent_collapsed,
+            winagent_off: !self.winagent_on,
             scopes_collapsed: self.scopes_collapsed,
             chat_collapsed: self.chat_collapsed,
             terminal_open: self.terminal_open,
@@ -2822,6 +2837,127 @@ impl App {
         }
     }
 
+    fn pump_winagent(&mut self) {
+        let Some(agent) = self.winagent.as_ref() else {
+            return;
+        };
+        let (fresh, cursor) = agent.since(self.winagent_cursor);
+        self.winagent_cursor = cursor;
+        for line in fresh {
+            if self.winagent_feed.len() >= 12 {
+                self.winagent_feed.pop_front();
+            }
+            self.winagent_feed.push_back(line);
+        }
+    }
+
+    fn winagent_sync(&mut self) {
+        let died = self.winagent.as_mut().is_some_and(|a| !a.alive());
+        if died {
+            self.winagent = None;
+            self.winagent_feed.push_back("оркестратор остановился".into());
+        }
+        if self.winagent_on && self.winagent.is_none() {
+            if !self.cfg.winagent_python.exists() {
+                self.winagent_on = false;
+                self.winagent_feed.push_back(format!(
+                    "не найден {}",
+                    self.cfg.winagent_python.display()
+                ));
+                return;
+            }
+            self.winagent_cursor = 0;
+            self.winagent = winagent::WinAgent::start(
+                &self.cfg.winagent_dir,
+                &self.cfg.winagent_python,
+            );
+            if self.winagent.is_none() {
+                self.winagent_on = false;
+                self.winagent_feed.push_back("не удалось запустить оркестратор".into());
+            }
+        } else if !self.winagent_on && self.winagent.is_some() {
+            self.winagent = None;
+            self.winagent_feed.clear();
+            self.winagent_cursor = 0;
+        }
+    }
+
+    fn draw_winagent(&mut self, ui: &mut egui::Ui) {
+        if !self.cfg.winagent_dir.exists() {
+            return;
+        }
+        let pal = self.palette;
+        self.winagent_sync();
+        self.pump_winagent();
+
+        let linked = self.winagent.as_ref().is_some_and(|a| a.linked());
+        let busy = self.winagent.as_ref().is_some_and(|a| a.busy());
+        let peer = self.winagent.as_ref().map(|a| a.peer()).unwrap_or_default();
+        let mut toggle = false;
+        let mut submit = false;
+
+        let mut collapsed = self.winagent_collapsed;
+        section_collapsible(pal, ui, "🖥 Агент Windows", &mut collapsed, |ui| {
+            ui.horizontal(|ui| {
+                let (mark, hint) = if !self.winagent_on {
+                    ("⏻ выключен", "Запустить оркестратор: ноут сможет подключиться")
+                } else if linked {
+                    ("● на связи", "Ноут подключён — можно ставить задачи")
+                } else {
+                    ("◌ ждёт ноут", "Оркестратор слушает, ноут ещё не подключился")
+                };
+                if ui
+                    .selectable_label(self.winagent_on, mark)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                if linked && !peer.is_empty() {
+                    ui.label(egui::RichText::new(peer).size(11.0).color(pal.dim));
+                }
+                if busy {
+                    ui.spinner();
+                }
+            });
+
+            if self.winagent_on {
+                ui.horizontal(|ui| {
+                    let field = egui::TextEdit::singleline(&mut self.winagent_task)
+                        .hint_text("что сделать на ноуте")
+                        .desired_width(ui.available_width() - 34.0);
+                    let resp = ui.add_enabled(linked && !busy, field);
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    if ui
+                        .add_enabled(linked && !busy, egui::Button::new("▶"))
+                        .on_hover_text("Отправить задачу агенту")
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                });
+            }
+
+            for line in self.winagent_feed.iter().rev().take(6) {
+                ui.label(egui::RichText::new(line).size(11.0).color(pal.dim));
+            }
+        });
+        self.winagent_collapsed = collapsed;
+
+        if toggle {
+            self.winagent_on = !self.winagent_on;
+            self.winagent_sync();
+        }
+        if submit {
+            let task = std::mem::take(&mut self.winagent_task);
+            if let Some(agent) = self.winagent.as_mut() {
+                agent.send(&task);
+            }
+        }
+    }
+
     fn draw_autopilot(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         if self.cfg.autopilot_bin.exists() {
@@ -3871,6 +4007,7 @@ impl eframe::App for App {
                 });
 
                 self.draw_autopilot(ui);
+                self.draw_winagent(ui);
 
                 self.process_transcript_keys(ctx);
 

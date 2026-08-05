@@ -32,6 +32,10 @@ pub struct State {
     pub terminal_width: Option<f32>,
     #[serde(default)]
     pub autopilot_collapsed: bool,
+    #[serde(default)]
+    pub winagent_collapsed: bool,
+    #[serde(default)]
+    pub winagent_off: bool,
     #[serde(default, alias = "metrics_collapsed")]
     pub scopes_collapsed: bool,
     #[serde(default)]
