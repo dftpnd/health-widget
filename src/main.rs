@@ -2923,9 +2923,10 @@ impl App {
 
             if self.winagent_on {
                 ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 34.0).clamp(60.0, 240.0);
                     let field = egui::TextEdit::singleline(&mut self.winagent_task)
                         .hint_text("что сделать на ноуте")
-                        .desired_width(ui.available_width() - 34.0);
+                        .desired_width(w);
                     let resp = ui.add_enabled(linked && !busy, field);
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
@@ -2941,7 +2942,10 @@ impl App {
             }
 
             for line in self.winagent_feed.iter().rev().take(6) {
-                ui.label(egui::RichText::new(line).size(11.0).color(pal.dim));
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).size(11.0).color(pal.dim))
+                        .truncate(),
+                );
             }
         });
         self.winagent_collapsed = collapsed;

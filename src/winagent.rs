@@ -190,10 +190,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn fake_python(name: &str, body: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("fake-winagent-{name}"));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir()
+            .join(format!("fake-winagent-{name}-{}-{stamp}", std::process::id()));
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    fn start_retry(dir: &Path, bin: &Path) -> WinAgent {
+        for _ in 0..20 {
+            if let Some(a) = WinAgent::start(dir, bin) {
+                return a;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("должен стартовать");
     }
 
     fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
@@ -210,7 +225,7 @@ mod tests {
     #[test]
     fn captures_log_and_detects_link() {
         let bin = fake_python("hello", "echo 'fake-win на связи, инструментов: 13'; sleep 5");
-        let mut a = WinAgent::start(&std::env::temp_dir(), &bin).expect("должен стартовать");
+        let mut a = start_retry(&std::env::temp_dir(), &bin);
         assert!(wait_for(|| a.linked()), "должен увидеть подключение ноута");
         assert_eq!(a.peer(), "fake-win");
         let (lines, _) = a.since(0);
@@ -221,7 +236,7 @@ mod tests {
     #[test]
     fn task_goes_to_stdin_only_when_linked() {
         let bin = fake_python("echo-stdin", "echo 'fake-win на связи, инструментов: 3'; while read l; do echo \"got:$l\"; done");
-        let mut a = WinAgent::start(&std::env::temp_dir(), &bin).expect("должен стартовать");
+        let mut a = start_retry(&std::env::temp_dir(), &bin);
         assert!(wait_for(|| a.linked()));
         assert!(a.send("открой блокнот"));
         assert!(wait_for(|| a.since(0).0.iter().any(|l| l.contains("got:открой блокнот"))));
@@ -230,7 +245,7 @@ mod tests {
     #[test]
     fn task_rejected_without_link() {
         let bin = fake_python("silent", "sleep 5");
-        let mut a = WinAgent::start(&std::env::temp_dir(), &bin).expect("должен стартовать");
+        let mut a = start_retry(&std::env::temp_dir(), &bin);
         assert!(!a.send("что-нибудь"), "без ноута задача не должна уходить");
     }
 }
