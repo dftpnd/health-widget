@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const LOG_CAP: usize = 40;
+const DONE: &str = "— готово —";
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 struct Log {
@@ -157,8 +158,9 @@ fn pump(
                 linked.store(false, Ordering::Relaxed);
                 busy.store(false, Ordering::Relaxed);
             }
-            if !text.starts_with('[') && !text.starts_with("  ") {
+            if text.contains(DONE) {
                 busy.store(false, Ordering::Relaxed);
+                continue;
             }
             push(&log, text);
         }
@@ -240,6 +242,21 @@ mod tests {
         assert!(wait_for(|| a.linked()));
         assert!(a.send("открой блокнот"));
         assert!(wait_for(|| a.since(0).0.iter().any(|l| l.contains("got:открой блокнот"))));
+    }
+
+    #[test]
+    fn done_marker_clears_busy() {
+        let bin = fake_python(
+            "done",
+            "echo 'fake-win на связи, инструментов: 3'; while read l; do echo \"[1] uia.tree\"; echo '— готово —'; done",
+        );
+        let mut a = start_retry(&std::env::temp_dir(), &bin);
+        assert!(wait_for(|| a.linked()));
+        assert!(a.send("задача"));
+        assert!(a.busy(), "сразу после отправки агент занят");
+        assert!(wait_for(|| !a.busy()), "маркер конца должен снять «занят»");
+        let (lines, _) = a.since(0);
+        assert!(!lines.iter().any(|l| l.contains("готово")), "маркер не показываем в ленте");
     }
 
     #[test]
