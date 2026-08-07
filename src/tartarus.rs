@@ -18,11 +18,9 @@ const EV_SYN: u16 = 0;
 const KEY_MAP: &[(KeyCode, &[KeyCode])] = &[
     (KeyCode::KEY_1, &[KeyCode::KEY_F13]),
     (KeyCode::KEY_5, &[KeyCode::KEY_F17]),
-    (KeyCode::KEY_TAB, &[KeyCode::KEY_F18]),
     (KeyCode::KEY_Q, &[KeyCode::KEY_F19]),
     (KeyCode::KEY_E, &[KeyCode::KEY_F21]),
     (KeyCode::KEY_R, &[KeyCode::KEY_F22]),
-    (KeyCode::KEY_CAPSLOCK, &[KeyCode::KEY_F23]),
     (KeyCode::KEY_A, &[KeyCode::KEY_F24]),
     (KeyCode::KEY_S, &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_F13]),
     (KeyCode::KEY_D, &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_F14]),
@@ -48,8 +46,10 @@ pub struct Handles {
     pub send_mic_p2: Arc<AtomicBool>,
     pub send_zoom_p2: Arc<AtomicBool>,
     pub clear_chat: Arc<AtomicBool>,
+    pub clear_zoom: Arc<AtomicBool>,
     pub paste_code: Arc<AtomicBool>,
     pub switch_provider: Arc<AtomicBool>,
+    pub toggle_context: Arc<AtomicBool>,
     pub move_dx: Arc<AtomicI32>,
     pub move_dy: Arc<AtomicI32>,
     pub move_next: Arc<AtomicBool>,
@@ -228,7 +228,19 @@ fn handle_key(ui: &mut VirtualDevice, h: &Handles, code: u16, value: i32) {
             h.ctx.request_repaint();
             return;
         }
+        if code == KeyCode::KEY_TAB.0 {
+            h.toggle_context.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
+        if code == KeyCode::KEY_CAPSLOCK.0 {
+            h.clear_zoom.store(true, Ordering::Relaxed);
+            h.ctx.request_repaint();
+            return;
+        }
     } else if matches!(code, c if c == KeyCode::KEY_5.0
+        || c == KeyCode::KEY_TAB.0
+        || c == KeyCode::KEY_CAPSLOCK.0
         || c == KeyCode::KEY_SPACE.0
         || c == KeyCode::KEY_2.0
         || c == KeyCode::KEY_Q.0

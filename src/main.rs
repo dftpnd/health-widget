@@ -11,6 +11,7 @@ mod awake;
 mod chat;
 mod clip;
 mod config;
+mod contexts;
 mod data;
 mod deepseek;
 mod detect;
@@ -396,6 +397,7 @@ struct TranscriptKeys {
     send_mic_p2: Arc<AtomicBool>,
     send_zoom_p2: Arc<AtomicBool>,
     clear_chat: Arc<AtomicBool>,
+    clear_zoom: Arc<AtomicBool>,
 }
 
 impl TranscriptKeys {
@@ -406,6 +408,7 @@ impl TranscriptKeys {
             send_mic_p2: Arc::new(AtomicBool::new(false)),
             send_zoom_p2: Arc::new(AtomicBool::new(false)),
             clear_chat: Arc::new(AtomicBool::new(false)),
+            clear_zoom: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -441,6 +444,12 @@ enum MoveTarget {
     Chat,
 }
 
+struct ContextDraft {
+    name: String,
+    text: String,
+    original: Option<String>,
+}
+
 struct App {
     cfg: Config,
     shared: Arc<Shared>,
@@ -466,6 +475,7 @@ struct App {
     // cursor_warp_request: Arc<AtomicBool>,
     paste_code: Arc<AtomicBool>,
     switch_provider: Arc<AtomicBool>,
+    toggle_context: Arc<AtomicBool>,
     // prev_cursor: Arc<std::sync::Mutex<Option<(f64, f64)>>>,
     transcript_keys: TranscriptKeys,
     win_move: WindowMove,
@@ -495,6 +505,8 @@ struct App {
     prompt_draft_1: String,
     prompt_draft_2: String,
     prompt_open: bool,
+    contexts: contexts::Contexts,
+    context_editor: Option<ContextDraft>,
     llm_provider: deepseek::Provider,
     present_mode: bool,
     present_size_before: Option<egui::Vec2>,
@@ -536,6 +548,7 @@ impl App {
         // let cursor_warp_request = Arc::new(AtomicBool::new(false));
         let paste_code = Arc::new(AtomicBool::new(false));
         let switch_provider = Arc::new(AtomicBool::new(false));
+        let toggle_context = Arc::new(AtomicBool::new(false));
         let transcript_keys = TranscriptKeys::new();
         let win_move = WindowMove::new();
 
@@ -578,8 +591,10 @@ impl App {
             send_mic_p2: transcript_keys.send_mic_p2.clone(),
             send_zoom_p2: transcript_keys.send_zoom_p2.clone(),
             clear_chat: transcript_keys.clear_chat.clone(),
+            clear_zoom: transcript_keys.clear_zoom.clone(),
             paste_code: paste_code.clone(),
             switch_provider: switch_provider.clone(),
+            toggle_context: toggle_context.clone(),
             move_dx: win_move.dx.clone(),
             move_dy: win_move.dy.clone(),
             move_next: win_move.next.clone(),
@@ -826,6 +841,7 @@ impl App {
             // cursor_warp_request,
             paste_code,
             switch_provider,
+            toggle_context,
             // prev_cursor: Arc::new(std::sync::Mutex::new(None)),
             transcript_keys,
             win_move,
@@ -855,6 +871,8 @@ impl App {
             prompt_draft_1: String::new(),
             prompt_draft_2: String::new(),
             prompt_open: false,
+            contexts: contexts::load(),
+            context_editor: None,
             llm_provider: st
                 .llm_provider
                 .as_deref()
@@ -1687,6 +1705,9 @@ impl App {
         if self.prompt_open {
             self.draw_prompt_editor(ctx);
         }
+        if self.context_editor.is_some() && !self.chat_open {
+            self.draw_context_editor(ctx);
+        }
         ui.add_space(2.0);
     }
 
@@ -1762,6 +1783,189 @@ impl App {
                  ответ обратно в буфер",
             );
         });
+    }
+
+    fn draw_context_row(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let before = self.contexts.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let switch = if self.contexts.enabled {
+                "Контекст: вкл"
+            } else {
+                "Контекст: выкл"
+            };
+            if ui
+                .selectable_label(self.contexts.enabled, switch)
+                .on_hover_text("Вопросы по контексту: выбранный контекст уходит в системный промпт")
+                .clicked()
+            {
+                self.contexts.enabled = !self.contexts.enabled;
+            }
+            if !self.contexts.enabled {
+                if ui
+                    .button("Создать контекст")
+                    .on_hover_text("Вставить текст и сохранить как системный контекст")
+                    .clicked()
+                {
+                    self.context_editor = Some(ContextDraft {
+                        name: String::new(),
+                        text: String::new(),
+                        original: None,
+                    });
+                }
+                return;
+            }
+            let current = if self.contexts.selected.is_empty() {
+                "— нет —".to_string()
+            } else {
+                self.contexts.selected.clone()
+            };
+            egui::ComboBox::from_id_salt("chat_context_pick")
+                .selected_text(egui::RichText::new(current).size(13.0))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    let names: Vec<String> =
+                        self.contexts.items.iter().map(|i| i.name.clone()).collect();
+                    for name in names {
+                        let picked = self.contexts.selected == name;
+                        if ui.selectable_label(picked, &name).clicked() {
+                            self.contexts.selected = name;
+                        }
+                    }
+                });
+            if ui
+                .button("Создать")
+                .on_hover_text("Вставить текст и сохранить как системный контекст")
+                .clicked()
+            {
+                self.context_editor = Some(ContextDraft {
+                    name: String::new(),
+                    text: String::new(),
+                    original: None,
+                });
+            }
+            let has_selected = self
+                .contexts
+                .items
+                .iter()
+                .any(|i| i.name == self.contexts.selected);
+            if has_selected {
+                if ui
+                    .button("Править")
+                    .on_hover_text("Редактировать контекст")
+                    .clicked()
+                {
+                    let name = self.contexts.selected.clone();
+                    let text = self.contexts.selected_text().unwrap_or_default().to_string();
+                    self.context_editor = Some(ContextDraft {
+                        name: name.clone(),
+                        text,
+                        original: Some(name),
+                    });
+                }
+                if ui
+                    .button("Удалить")
+                    .on_hover_text("Удалить контекст")
+                    .clicked()
+                {
+                    let name = self.contexts.selected.clone();
+                    self.contexts.remove(&name);
+                }
+            } else if self.contexts.items.is_empty() {
+                ui.label(
+                    egui::RichText::new("контекстов нет")
+                        .size(10.0)
+                        .italics()
+                        .color(p.muted),
+                );
+            }
+        });
+        if self.contexts != before {
+            contexts::save(&self.contexts);
+        }
+    }
+
+    fn draw_context_editor(&mut self, ctx: &egui::Context) {
+        let p = self.palette;
+        let accent = p.accent;
+        let Some(mut draft) = self.context_editor.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        let modal = egui::Modal::new(egui::Id::new("context_editor")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.horizontal(|ui| {
+                let title = if draft.original.is_some() {
+                    "Контекст"
+                } else {
+                    "Новый контекст"
+                };
+                ui.label(egui::RichText::new(title).size(15.0).strong().color(accent));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✖").clicked() {
+                        keep_open = false;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .hint_text("название")
+                    .font(egui::FontId::proportional(13.0))
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("context_editor_scroll")
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut draft.text)
+                            .hint_text("вставь сюда текст контекста…")
+                            .font(egui::FontId::proportional(13.0))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(10),
+                    );
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let empty = draft.text.trim().is_empty();
+                if ui
+                    .add_enabled(!empty, egui::Button::new("💾 Сохранить"))
+                    .clicked()
+                {
+                    let name = match &draft.original {
+                        Some(old) if old.trim() == draft.name.trim() => old.clone(),
+                        Some(old) => {
+                            self.contexts.remove(old);
+                            self.contexts.free_name(&draft.name)
+                        }
+                        None => self.contexts.free_name(&draft.name),
+                    };
+                    self.contexts.upsert(name, draft.text.clone());
+                    self.contexts.enabled = true;
+                    contexts::save(&self.contexts);
+                    keep_open = false;
+                }
+                if ui.button("Отмена").clicked() {
+                    keep_open = false;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Контекст добавляется к системному промпту, пока свитчер в блоке чата включён. Хранится в ~/.health-widget-contexts.json.")
+                    .size(10.0)
+                    .italics()
+                    .color(p.muted),
+            );
+        });
+        if modal.should_close() {
+            keep_open = false;
+        }
+        if keep_open {
+            self.context_editor = Some(draft);
+        }
     }
 
     fn draw_prompt_editor(&mut self, ctx: &egui::Context) {
@@ -1841,8 +2045,10 @@ impl App {
             ("02", "🗑 Очистить транскрипт микрофона"),
             ("04", "🔀 Свитч LLM для чата: DeepSeek ↔ OpenAI"),
             ("05", "📷 Скриншот"),
+            ("06", "🧠 Контекст в чате: вкл/выкл"),
             ("07", "🗑 Очистить транскрипт зума"),
             ("10", "⌨ Печатать код из буфера в позиции курсора"),
+            ("11", "🗑 Очистить текст транскрипции Zoom/Телемост"),
             ("12", "🗑 Очистить чат"),
             ("20", "⚙ Цель D-pad: виджет -> веб-мик -> чат"),
             ("D-pad", "🕹 Двигать выбранное окно по экрану"),
@@ -2333,10 +2539,14 @@ impl App {
                         },
                     );
                 });
+                self.draw_context_row(ui);
                 let log_height = (ui.available_height() - 56.0).max(80.0);
                 submitted = self.chat.ui_scrolled(p, ui, log_height, wheel);
                 draw_resize_grip(p, ui, cctx, grip_rect);
             });
+            if self.context_editor.is_some() {
+                self.draw_context_editor(cctx);
+            }
             self.chat_size = cctx.screen_rect().size();
         });
 
@@ -3499,13 +3709,16 @@ impl App {
             let nothing_to_clear = !self.chat.has_dialogue()
                 && self.deepseek.is_none()
                 && self.chat_queue.is_empty();
-            self.abort_deepseek("очистка");
-            self.chat_queue.clear();
-            self.chat.clear();
-            self.reset_active_prompt();
+            self.clear_chat_dialogue();
             if nothing_to_clear {
                 self.report_chain();
             }
+        }
+        if self.transcript_keys.clear_zoom.swap(false, Ordering::Relaxed) {
+            if let Some(mon) = &self.audio.zoom {
+                mon.clear_transcript();
+            }
+            self.clear_chat_dialogue();
         }
         if self.transcript_keys.send_mic.swap(false, Ordering::Relaxed) {
             self.send_transcript(ctx.clone(), true, self.prompts.prompt_1.clone(), true, true);
@@ -3519,6 +3732,13 @@ impl App {
         if self.transcript_keys.send_zoom_p2.swap(false, Ordering::Relaxed) {
             self.send_transcript(ctx.clone(), false, self.prompts.prompt_2.clone(), false, false);
         }
+    }
+
+    fn clear_chat_dialogue(&mut self) {
+        self.abort_deepseek("очистка");
+        self.chat_queue.clear();
+        self.chat.clear();
+        self.reset_active_prompt();
     }
 
     fn send_transcript(
@@ -3560,6 +3780,7 @@ impl App {
         } else {
             self.prompts.prompt_1.clone()
         };
+        let prompt = contexts::compose_system(&prompt, self.contexts.active_text());
         self.start_deepseek_with_prompt(ctx, prompt, text, think);
     }
 
@@ -3729,7 +3950,8 @@ impl App {
     }
 
     fn start_deepseek(&mut self, ctx: egui::Context, question: String) {
-        let prompt = self.prompts.active_text().to_string();
+        let prompt =
+            contexts::compose_system(self.prompts.active_text(), self.contexts.active_text());
         self.start_deepseek_with_prompt(ctx, prompt, question, true);
     }
 
@@ -3817,7 +4039,8 @@ impl App {
     fn draw_chat(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
         let chat_open = self.chat_open;
-        let inner = section_collapsible(p, ui, "💬 Чат", &mut self.chat_collapsed, |ui| {
+        let mut collapsed = self.chat_collapsed;
+        let inner = section_collapsible(p, ui, "💬 Чат", &mut collapsed, |ui| {
             let label = if chat_open {
                 "💬 Прикрепить"
             } else {
@@ -3831,10 +4054,12 @@ impl App {
                 ui.weak("чат в отдельном окне");
                 None
             } else {
+                self.draw_context_row(ui);
                 self.chat.ui(p, ui)
             };
             (toggle, submitted)
         });
+        self.chat_collapsed = collapsed;
         if let Some((toggle, submitted)) = inner {
             if toggle {
                 self.toggle_chat_window();
@@ -3923,6 +4148,18 @@ impl eframe::App for App {
             telemetry::event(
                 "hotkey.switch_provider",
                 serde_json::json!({ "provider": self.llm_provider.to_string() }),
+            );
+        }
+
+        if self.toggle_context.swap(false, Ordering::Relaxed) {
+            self.contexts.enabled = !self.contexts.enabled;
+            contexts::save(&self.contexts);
+            telemetry::event(
+                "hotkey.toggle_context",
+                serde_json::json!({
+                    "enabled": self.contexts.enabled,
+                    "selected": self.contexts.selected,
+                }),
             );
         }
 
