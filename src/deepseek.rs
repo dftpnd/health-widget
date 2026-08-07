@@ -95,6 +95,17 @@ pub fn ask(
     Job { slot, pid }
 }
 
+fn low_reasoning_effort(model: &str) -> Option<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    if m.starts_with("gpt-5") {
+        return Some("minimal");
+    }
+    if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        return Some("low");
+    }
+    None
+}
+
 fn run(
     autopilot_dir: &Path,
     provider: Provider,
@@ -149,7 +160,14 @@ fn run(
         "stream": false
     });
     if !think {
-        payload["think"] = serde_json::Value::Bool(false);
+        match provider {
+            Provider::DeepSeek => payload["think"] = serde_json::Value::Bool(false),
+            Provider::OpenAi => {
+                if let Some(effort) = low_reasoning_effort(&model) {
+                    payload["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+                }
+            }
+        }
     }
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
     let child = Command::new("curl")
